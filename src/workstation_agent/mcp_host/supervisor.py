@@ -25,7 +25,9 @@ signature verification, permissions and audit live in SPEC-03B.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
+import inspect
 import logging
 import msvcrt
 import os
@@ -42,7 +44,7 @@ import win32process
 import win32security
 
 if TYPE_CHECKING:  # pragma: no cover - typing-only imports
-    from collections.abc import Callable
+    from collections.abc import Awaitable, Callable
     from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -370,19 +372,26 @@ class PluginSupervisor:
 
     # -- terminate ------------------------------------------------------------
 
-    def terminate(
+    async def terminate(
         self,
         handle: SubprocessHandle,
         *,
         hard_after: float = 5.0,
-        shutdown_fn: Callable[[], None] | None = None,
+        shutdown_fn: Callable[[], Awaitable[None] | None] | None = None,
     ) -> None:
         """Terminate ``handle`` gracefully then hard-close the Job Object.
 
         ``shutdown_fn`` is an optional callable that performs the MCP
         ``shutdown`` handshake. It is separate from the client so tests can
         supply a fake; in production SPEC-03B wires
-        :meth:`MCPStdioClient.shutdown` in here.
+        :meth:`MCPStdioClient.shutdown` in here. It may be sync or async — if
+        it returns an awaitable we await it (this is the fix for the
+        deadlock: a sync ``handle.process.wait`` would otherwise block the
+        event loop before the awaitable ever ran).
+
+        The blocking ``process.wait`` is off-loaded to the default executor so
+        the event loop stays responsive; callers must be in an asyncio
+        context. See :meth:`terminate_sync` for signal-handler cleanup.
         """
         if handle.closed:
             return
@@ -390,17 +399,38 @@ class PluginSupervisor:
         # Graceful phase: give the plugin a chance to flush + exit.
         if shutdown_fn is not None:
             try:
-                shutdown_fn()
+                result = shutdown_fn()
+                if inspect.isawaitable(result):
+                    await result
             except Exception:
                 log.warning("shutdown_fn raised for pid=%d; forcing", handle.pid, exc_info=True)
 
+        loop = asyncio.get_running_loop()
         try:
-            handle.process.wait(timeout=hard_after)
-        except subprocess.TimeoutExpired:
+            await asyncio.wait_for(
+                loop.run_in_executor(None, handle.process.wait),
+                timeout=hard_after,
+            )
+        except TimeoutError:
             log.info("plugin pid=%d did not exit in %.1fs; killing job", handle.pid, hard_after)
         except Exception:
             log.exception("wait() failed for pid=%d", handle.pid)
 
+        self._hard_close(handle)
+
+    def terminate_sync(self, handle: SubprocessHandle) -> None:
+        """Synchronous cleanup for signal-handler / atexit paths.
+
+        Skips the graceful ``shutdown_fn`` handshake (which would need an
+        event loop) and jumps straight to closing the Job Object. Safe to
+        call from a signal handler where ``asyncio.run`` is unavailable.
+        """
+        if handle.closed:
+            return
+        self._hard_close(handle)
+
+    def _hard_close(self, handle: SubprocessHandle) -> None:
+        """Close the Job Object, drain pipes, drop from registry."""
         # Hard phase: closing the Job Object kills the whole tree.
         _close_job(handle.job_handle)
 

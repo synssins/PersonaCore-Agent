@@ -36,7 +36,7 @@ async def live_client(
         yield client, handle, supervisor
     finally:
         await client.close()
-        supervisor.terminate(handle, hard_after=1.0)
+        await supervisor.terminate(handle, hard_after=1.0)
 
 
 async def test_initialize_returns_server_info(live_client) -> None:

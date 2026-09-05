@@ -9,6 +9,7 @@ Covers:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from pathlib import Path
@@ -93,7 +94,7 @@ def test_spawn_pid_and_job_present_then_terminated(
         resp = _read_line(handle)
         assert resp["id"] == 1
     finally:
-        supervisor.terminate(handle, hard_after=1.0)
+        asyncio.run(supervisor.terminate(handle, hard_after=1.0))
 
     assert handle.closed
     # Job Object closed + subprocess exited.
@@ -133,7 +134,7 @@ def test_env_whitelist_is_enforced_in_child(
         # WSA_PLUGIN_ID is set correctly.
         assert env_seen["WSA_PLUGIN_ID"] == "env-check"
     finally:
-        supervisor.terminate(handle, hard_after=1.0)
+        asyncio.run(supervisor.terminate(handle, hard_after=1.0))
 
 
 def test_terminate_uses_shutdown_fn_when_provided(
@@ -148,7 +149,7 @@ def test_terminate_uses_shutdown_fn_when_provided(
         # Tell the child to shut down cleanly.
         _send_line(handle, {"jsonrpc": "2.0", "id": 99, "method": "shutdown"})
 
-    supervisor.terminate(handle, hard_after=1.5, shutdown_fn=graceful)
+    asyncio.run(supervisor.terminate(handle, hard_after=1.5, shutdown_fn=graceful))
     assert called["count"] == 1
     assert handle.closed
 
@@ -163,7 +164,7 @@ def test_terminate_swallows_shutdown_exceptions(
         raise RuntimeError("boom")
 
     # Must not raise: exception is logged, then the hard kill takes over.
-    supervisor.terminate(handle, hard_after=0.2, shutdown_fn=boom)
+    asyncio.run(supervisor.terminate(handle, hard_after=0.2, shutdown_fn=boom))
     assert handle.closed
 
 
@@ -172,9 +173,22 @@ def test_terminate_idempotent(
 ) -> None:
     supervisor = PluginSupervisor()
     handle = supervisor.spawn(echo_plugin_cmd, cwd=repo_root, plugin_id="dup-term")
-    supervisor.terminate(handle, hard_after=0.5)
+    asyncio.run(supervisor.terminate(handle, hard_after=0.5))
     # Second call is a no-op.
-    supervisor.terminate(handle, hard_after=0.5)
+    asyncio.run(supervisor.terminate(handle, hard_after=0.5))
+    assert handle.closed
+
+
+def test_terminate_sync_skips_shutdown_fn(
+    echo_plugin_cmd: list[str], repo_root: Path,
+) -> None:
+    """terminate_sync closes the Job Object without needing an event loop."""
+    supervisor = PluginSupervisor()
+    handle = supervisor.spawn(echo_plugin_cmd, cwd=repo_root, plugin_id="sync-term")
+    supervisor.terminate_sync(handle)
+    assert handle.closed
+    # Second call is a no-op.
+    supervisor.terminate_sync(handle)
     assert handle.closed
 
 
@@ -202,7 +216,7 @@ def test_low_integrity_fallback_when_token_call_raises(
         assert handle.integrity == "medium"
         assert any("low-integrity token unavailable" in r.getMessage() for r in caplog.records)
     finally:
-        supervisor.terminate(handle, hard_after=1.0)
+        asyncio.run(supervisor.terminate(handle, hard_after=1.0))
 
 
 def test_low_integrity_fallback_when_spawn_call_raises(
@@ -226,7 +240,7 @@ def test_low_integrity_fallback_when_spawn_call_raises(
         assert handle.integrity == "medium"
         assert any("low-integrity spawn failed" in r.getMessage() for r in caplog.records)
     finally:
-        supervisor.terminate(handle, hard_after=1.0)
+        asyncio.run(supervisor.terminate(handle, hard_after=1.0))
 
 
 # ---------------------------------------------------------------------------
@@ -280,3 +294,63 @@ def test_pump_stderr_survives_broken_stream() -> None:
 
     # Should return without raising.
     sup_mod._pump_stderr(_Broken(), "test")  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# Bug-1 regression: terminate() must not deadlock the event loop
+# ---------------------------------------------------------------------------
+
+
+async def test_terminate_does_not_deadlock_async_shutdown_task(
+    echo_plugin_cmd: list[str], repo_root: Path,
+) -> None:
+    """shutdown_fn schedules an async task; that task MUST run before terminate returns.
+
+    Prior implementation called ``handle.process.wait`` synchronously on the
+    event-loop thread, so any task scheduled from ``shutdown_fn`` could not
+    execute until ``wait`` returned — which itself waited for a plugin whose
+    exit signal came from that never-scheduled task. Deadlock.
+
+    The fix off-loads ``wait`` to the default executor and awaits it so the
+    loop stays live; this test asserts the scheduled coroutine ran BEFORE
+    ``terminate`` returned.
+    """
+    supervisor = PluginSupervisor()
+    handle = supervisor.spawn(echo_plugin_cmd, cwd=repo_root, plugin_id="deadlock-guard")
+
+    task_ran = asyncio.Event()
+
+    async def scheduled_shutdown() -> None:
+        # Simulate an async MCP ``shutdown`` handshake: sleep briefly, mark
+        # ran, then push the shutdown message so the child exits.
+        await asyncio.sleep(0.05)
+        task_ran.set()
+        _send_line(handle, {"jsonrpc": "2.0", "id": 77, "method": "shutdown"})
+
+    def shutdown_fn() -> asyncio.Task[None]:
+        # Schedule an async task on the running loop, exactly the way an
+        # async MCP client's ``shutdown()`` would.
+        return asyncio.create_task(scheduled_shutdown())
+
+    await supervisor.terminate(handle, hard_after=2.0, shutdown_fn=shutdown_fn)
+    assert task_ran.is_set(), "scheduled shutdown task never ran — event loop was deadlocked"
+    assert handle.closed
+
+
+async def test_terminate_awaits_async_shutdown_fn(
+    echo_plugin_cmd: list[str], repo_root: Path,
+) -> None:
+    """A shutdown_fn that IS itself a coroutine must be awaited."""
+    supervisor = PluginSupervisor()
+    handle = supervisor.spawn(echo_plugin_cmd, cwd=repo_root, plugin_id="async-shutdown-fn")
+
+    ran = {"count": 0}
+
+    async def coro_shutdown() -> None:
+        await asyncio.sleep(0)
+        ran["count"] += 1
+        _send_line(handle, {"jsonrpc": "2.0", "id": 88, "method": "shutdown"})
+
+    await supervisor.terminate(handle, hard_after=2.0, shutdown_fn=coro_shutdown)
+    assert ran["count"] == 1
+    assert handle.closed
