@@ -17,7 +17,41 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import runpy
 import sys
+
+
+def _maybe_run_as_python(argv: list[str]) -> int | None:
+    """Detect ``[-u] -m <module>`` invocation and act as a Python module runner.
+
+    Under PyInstaller, ``sys.executable`` is ``Agent.exe`` (not ``python.exe``),
+    so the MCP-host supervisor's ``[sys.executable, "-u", "-m", "plugin.mod"]``
+    spawn command re-invokes Agent.exe with those args. Without this hook,
+    argparse would reject ``-u -m ...`` as unrecognized and the plugin
+    subprocess would exit before its stdout produced anything, which the
+    supervisor logs as ``plugin stdout closed``.
+
+    Returns:
+        The exit code if we ran a module (caller should exit with it), or
+        ``None`` to indicate normal argparse dispatch should proceed.
+    """
+    # Strip a leading -u (unbuffered stdio) if present.
+    args = list(argv[1:])
+    if args and args[0] == "-u":
+        args = args[1:]
+    if not (len(args) >= 2 and args[0] == "-m"):
+        return None
+    module = args[1]
+    # Shift sys.argv so the target module sees a normal argv.
+    sys.argv = [module, *args[2:]]
+    try:
+        runpy.run_module(module, run_name="__main__", alter_sys=True)
+    except SystemExit as exc:
+        code = exc.code
+        if isinstance(code, int):
+            return code
+        return 0 if code is None else 1
+    return 0
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -86,6 +120,13 @@ def _cmd_rollback(version: str) -> int:
 
 def main() -> int:
     """Parse args and dispatch to the requested command."""
+    # Under PyInstaller, this same EXE is used by the MCP-host supervisor to
+    # spawn plugin subprocesses (``sys.executable == Agent.exe``). Detect the
+    # ``-u -m <module>`` pattern before argparse and act as a Python runner.
+    rc = _maybe_run_as_python(sys.argv)
+    if rc is not None:
+        return rc
+
     args = _build_parser().parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
