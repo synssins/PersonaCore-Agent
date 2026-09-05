@@ -52,6 +52,15 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e .[dev]
 
+      - name: Install Inno Setup (for building Setup.exe)
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          # Add ISCC to PATH for this and subsequent steps in the same job.
+          $inno = "C:\Program Files (x86)\Inno Setup 6"
+          "$inno" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+          & "$inno\iscc.exe" /? | Select-String "^Inno Setup" | Select-Object -First 1
+
       - name: Run pytest (informational; does not gate publish)
         continue-on-error: true
         run: pytest -q
@@ -138,14 +147,33 @@ jobs:
           $v = "${{ steps.ver.outputs.version }}"
           $tag = "v$v"
           $title = "PersonaCore-Agent $tag"
-          $notes = "Automated release for $tag. See CHANGELOG for details."
-          # Assemble the artifact list per spec §"Release workflow":
-          # agent zip, Updater.exe, manifest.json + .sig, installer.
-          $assets = @(
-            (Get-Item "dist\agent-$v-win-x64.zip").FullName
-            (Get-Item "dist\Updater.exe").FullName
-            (Get-Item "manifest.json").FullName
-            (Get-Item "manifest.json.sig").FullName
-            (Get-Item "dist\PersonaCore-Agent-Setup-$v.exe").FullName
+          $isPrerelease = $tag -match "-(alpha|beta|rc|dev)"
+          $notes = @"
+Automated release for $tag.
+
+**Install:** download ``PersonaCore-Agent-Setup-$v.exe`` below and run it. Per-user by default; pass ``/ALLUSERS`` on the command line for machine-wide install.
+
+**Alpha caveats:**
+- Not code-signed. SmartScreen will warn; click "More info" then "Run anyway".
+- All 6 first-party plugins (filesystem/powershell/desktop_control/browser/screen_vision/clipboard) are stubs returning ``not_implemented``. Real implementations land in v0.2. Voice pipeline (wake -> STT -> LLM -> TTS) is fully wired against your OpenAI-compat + Wyoming endpoints.
+"@
+          # Collect artifacts only if they actually exist — signing/installer steps are conditional.
+          $candidates = @(
+            "dist\PersonaCore-Agent-Setup-$v.exe"
+            "dist\agent-$v-win-x64.zip"
+            "dist\Updater.exe"
+            "dist\updater-$v-win-x64.exe"
+            "manifest.json"
+            "manifest.json.sig"
           )
-          & gh release create $tag --title $title --notes $notes @assets
+          $assets = @()
+          foreach ($c in $candidates) {
+            if (Test-Path $c) { $assets += (Get-Item $c).FullName } else { Write-Host "skipping missing asset: $c" }
+          }
+          if ($assets.Count -eq 0) {
+            throw "no release assets found — every candidate file was missing"
+          }
+          $args = @("release", "create", $tag, "--title", $title, "--notes", $notes)
+          if ($isPrerelease) { $args += "--prerelease" }
+          $args += $assets
+          & gh @args
