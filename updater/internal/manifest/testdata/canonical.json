@@ -1,0 +1,80 @@
+[
+  {
+    "input": {
+      "a": 1,
+      "b": 2,
+      "c": [
+        1,
+        2,
+        3
+      ]
+    },
+    "canonical_b64": "eyJhIjoxLCJiIjoyLCJjIjpbMSwyLDNdfQ=="
+  },
+  {
+    "input": {
+      "z": "unicode test",
+      "a": null,
+      "b": true,
+      "c": false
+    },
+    "canonical_b64": "eyJhIjpudWxsLCJiIjp0cnVlLCJjIjpmYWxzZSwieiI6InVuaWNvZGUgdGVzdCJ9"
+  },
+  {
+    "input": {},
+    "canonical_b64": "e30="
+  },
+  {
+    "input": [
+      1,
+      2,
+      3,
+      {
+        "nested": {
+          "x": 1,
+          "y": [
+            true,
+            false,
+            null
+          ]
+        }
+      }
+    ],
+    "canonical_b64": "WzEsMiwzLHsibmVzdGVkIjp7IngiOjEsInkiOlt0cnVlLGZhbHNlLG51bGxdfX1d"
+  },
+  {
+    "input": {
+      "version": "1.2.3",
+      "channel": "stable",
+      "released_at": "2026-09-15T04:00:00Z",
+      "mandatory": false,
+      "notes_url": "https://example.invalid/v1.2.3",
+      "artifacts": {
+        "agent": {
+          "url": "https://example.invalid/agent.zip",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+          "size": 100
+        },
+        "updater": {
+          "url": "https://example.invalid/updater.exe",
+          "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+          "size": 50
+        }
+      },
+      "min_updater_version": "1.0.0"
+    },
+    "canonical_b64": "eyJhcnRpZmFjdHMiOnsiYWdlbnQiOnsic2hhMjU2IjoiMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMCIsInNpemUiOjEwMCwidXJsIjoiaHR0cHM6Ly9leGFtcGxlLmludmFsaWQvYWdlbnQuemlwIn0sInVwZGF0ZXIiOnsic2hhMjU2IjoiMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMSIsInNpemUiOjUwLCJ1cmwiOiJodHRwczovL2V4YW1wbGUuaW52YWxpZC91cGRhdGVyLmV4ZSJ9fSwiY2hhbm5lbCI6InN0YWJsZSIsIm1hbmRhdG9yeSI6ZmFsc2UsIm1pbl91cGRhdGVyX3ZlcnNpb24iOiIxLjAuMCIsIm5vdGVzX3VybCI6Imh0dHBzOi8vZXhhbXBsZS5pbnZhbGlkL3YxLjIuMyIsInJlbGVhc2VkX2F0IjoiMjAyNi0wOS0xNVQwNDowMDowMFoiLCJ2ZXJzaW9uIjoiMS4yLjMifQ=="
+  },
+  {
+    "input": {
+      "escape": "a\"b\\c\nd\te"
+    },
+    "canonical_b64": "eyJlc2NhcGUiOiJhXCJiXFxjXG5kXHRlIn0="
+  },
+  {
+    "input": {
+      "ctrl": "\u0000\u0001\u001f"
+    },
+    "canonical_b64": "eyJjdHJsIjoiXHUwMDAwXHUwMDAxXHUwMDFmIn0="
+  }
+]
