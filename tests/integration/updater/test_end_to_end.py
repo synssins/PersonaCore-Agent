@@ -389,6 +389,98 @@ def test_updater_rejects_bad_signature(
     assert not (install_root / "app" / "0.0.2").exists()
 
 
+def test_updater_rollback(
+    tmp_path: Path,
+    updater_binary: Path,
+) -> None:
+    """``Updater.exe --rollback <ver>`` swaps `current` back to an
+    earlier installed version without touching data on disk.
+
+    Layout:
+        <root>/app/1.0.0/Agent.exe         (previous "known good" version)
+        <root>/app/1.1.0/Agent.exe         (freshly installed, misbehaving)
+        <root>/current -> app/1.1.0        (currently active)
+
+    After ``--rollback 1.0.0``:
+        <root>/current -> app/1.0.0        (rolled back)
+        <root>/app/1.1.0/**                (preserved — no data loss)
+        <root>/app/1.0.0/**                (preserved)
+        Mock agent has been relaunched (exit code 0 from updater).
+    """
+    # -- Install layout with two versions ------------------------------------
+    install_root = tmp_path / "install"
+    v_old = install_root / "app" / "1.0.0"
+    v_new = install_root / "app" / "1.1.0"
+    for v, tag in [(v_old, "1.0.0"), (v_new, "1.1.0")]:
+        v.mkdir(parents=True)
+        # Copy python.exe as Agent.exe so Relaunch can start it.
+        shutil.copy2(Path(sys.executable), v / "Agent.exe")
+        for sibling in Path(sys.executable).parent.iterdir():
+            if (
+                sibling.suffix.lower() == ".dll"
+                and sibling.name.lower().startswith("python")
+            ):
+                shutil.copy2(sibling, v / sibling.name)
+        (v / "version.txt").write_text(tag, encoding="utf-8")
+        # A data-file we later assert survives the rollback verbatim.
+        (v / "user_data.txt").write_text(f"payload-{tag}", encoding="utf-8")
+
+    # `current` starts pointing at 1.1.0 (the version we roll back FROM).
+    _make_junction(install_root / "current", v_new)
+    assert (install_root / "current" / "version.txt").read_text(
+        encoding="utf-8",
+    ) == "1.1.0"
+
+    # -- Run Updater.exe --rollback 1.0.0 ------------------------------------
+    logs_dir = tmp_path / "logs"
+    env = {
+        **os.environ,
+        "PC_AGENT_INSTALL_ROOT": str(install_root),
+        # Skip the self-copy dance — we're already running from tempdir.
+        "PC_AGENT_UPDATER_SELF_RELAY": str(updater_binary),
+    }
+    result = subprocess.run(
+        [
+            str(updater_binary),
+            "--rollback",
+            "1.0.0",
+            "--install-root",
+            str(install_root),
+            "--logs-dir",
+            str(logs_dir),
+            "--keep",
+            "3",
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=60,
+    )
+    assert result.returncode == 0, (
+        f"rollback exit {result.returncode}\nstdout: {result.stdout}\n"
+        f"stderr: {result.stderr}"
+    )
+
+    # -- Post-conditions -----------------------------------------------------
+    # `current` now points at 1.0.0.
+    current = install_root / "current"
+    assert (current / "version.txt").read_text(encoding="utf-8") == "1.0.0"
+
+    # No data loss: both version dirs still exist with their data.
+    assert (v_old / "user_data.txt").read_text(encoding="utf-8") == "payload-1.0.0"
+    assert (v_new / "user_data.txt").read_text(encoding="utf-8") == "payload-1.1.0"
+
+    # Log file was written and mentions the rollback swap.
+    log_files = list(logs_dir.glob("updater-*.log"))
+    assert log_files, "expected an updater log file"
+    log_text = log_files[0].read_text(encoding="utf-8")
+    assert "rollback" in log_text.lower()
+    assert "junction" in log_text.lower()
+    assert "relaunched agent pid=" in log_text, (
+        f"expected relaunch confirmation in log; got:\n{log_text}"
+    )
+
+
 def test_stage_pending_atomic(tmp_path: Path) -> None:
     """stage_pending must produce a file with the right shape atomically."""
     appdata = tmp_path / "appdata"

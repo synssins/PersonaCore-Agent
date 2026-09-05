@@ -1,1 +1,1 @@
-"""Security primitives: DPAPI encryption, Ed25519 signatures."""
+"""Security primitives: DPAPI wrapper, Ed25519 signature verify, redaction, file hardening."""
