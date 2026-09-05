@@ -16,9 +16,31 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import io
 import logging
+import os
 import runpy
 import sys
+
+
+def _ensure_std_streams() -> None:
+    """PyInstaller windowed builds (--noconsole) set sys.stdout/stderr to None.
+
+    Uvicorn's default log config instantiates ``ColourizedFormatter`` which
+    calls ``sys.stdout.isatty()`` — that blows up with
+    ``AttributeError: 'NoneType' object has no attribute 'isatty'`` and
+    prevents the agent from starting. Give it a sink that answers ``isatty()``
+    with ``False`` so uvicorn's TTY check just returns False and skips colours.
+
+    This is the canonical PyInstaller-windowed workaround; safe in every mode
+    because it only replaces streams that are truly ``None``.
+    """
+    if sys.stdout is None:
+        sys.stdout = open(os.devnull, "w", encoding="utf-8", buffering=1)  # noqa: SIM115, PTH123
+    if sys.stderr is None:
+        sys.stderr = open(os.devnull, "w", encoding="utf-8", buffering=1)  # noqa: SIM115, PTH123
+    if sys.stdin is None:
+        sys.stdin = io.StringIO("")
 
 
 def _maybe_run_as_python(argv: list[str]) -> int | None:
@@ -120,6 +142,10 @@ def _cmd_rollback(version: str) -> int:
 
 def main() -> int:
     """Parse args and dispatch to the requested command."""
+    # PyInstaller windowed builds leave stdout/stderr as None; give uvicorn +
+    # anything else that calls .isatty() something real to talk to.
+    _ensure_std_streams()
+
     # Under PyInstaller, this same EXE is used by the MCP-host supervisor to
     # spawn plugin subprocesses (``sys.executable == Agent.exe``). Detect the
     # ``-u -m <module>`` pattern before argparse and act as a Python runner.
