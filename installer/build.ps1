@@ -36,20 +36,24 @@ Write-Host "==> [1/3] PyInstaller"
 # copy_metadata("webrtcvad"). We ship the module via `webrtcvad-wheels`
 # (drop-in binary distribution with a different distribution name), so the
 # metadata lookup fails with PackageNotFoundError. Delete the offending
-# hook file before PyInstaller runs — the module still imports fine and
-# workstation_agent.spec hiddenimports webrtcvad explicitly.
-$hookInfo = & $Python -c "import _pyinstaller_hooks_contrib.stdhooks.hook_webrtcvad as h; print(h.__file__)" 2>$null
-if ($LASTEXITCODE -eq 0 -and $hookInfo) {
-    $hookPath = $hookInfo.Trim()
-    if (Test-Path $hookPath) {
-        Remove-Item -Force $hookPath
-        Write-Host "    (removed stock webrtcvad hook: $hookPath)"
+# hook file (and its .pyc) before PyInstaller runs — the module still
+# imports fine and workstation_agent.spec hiddenimports webrtcvad explicitly.
+try {
+    $stdhooksDirRaw = & $Python -c "import os, _pyinstaller_hooks_contrib.stdhooks as m; print(os.path.dirname(m.__file__))" 2>&1
+    if ($LASTEXITCODE -eq 0 -and $stdhooksDirRaw) {
+        $stdhooksDir = ($stdhooksDirRaw | Out-String).Trim()
+        if ($stdhooksDir -and (Test-Path $stdhooksDir)) {
+            Get-ChildItem -Path $stdhooksDir -Filter "hook-webrtcvad*" -ErrorAction SilentlyContinue | ForEach-Object {
+                Write-Host "    (removed $($_.FullName))"
+                Remove-Item -Force $_.FullName -ErrorAction SilentlyContinue
+            }
+            Get-ChildItem -Path (Join-Path $stdhooksDir "__pycache__") -Filter "hook-webrtcvad*" -ErrorAction SilentlyContinue | ForEach-Object {
+                Remove-Item -Force $_.FullName -ErrorAction SilentlyContinue
+            }
+        }
     }
-}
-# Also remove the .pyc if PyInstaller cached one already.
-$hookDir = Split-Path $hookPath -Parent 2>$null
-if ($hookDir) {
-    Get-ChildItem -Path $hookDir -Filter "hook-webrtcvad*.pyc" -Recurse -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+} catch {
+    Write-Warning "webrtcvad hook removal skipped: $($_.Exception.Message)"
 }
 
 & $Python -m PyInstaller --noconfirm workstation_agent.spec
