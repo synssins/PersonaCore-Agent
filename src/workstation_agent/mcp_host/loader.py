@@ -39,7 +39,9 @@ import workstation_agent.security.signature as _sig
 
 log = logging.getLogger(__name__)
 
-TRUSTED_PUBKEYS: list[bytes] = []
+from workstation_agent.security.first_party_pubkey import FIRST_PARTY_PUBKEY
+
+TRUSTED_PUBKEYS: list[bytes] = [FIRST_PARTY_PUBKEY]
 
 _env_key = _sig.load_public_key()
 if _env_key is not None:

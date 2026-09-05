@@ -266,7 +266,14 @@ async def test_clipboard_tools_list(agent_config, isolated_audit_db):
 async def test_invoke_returns_not_implemented(agent_config, isolated_audit_db):
     """Invoking any tool returns not_implemented status."""
     host = MCPHost()
-    await host.start(agent_config, confirm_cb=None)
+
+    # Auto-approve any runtime confirmation prompts so the stub-invocation
+    # test doesn't have to shape args to fit each plugin's declared_paths /
+    # command allowlist — we're testing the wire, not the guard rails.
+    async def _auto_approve(_req) -> bool:
+        return True
+
+    await host.start(agent_config, confirm_cb=_auto_approve)
 
     try:
         # Test one tool from each plugin
