@@ -1,7 +1,7 @@
 # SPEC-05 — LLM client + tool bridge + session store
 
 **Executor tier:** sonnet. **Branch:** `feat/spec-05-llm`. **Worktree:** `../wsa-spec-05/`.
-**Depends on:** SPEC-01, SPEC-02. **Consumes:** SPEC-03's `MCPHost` Protocol (mocked for now).
+**Depends on:** SPEC-01, SPEC-02. **Consumes:** the `MCPHost` Protocol from `workstation_agent.protocols` (defined by SPEC-01, produced by SPEC-03B — this SPEC depends on the Protocol only; a `FakeMCPHost` in `tests/fakes/` covers testing).
 
 ## Goal
 
@@ -47,9 +47,12 @@ OpenAI-compatible chat client with streaming + tool-call loop, MCP-to-OpenAI too
     - `should_continue(session_id, now: datetime, sticky_seconds: int) -> bool` — for sticky-window logic.
 - `src/workstation_agent/llm/turn.py`:
   - `class LLMTurn` — orchestrates one user turn:
+    - Reads `config.llm.system_prompt` (see below); if none, uses a default: "You are a Windows workstation assistant. You have access to local tools via MCP. Prefer concise answers. Confirm destructive actions before running them. Speak naturally when your reply will be read aloud."
     - Takes user text, gets tools from `MCPHost`, calls `OpenAICompatClient.chat`, streams deltas, dispatches tool calls through `ToolRouter`, feeds tool results back into the LLM (multi-round if the LLM makes more tool calls), yields final text chunks to the caller for TTS.
     - Emits progress events (`text_chunk`, `tool_call_started`, `tool_call_done`, `finished`) for the UI.
     - Persists every message to `SessionStore`.
+- `src/workstation_agent/llm/system_prompt.py`:
+  - Provides `default_system_prompt()` and helpers for user-customized prompt via config (add `system_prompt: str | None` field to `LlmConfig` in SPEC-02's schema — since SPEC-02 has already landed by the time this SPEC runs, note this in your executor summary and the orchestrator will patch `config/schema.py` at integration).
 - `tests/fakes/fake_openai.py`:
   - FastAPI ASGI app implementing `/v1/chat/completions` with SSE streaming. Configurable canned responses including tool-call sequences and multi-round loops.
 - `tests/unit/llm/test_tool_bridge.py` — MCP descriptor → OpenAI schema conversion table.

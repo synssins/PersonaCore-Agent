@@ -19,8 +19,9 @@ Direction 1: Agent exposes its own MCP server so Claude Code (and any other MCP 
     - `agent.last_transcript(n?: int) -> {turns: [{role, text, ts}]}`.
     - `agent.pause_listening(seconds: int) -> {ok: bool}`.
     - `agent.execute_local(plugin_id: str, tool: str, args: dict) -> {result}` — proxies through `MCPHost.invoke` with permission checks.
-  - Runs on a separate task; can be launched standalone (`python -m workstation_agent.mcp_host.mcp_server`) for CC to add to its `.claude/mcp.json`. The standalone entry connects back to the running agent over a local Unix-socket-equivalent on Windows: named pipe `\\.\pipe\WSA-AGENT-<pid>` — or, simpler, IPC via the local FastAPI on `127.0.0.1:<port>/agent-ipc` with a per-session bearer token. **Pick named pipe** — matches Windows conventions, avoids exposing IPC over HTTP.
-  - Token: agent generates a random 32-byte token at startup, writes to `%APPDATA%\WorkstationAgent\mcp-token` (mode 0600 equivalent on Windows: DACL current-user-only). The standalone MCP server reads the token and presents it on the named-pipe handshake.
+  - Runs on a separate task; can be launched standalone (`python -m workstation_agent.mcp_host.mcp_server`) for CC to add to its `.claude/mcp.json`.
+  - **Static named pipe** (audit finding): the standalone entry connects back to the running agent over `\\.\pipe\PC-Agent-MCP` — a fixed name so CC's `.claude/mcp.json` doesn't need updating when the agent restarts with a new PID. Only one agent instance can bind this pipe at a time (enforced by `CreateNamedPipe` returning `ERROR_PIPE_BUSY` on the second attempt); the second instance logs "another agent instance is already running" and exits with a non-zero code.
+  - **Token**: agent generates a random 32-byte token at startup, writes to `%APPDATA%\WorkstationAgent\mcp-token` and immediately calls `security.harden_file(path)` from SPEC-02 to apply the DACL that denies Low-integrity SID read + Everyone read, granting only current user. The standalone MCP server reads the token and presents it on the named-pipe handshake.
 
 ### Direction 2: driving Claude Code
 

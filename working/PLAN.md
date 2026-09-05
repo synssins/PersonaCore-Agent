@@ -26,17 +26,21 @@ worktree isolation — each subtask runs in its own git worktree branched from
   package with `__init__.py` and `__main__.py` stubs, empty subpackage
   directories with docstrings pinning purpose.
 
-### Wave 1 (parallel — five independent subtasks after SPEC-01)
+### Wave 1 (parallel — six independent subtasks after SPEC-01)
 
 - **SPEC-02 — Security primitives + config store** (`sonnet`)
   `security.dpapi`, `security.signature`, `config.store` (TOML load/save,
-  atomic writes, JSON-schema validation). No UI, no I/O beyond disk.
-- **SPEC-03 — MCP host: subprocess supervisor + plugin loader + permissions + audit** (`opus`)
-  The load-bearing piece. Windows Job Objects, low-integrity spawn,
-  discovery via entry-points + folder scan, manifest signature verify (uses
-  SPEC-02), install-time perms model, runtime confirmation hooks (callback
-  interface — UI wires later), append-only audit SQLite. One canary
-  `hello_world` in-tree plugin proves the loader end-to-end.
+  atomic writes, JSON-schema validation, DACL-hardened secrets file). No
+  UI, no I/O beyond disk.
+- **SPEC-03A — Subprocess supervisor + MCP stdio client** (`opus`)
+  Windows Job Objects, low-integrity spawn (with explicit env var
+  whitelist), MCP client, heartbeat watchdog. Load-bearing plumbing.
+- **SPEC-03B — Plugin loader + permissions + audit + MCPHost facade** (`sonnet`)
+  Discovery via entry-points + folder scan + bundled, manifest signature
+  verify (uses SPEC-02), install-time perms model, runtime confirmation
+  hooks (callback interface — UI wires later), append-only audit SQLite,
+  `hello_world` canary. Depends on SPEC-03A landing first (or a stubbed
+  supervisor for parallel dev).
 - **SPEC-04 — Audio subsystem skeleton** (`sonnet`)
   `audio.wake` (OpenWakeWord wrapper — model file path from config, callback
   fires on trigger), `audio.ptt` (global hotkey listener), `audio.stt`
@@ -58,16 +62,18 @@ worktree isolation — each subtask runs in its own git worktree branched from
   the Go binary against a local HTTP fixture serving canned manifest +
   zip.
 
-### Wave 2 (parallel — four subtasks after Wave 1 lands)
+### Wave 2 (parallel — five subtasks after Wave 1 lands)
 
-- **SPEC-07 — UI: systray + WebView2 + FastAPI backend + toast notifications** (`sonnet`)
-  `ui.systray` (pystray icon + full right-click menu including
-  mute-mic-and-speaker), `ui.webview` (pywebview window pointed at local
-  FastAPI URL), `ui.backend` (FastAPI serving `/first-run`, `/dashboard`,
-  `/config`, `/plugins`, `/audit`, `/logs`, `/about` — HTML skeleton with
-  functional forms; visual design deferred to `interface-design` skill),
-  `ui.notifications` (Windows toast via `winrt`), `observability.logging`
-  (structlog + JSONL rotation). This is the biggest surface after SPEC-03.
+- **SPEC-07A — UI backend: FastAPI routes + structured logging** (`sonnet`)
+  `ui.backend` (FastAPI serving `/first-run`, `/dashboard`, `/config`,
+  `/plugins`, `/audit`, `/logs`, `/about` — HTML skeleton with functional
+  forms; visual design deferred to `interface-design` skill),
+  `observability.logging` (structlog + JSONL rotation). Loopback-only bind.
+- **SPEC-07B — UI frontend: WebView2 + systray + toast notifications** (`sonnet`)
+  `ui.webview` (pywebview window pointed at SPEC-07A's local FastAPI URL —
+  runs on MAIN THREAD per plan audit), `ui.systray` (pystray icon + full
+  right-click menu including mute-mic-and-speaker, runs detached),
+  `ui.notifications` (Windows toast via `winrt`).
 - **SPEC-08 — Claude Code integration** (`sonnet`)
   `claude_code.driver` — `claude-agent-sdk` wrapper, cross-process presence
   detection (process enum), explicit "ask Claude Code" tool exposed as a
@@ -82,13 +88,13 @@ worktree isolation — each subtask runs in its own git worktree branched from
   `clipboard`. Each ships a signed `plugin.toml` + Python entry.
   **Real implementations are future work** — this proves the loader,
   permission surface, and audit log with real plugin manifests.
-- **SPEC-10 — Installer (Inno Setup) + main entry wiring + boot check** (`sonnet`)
+- **SPEC-10 — Installer (Inno Setup) + main entry wiring + boot check** (`opus` — bumped from sonnet per plan audit)
   Inno Setup script covering per-user vs machine-wide branching, Launch
   checkbox on final page, Registry Run vs Task Scheduler registration,
-  uninstaller. Wires `__main__.py` to compose all subsystems into a
-  runnable app. `scripts/boot_check.py` — starts agent against fakes,
-  asserts everything comes up. Extends `release.yml` with build + sign +
-  publish steps.
+  uninstaller. Wires `app.py` to compose all subsystems with the
+  main-thread pywebview + background-thread asyncio topology.
+  `scripts/boot_check.py` — starts agent against fakes, asserts everything
+  comes up. Extends `release.yml` with build + sign + publish steps.
 
 ## Interfaces between subtasks (the "joints")
 
@@ -107,18 +113,20 @@ Every interface above is a Python `Protocol` in `src/workstation_agent/protocols
 ## Dependency graph
 
 ```
-SPEC-01 (scaffold)
+SPEC-01 (scaffold — declares ALL runtime deps upfront so no wave modifies pyproject.toml)
   ├─▶ SPEC-02 (security + config)
-  │     ├─▶ SPEC-03 (MCP host)
+  │     ├─▶ SPEC-03A (supervisor + MCP stdio)
+  │     │     └─▶ SPEC-03B (loader + permissions + audit + host)
   │     └─▶ SPEC-06 (updater)
-  ├─▶ SPEC-04 (audio)
-  └─▶ SPEC-05 (LLM)  [needs SPEC-03's ToolDescriptor type — mocked until SPEC-03 lands]
+  ├─▶ SPEC-04 (audio, threaded/asyncio bridged)
+  └─▶ SPEC-05 (LLM — uses MCPHost Protocol from protocols.py + FakeMCPHost for tests)
 
 After Wave 1:
-  SPEC-07 (UI)          [needs SPEC-02 config, SPEC-03 plugins, SPEC-06 updates]
-  SPEC-08 (Claude Code) [needs SPEC-03 MCP host, SPEC-04 audio, SPEC-07 notifications]
-  SPEC-09 (plugin stubs) [needs SPEC-03 plugin loader]
-  SPEC-10 (installer + wiring) [needs everything]
+  SPEC-07A (UI backend)  [needs SPEC-02 config, SPEC-03B host, SPEC-06 update surface]
+  SPEC-07B (UI frontend) [needs SPEC-07A backend URL, but can begin against a fake in parallel]
+  SPEC-08 (Claude Code)  [needs SPEC-03B, SPEC-04, SPEC-07B toast]
+  SPEC-09 (plugin stubs) [needs SPEC-03B plugin loader]
+  SPEC-10 (installer + wiring, opus) [needs everything]
 ```
 
 ## Execution policy

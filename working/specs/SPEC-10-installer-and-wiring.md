@@ -1,6 +1,6 @@
 # SPEC-10 — Installer, main entry wiring, boot check, release workflow
 
-**Executor tier:** sonnet. **Branch:** `feat/spec-10-installer`. **Worktree:** `../wsa-spec-10/`.
+**Executor tier:** opus (per plan-audit — PyInstaller + Inno Setup + GH Actions + boot-check integration is failure-prone at lower tiers). **Branch:** `feat/spec-10-installer`. **Worktree:** `../wsa-spec-10/`.
 **Depends on:** ALL previous SPECs (integration layer).
 
 ## Goal
@@ -12,20 +12,25 @@ Compose all subsystems into a runnable app, produce a working installer, wire th
 ### Main entry wiring
 
 - `src/workstation_agent/app.py`:
-  - `class Application` — composition root. Order:
-    1. Configure logging (`observability.logging.configure`).
-    2. Load config (`config.store.load`).
-    3. Instantiate audit log, session store, secret loader.
-    4. Instantiate `MCPHost`, start it (discover + spawn plugins).
-    5. Instantiate `WyomingSTTClient`, `WyomingTTSClient`, `MicStream`, `Speaker`, `AudioSession`.
-    6. Instantiate `OpenAICompatClient`, `LLMTurn`.
-    7. Wire `AudioSession.on_transcribed → LLMTurn.run → TTS speak`.
-    8. Instantiate `ToastPresenter`, `SystemTray`, `WebviewWindow`, `FastAPIApp`.
-    9. Instantiate `UpdatePoller`, wire `on_update_available` → toast + optional voice.
-    10. Instantiate `ClaudeCodeDriver` and start the agent's own MCP server.
-    11. On first-run flag missing: `WebviewWindow.open("/first-run")`.
-  - `async run()` — sets up signal handlers, joins the systray thread, waits for exit.
-  - `async shutdown()` — graceful teardown in reverse order.
+  - `class Application` — composition root.
+  - **CRITICAL threading topology** (per plan audit):
+    - Main thread runs `pywebview.start()` — blocking, owned by SPEC-07B's `WebviewWindow`.
+    - A **dedicated background thread** runs the asyncio event loop hosting: MCP host, audio pipeline, LLM turns, update poller, FastAPI (via `uvicorn`), Claude Code driver, agent's own MCP server.
+    - The systray runs on its own thread via `pystray.Icon.run_detached()` — invoked from the asyncio thread during startup.
+    - Cross-thread communication: from asyncio → main-thread pywebview via a thread-safe queue polled by pywebview's own `window.evaluate_js` timer; from pywebview/systray → asyncio via `asyncio.run_coroutine_threadsafe`.
+  - Startup order (on the asyncio thread, before starting pywebview on the main thread):
+    1. Configure logging.
+    2. Load config, audit log, session store, secret loader.
+    3. Start `MCPHost` (discover + spawn plugins).
+    4. Start `WyomingSTTClient`, `WyomingTTSClient`, `MicStream`, `Speaker`, `AudioSession`.
+    5. Start `OpenAICompatClient`, wire `LLMTurn`.
+    6. Wire `AudioSession.on_transcribed → LLMTurn.run → TTS speak`.
+    7. Start FastAPI backend (SPEC-07A) on ephemeral port, write `ui-port` file.
+    8. Start `ToastPresenter`, `SystemTray.run_detached()`.
+    9. Start `UpdatePoller`, wire `on_update_available` → toast + optional voice.
+    10. Start `ClaudeCodeDriver` and the agent's own MCP server on the static named pipe.
+    11. Signal main thread: instantiate `WebviewWindow`, if first-run flag missing call `WebviewWindow.open("/first-run")`, then `WebviewWindow.start()` (blocks).
+  - `async shutdown()` — reverse order teardown from asyncio thread; signal pywebview to close.
 - `src/workstation_agent/__main__.py` — replaces the SPEC-01 placeholder:
   - `argparse` for `--autostart`, `--diag`, `--fake-backends`, `--check-updates`, `--rollback [ver]`.
   - `--diag` prints subsystem readiness table (each subsystem exposes a `health()` method returning `{ok, detail}`; the composition root iterates).

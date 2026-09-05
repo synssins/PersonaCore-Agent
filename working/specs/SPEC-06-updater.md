@@ -24,7 +24,8 @@ End-to-end signed self-update flow per design §4.7. In-agent Python side polls 
 - `updater/go.mod` — module `github.com/synssins/PersonaCore-Agent/updater`, Go 1.22.
 - `updater/main.go` — CLI with subcommands via `flag`:
   - `--update` — read `pending_update.json`, wait for agent PID exit (30 s grace, then `TerminateProcess`), download artifact, verify SHA-256 against manifest, extract to `<install>\app\<version>\`, atomically swap `<install>\current` junction (Windows: `mklink /J` semantics via `syscall.CreateSymbolicLink` with directory flag, or `os.Symlink` — junction is preferable, use `golang.org/x/sys/windows` to call `DeviceIoControl` with `FSCTL_SET_REPARSE_POINT` if needed), relaunch `<install>\current\Agent.exe`, prune to last 3 versions, exit 0.
-  - `--rollback [version]` — switch `current` junction to the specified older version folder, relaunch, exit 0.
+  - **CRITICAL — self-lock avoidance:** the updater invoked by the running agent is `<install>\current\Updater.exe`. Attempting to swap the `current` junction while `Updater.exe` is running from inside it will fail with sharing-violation errors. Therefore: on `--update` entry, **the updater first copies itself to `%TEMP%\PC-Agent-Updater-<version>.exe` and re-execs from that copy** (via `os.StartProcess` + `os.Exit`), so the on-disk `current\Updater.exe` is no longer held open when the junction swap happens. The temp copy self-deletes after successful completion (schedule via `MoveFileEx MOVEFILE_DELAY_UNTIL_REBOOT` or write a `.bat` self-deleter — the classic approach).
+  - `--rollback [version]` — same self-copy pattern, then switch `current` junction to the specified older version folder, relaunch, exit 0.
   - `--check` — one-shot: fetch + verify latest release, print to stdout, exit.
 - `updater/internal/verify/verify.go`:
   - Ed25519 verification via `crypto/ed25519`. Public key baked in via `-ldflags "-X main.PublicKeyHex=<hex>"`.

@@ -11,7 +11,8 @@ Wire the full listen → transcribe → speak audio path against Wyoming, with w
 
 - `src/workstation_agent/audio/__init__.py`
 - `src/workstation_agent/audio/mic.py`:
-  - `MicStream` — captures 16 kHz mono PCM frames from the OS default input device using `sounddevice` (add to `pyproject.toml` deps — flag this in executor summary, orchestrator will amend). Or, if adding a dep is disallowed, use `pyaudiowpatch`. Prefer `sounddevice`.
+  - `MicStream` — captures 16 kHz mono PCM frames from the OS default input device using `sounddevice` (already in `pyproject.toml` per SPEC-01).
+  - **Threading contract:** `sounddevice.InputStream` uses a blocking C callback thread that MUST NOT touch the asyncio event loop directly. Bridge via `queue.SimpleQueue` (thread-safe) plus `asyncio.get_running_loop().call_soon_threadsafe` to hand frames into an `asyncio.Queue` consumed by the async iterator. Alternatively, wrap the entire `sounddevice.InputStream.read()` blocking loop in `asyncio.to_thread` and yield frames through an async queue. Document the choice.
   - Async iterator yielding `AudioFrame(pcm: bytes, ts_ms: int)`.
   - `pause()` / `resume()` for mute integration.
 - `src/workstation_agent/audio/wake.py`:
@@ -31,7 +32,8 @@ Wire the full listen → transcribe → speak audio path against Wyoming, with w
   - `async speak(text: str) -> AbortableTask` returns immediately; task runs in background, yields `audio-chunk` bytes to a queue consumed by the sound-output module.
   - `AbortableTask.abort()` cancels the exchange, drops in-flight audio, sends `synthesize-stop`.
 - `src/workstation_agent/audio/sink.py`:
-  - `Speaker` — plays PCM to OS default output via `sounddevice`. Barge-in fast-cancel.
+  - `Speaker` — plays PCM to OS default output via `sounddevice.OutputStream`. Same threading pattern as `MicStream`: blocking C callback bridged via `call_soon_threadsafe` or `asyncio.to_thread` — never call blocking `sounddevice` operations inline in async code.
+  - Fast barge-in cancel: `abort()` sets a flag consumed by the callback thread; drains the pending queue.
   - `mute()` / `unmute()` for the systray mute action (which mutes BOTH mic and speaker per Q10b).
 - `src/workstation_agent/audio/session.py`:
   - `AudioSession` state machine per design §4.11. Consumes `WakeDetector` + `PushToTalk` callbacks, drives `WyomingSTTClient`, waits for LLM turn via injected `on_transcribed` callback, plays TTS via `Speaker`, handles barge-in (wake mid-TTS cancels the `AbortableTask`, resets to LISTENING).
@@ -52,7 +54,7 @@ Wire the full listen → transcribe → speak audio path against Wyoming, with w
 - No real audio device required for tests: `MicStream` accepts an injectable frame source (in prod: `sounddevice`; in tests: a fake). Same for `Speaker`.
 - No real network required: `WyomingSTTClient` and `WyomingTTSClient` accept an injectable connect function (in prod: `asyncio.open_connection`; in tests: an in-process socket pair or the `fake_wyoming` server).
 - The session mode logic lives in `AudioSession`, not in `LLMSession` — SPEC-05 just gets called once per user turn.
-- If you MUST add `sounddevice` / `webrtcvad` to deps, note it in the executor summary; orchestrator amends `pyproject.toml`.
+- All required deps (`sounddevice`, `webrtcvad-wheels`, `openwakeword`, `wyoming`, `keyboard`) are pre-declared by SPEC-01. Do NOT modify `pyproject.toml`.
 
 ## Acceptance criteria
 

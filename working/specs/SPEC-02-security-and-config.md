@@ -29,9 +29,10 @@ Land the crypto and config-file primitives every other subsystem uses. No UI, no
   - `paths()` — returns dict of resolved paths (config file, secrets blob, plugins dir, audit db, conversations db, logs dir) using `%APPDATA%\WorkstationAgent\`. Respects `PC_AGENT_APPDATA` env for tests.
   - `load() -> AgentConfig` — reads TOML via `tomlkit`, validates via Pydantic, returns default and writes it if file missing.
   - `save(cfg: AgentConfig) -> None` — atomic write: write to `config.toml.tmp` then `os.replace` to `config.toml`. Preserves comments in existing file where structure unchanged (tomlkit round-trip).
-  - `save_secret(name: str, plaintext: bytes) -> None` — protects via DPAPI, writes to `secrets/<name>.dpapi` atomically.
+  - `save_secret(name: str, plaintext: bytes) -> None` — protects via DPAPI, writes to `secrets/<name>.dpapi` atomically, then **applies an explicit Windows ACL denying READ/EXECUTE to the Low-integrity mandatory SID** (`S-1-16-4096`) and to `Everyone`, granting only the current user Read+Write. Use `win32security.SetNamedSecurityInfo` with a DACL built from `win32security.ACL()`. This is critical: without it, our Low-IL plugin subprocesses could read the DPAPI blob and decrypt it since DPAPI CurrentUser scope applies to any process in the same user session.
   - `load_secret(name: str) -> bytes` — reads and unprotects; raises `KeyError` if absent (no info leak).
   - `delete_secret(name: str) -> None`.
+  - `harden_file(path: Path) -> None` — extracted helper for the ACL work above; also applied by SPEC-08 to the CC MCP token file.
 - `tests/unit/security/test_signature.py` — verify against known-good vector (generate an Ed25519 keypair in the test with `nacl`, sign, verify true; flip a byte, verify false; malformed sig returns False not raise).
 - `tests/unit/security/test_dpapi.py` — Windows-only (skip on non-Windows via `pytest.mark.skipif`), round-trip a small blob.
 - `tests/unit/security/test_redact.py` — redaction table cases including `sk-abc...`, embedded in log lines, multiple keys per string.
