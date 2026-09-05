@@ -89,13 +89,22 @@ jobs:
               updater = @{ url = "https://github.com/${{ github.repository }}/releases/download/v$v/updater-$v-win-x64.exe"; sha256 = $updSha;   size = $updSize }
             }
           }
-          $manifest | ConvertTo-Json -Depth 6 | Out-File "$dist\manifest.json" -Encoding utf8
+          # Write to BOTH dist/manifest.json (for signing / uploads) and
+          # repo-root manifest.json (spec §"Release workflow" naming).
+          $json = ($manifest | ConvertTo-Json -Depth 6)
+          $json | Out-File "$dist\manifest.json" -Encoding utf8
+          $json | Out-File "manifest.json"      -Encoding utf8
 
       - name: Sign manifest (Ed25519)
         if: env.PC_AGENT_SIGNING_PRIVATE_KEY != ''
-        run: python scripts/sign_manifest.py dist/manifest.json
+        shell: pwsh
+        run: |
+          python scripts/sign_manifest.py dist/manifest.json
+          # Mirror the .sig alongside the repo-root manifest.json for the
+          # gh-release upload step below.
+          Copy-Item "dist\manifest.json.sig" "manifest.json.sig" -Force
 
-      - name: Authenticode-sign binaries
+      - name: Authenticode-sign binaries (placeholder — no-op without cert)
         if: env.PC_AGENT_CODESIGN_CERT_PATH != ''
         shell: pwsh
         run: |
@@ -113,20 +122,30 @@ jobs:
           path: |
             dist/agent-*.zip
             dist/updater-*.exe
+            dist/Updater.exe
             dist/manifest.json
             dist/manifest.json.sig
             dist/PersonaCore-Agent-Setup-*.exe
+            manifest.json
+            manifest.json.sig
 
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            dist/agent-*.zip
-            dist/updater-*.exe
-            dist/manifest.json
-            dist/manifest.json.sig
-            dist/PersonaCore-Agent-Setup-*.exe
-          fail_on_unmatched_files: false
+        shell: pwsh
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $v = "${{ steps.ver.outputs.version }}"
+          $tag = "v$v"
+          $title = "PersonaCore-Agent $tag"
+          $notes = "Automated release for $tag. See CHANGELOG for details."
+          # Assemble the artifact list per spec §"Release workflow":
+          # agent zip, Updater.exe, manifest.json + .sig, installer.
+          $assets = @(
+            (Get-Item "dist\agent-$v-win-x64.zip").FullName
+            (Get-Item "dist\Updater.exe").FullName
+            (Get-Item "manifest.json").FullName
+            (Get-Item "manifest.json.sig").FullName
+            (Get-Item "dist\PersonaCore-Agent-Setup-$v.exe").FullName
+          )
+          & gh release create $tag --title $title --notes $notes @assets

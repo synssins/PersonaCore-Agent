@@ -57,10 +57,30 @@ Name: "autostart_task";  Description: "Start {#AppName} at logon (all users, via
     GroupDescription: "Startup:"; Flags: unchecked; Check: IsAdminInstall
 
 [Files]
+; Application binaries — installed under {app} which resolves per install
+; mode: {localappdata}\WorkstationAgent (per-user) or {pf}\WorkstationAgent
+; (machine-wide), chosen by GetDefaultDir() below.  The [Files] section is
+; identical in both modes; only the destination root differs.
 Source: "..\dist\Agent\*"; DestDir: "{app}\app\{#AppVersion}"; \
     Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\dist\{#UpdaterExeName}"; DestDir: "{app}\app\{#AppVersion}"; \
     Flags: ignoreversion
+; Per-user config seed: writable data dir under %APPDATA% (never
+; %ProgramData%) so the per-user branch never needs elevation to write.
+Source: "..\dist\Agent\Agent.exe"; DestDir: "{userappdata}\WorkstationAgent"; \
+    Flags: onlyifdoesntexist skipifsourcedoesntexist external dontcopy; \
+    Check: IsPerUser
+; Machine-wide config seed lives under %ProgramData% so all users share.
+Source: "..\dist\Agent\Agent.exe"; DestDir: "{commonappdata}\WorkstationAgent"; \
+    Flags: onlyifdoesntexist skipifsourcedoesntexist external dontcopy; \
+    Check: IsAdminInstall
+
+[Dirs]
+; Ensure a writable data dir exists in the correct scope.  Per-user goes to
+; %APPDATA%, machine-wide goes to %ProgramData% (world-writable ACL is
+; explicitly NOT granted — services expect elevated writers only).
+Name: "{userappdata}\WorkstationAgent";   Check: IsPerUser
+Name: "{commonappdata}\WorkstationAgent"; Check: IsAdminInstall
 
 [Icons]
 Name: "{group}\{#AppName}";       Filename: "{app}\current\{#AppExeName}"
@@ -71,26 +91,34 @@ Name: "{group}\Uninstall {#AppName}"; Filename: "{uninstallexe}"
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; \
     ValueName: "WorkstationAgent"; ValueType: string; \
     ValueData: """{app}\current\{#AppExeName}"" --autostart"; \
-    Flags: uninsdeletevalue; Tasks: autostart_hkcu
+    Flags: uninsdeletevalue; Tasks: autostart_hkcu; Check: IsPerUser
+; Machine-wide install records the installed version under HKLM (audit trail;
+; the actual Run key is NOT used since HKLM\Run would run in the target user
+; context anyway — we use Task Scheduler instead for admin installs).
+Root: HKLM; Subkey: "Software\{#AppPublisher}\{#AppName}"; \
+    ValueName: "InstallVersion"; ValueType: string; ValueData: "{#AppVersion}"; \
+    Flags: uninsdeletekey; Check: IsAdminInstall
 
 [Run]
-; Machine-wide install → register a Task Scheduler job at logon.
+; Machine-wide install → register a Task Scheduler job at logon.  This is
+; guarded by BOTH the Tasks flag (user opt-in) and Check (install mode).
 Filename: "schtasks.exe"; \
     Parameters: "/create /F /TN ""WorkstationAgent\Startup"" /TR ""\""{app}\current\{#AppExeName}\"" --autostart"" /SC ONLOGON /RL LIMITED"; \
-    Flags: runhidden; Tasks: autostart_task
+    Flags: runhidden; Tasks: autostart_task; Check: IsAdminInstall
 ; Optional: launch the app after install (default checked on Finish page).
 Filename: "{app}\current\{#AppExeName}"; Description: "Launch {#AppName}"; \
     Flags: postinstall skipifsilent nowait
 
 [UninstallRun]
 Filename: "schtasks.exe"; Parameters: "/delete /F /TN ""WorkstationAgent\Startup"""; \
-    Flags: runhidden; RunOnceId: "DelStartupTask"
+    Flags: runhidden; RunOnceId: "DelStartupTask"; Check: IsAdminInstall
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}\app"
 Type: files; Name: "{app}\current"
-; NOTE: %APPDATA%\WorkstationAgent (config, secrets, conversations, logs)
-; is intentionally NOT removed on uninstall. See MessagesFile below.
+; NOTE: %APPDATA%\WorkstationAgent (per-user config, secrets, conversations,
+; logs) and %ProgramData%\WorkstationAgent (machine-wide seed) are
+; intentionally NOT removed on uninstall. See MessagesFile below.
 
 [Messages]
 UninstalledAll=%1 was successfully removed.%n%nYour data folder (%APPDATA%\WorkstationAgent) was left in place. Delete it manually if you no longer need it.

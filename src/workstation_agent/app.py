@@ -50,7 +50,7 @@ returns control to the main thread):
 
 Shutdown (:meth:`Application.shutdown`) reverses the above.
 """
-# ruff: noqa: ANN401, BLE001, PLC0415, PLR0915, SLF001
+# ruff: noqa: ANN401, BLE001, C901, PLC0415, PLR0915, SLF001
 
 from __future__ import annotations
 
@@ -132,6 +132,7 @@ class _Subsystems:
     ui_port: int = 0
     webview_window: Any = None
     http_client: Any = None
+    current_tts_task: Any = None
     started: dict[str, Health] = field(default_factory=dict)
 
 
@@ -285,6 +286,13 @@ class Application:
         self._shutdown_requested.set()
         webview_window = self._subs.webview_window
         if webview_window is not None:
+            # Thread-safety note (Bug 3 audit — false positive):
+            # WebviewWindow.stop() is thread-safe per SPEC-07B — it only
+            # enqueues ``("stop", None)`` onto the internal
+            # ``_pending_ops`` (a queue.SimpleQueue) which is drained by
+            # ``_process_queue`` on the pywebview worker thread.  No
+            # pywebview APIs are touched from the caller's thread here, so
+            # calling this from the systray thread (or any thread) is safe.
             with contextlib.suppress(Exception):
                 webview_window.stop()
 
@@ -328,7 +336,7 @@ class Application:
 
         self._webview_ready.set()
 
-    async def _shutdown_async(self) -> None:  # noqa: C901
+    async def _shutdown_async(self) -> None:
         """Reverse-order teardown from the asyncio thread."""
         subs = self._subs
 
@@ -356,6 +364,13 @@ class Application:
             subs.audio_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await subs.audio_task
+
+        # Abort any in-flight TTS synthesis so the shutdown doesn't
+        # dangle waiting for audio bytes to drain (see Bug 2 fix).
+        if subs.current_tts_task is not None:
+            with contextlib.suppress(Exception):
+                subs.current_tts_task.abort()
+            subs.current_tts_task = None
 
         if subs.mic is not None:
             with contextlib.suppress(Exception):
@@ -516,10 +531,14 @@ class Application:
         )
         self._subs.audio_session = session
 
-        # We do NOT block startup on the session run() — it is a persistent
-        # loop that only makes sense with a live wake source.  In fake mode
-        # the boot check drives the session's on_transcribed hook directly
-        # via a helper, so we skip session.run() entirely.
+        # Bug 1 fix: spawn AudioSession.run() as a background task in real
+        # mode so wake events actually trigger the STT/LLM/TTS pipeline.
+        # In fake mode the boot check drives on_transcribed directly and the
+        # session state machine has no live wake source, so we skip the task.
+        if not self._fake:
+            self._subs.audio_task = asyncio.create_task(
+                session.run(), name="audio-session-run",
+            )
         self._subs.started["audio_pipeline"] = Health(ok=True, detail=f"mode={mode.value}")
         self._subs.started["llm_client"] = Health(ok=True, detail=cfg.llm.model)
 
@@ -555,7 +574,26 @@ class Application:
                     chunks.append(getattr(event, "text", ""))  # noqa: PERF401
         except Exception:
             log.exception("LLMTurn raised")
-        return "".join(chunks)
+        reply = "".join(chunks)
+        # Bug 2 fix: fire TTS on the completed turn text and track the
+        # AbortableTask so barge-in / shutdown can cancel it.  Audio chunks
+        # are drained onto the Speaker so the pipeline actually produces
+        # audible output in real mode.
+        if reply and self._subs.tts is not None:
+            try:
+                tts_task = await self._subs.tts.speak(reply)
+                self._subs.current_tts_task = tts_task
+                async for chunk in self._subs.tts.audio_chunks(tts_task):
+                    if self._subs.speaker is not None:
+                        self._subs.speaker.enqueue(chunk)
+            except Exception:
+                log.exception("real-mode tts flow failed")
+            finally:
+                self._subs.current_tts_task = None
+        # Return "" so AudioSession's own _run_speaking is effectively a
+        # no-op (empty text yields no synthesis chunks) and we don't
+        # double-speak.  The state machine still advances normally.
+        return ""
 
     async def _start_fastapi_backend(self) -> None:
         """Bind FastAPI on an ephemeral port; write ``ui-port`` for pywebview."""
@@ -656,6 +694,25 @@ class Application:
 
                 with contextlib.suppress(Exception):
                     show_update_toast(toast, manifest.version)
+            # Gap 4 fix: voice-announce the update (fire-and-forget) when
+            # the user has opted in via notifications.voice_announce_updates_enabled.
+            notif_cfg = getattr(self._subs.config, "notifications", None)
+            voice_ok = bool(getattr(notif_cfg, "voice_announce_updates_enabled", False))
+            tts = self._subs.tts
+            if voice_ok and tts is not None:
+                announce = (
+                    f"Update {manifest.version} available. "
+                    "Say 'update' to install."
+                )
+
+                async def _announce() -> None:
+                    with contextlib.suppress(Exception):
+                        task = await tts.speak(announce)
+                        async for chunk in tts.audio_chunks(task):
+                            if self._subs.speaker is not None:
+                                self._subs.speaker.enqueue(chunk)
+
+                asyncio.create_task(_announce(), name="update-voice-announce")  # noqa: RUF006
 
         if self._fake:
             self._subs.started["update_poller"] = Health(ok=True, detail="skipped (fake)")

@@ -13,14 +13,17 @@ Success criteria (all must pass within 30 seconds total):
 
 The script exits ``0`` on success, non-zero + a summary on failure.
 """
+# ruff: noqa: PLR0912, PLR0915
 
 from __future__ import annotations
 
 import argparse
 import asyncio
 import contextlib
+import os
 import sys
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -98,10 +101,47 @@ async def _run_boot_check() -> int:
             print(f"[BOOT-CHECK] /dashboard request FAILED: {exc!r}")
             return 5
 
+        # Gap 3: assert the ui-port file exists on disk and contains a
+        # parseable port number matching the bound uvicorn port.
+        # Path resolution mirrors ui.backend.app._appdata_root():
+        #   PC_AGENT_APPDATA (if set) is used directly as the root, else
+        #   %APPDATA%\WorkstationAgent (or ~\WorkstationAgent).
+        override = os.environ.get("PC_AGENT_APPDATA")
+        if override:
+            appdata_root = Path(override)
+        else:
+            base = os.environ.get("APPDATA") or str(Path.home())
+            appdata_root = Path(base) / "WorkstationAgent"
+        port_file = appdata_root / "ui-port"
+        if not port_file.exists():
+            print(f"[BOOT-CHECK] ui-port file missing at {port_file}")
+            return 9
+        try:
+            file_port = int(port_file.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError) as exc:
+            print(f"[BOOT-CHECK] ui-port file unreadable/unparseable: {exc!r}")
+            return 9
+        if file_port != port:
+            print(
+                f"[BOOT-CHECK] ui-port file mismatch: file={file_port} bound={port}",
+            )
+            return 9
+
         # systray thread
         tray = app._subs.tray  # noqa: SLF001
         if tray is None:
             print("[BOOT-CHECK] systray not started")
+            return 6
+        # Gap 3: assert the systray's background thread is alive after
+        # startup.  In headless mode the composition root skips
+        # ``run_detached`` (no Win32 desktop guaranteed), so pystray
+        # never spawns its thread.  We surface both cases explicitly:
+        # if an icon was created, its thread must be alive; if not
+        # (headless), we still confirm the tray object exists.
+        icon = getattr(tray, "_icon", None)
+        tray_thread = getattr(icon, "_thread", None) if icon is not None else None
+        if tray_thread is not None and not tray_thread.is_alive():
+            print("[BOOT-CHECK] systray thread not alive")
             return 6
 
         # audio round-trip
