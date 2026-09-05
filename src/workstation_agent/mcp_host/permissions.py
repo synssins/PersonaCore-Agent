@@ -107,6 +107,46 @@ CONDITION_CHECKERS: dict[str, _ConditionChecker] = {
 }
 
 
+def _check_tool_permission(
+    plugin: PluginManifest,
+    tool: str,
+    granted: set[str],
+) -> PermissionDecision:
+    """Evaluate the tool-identity gate: declared AND granted.
+
+    Returns ``"deny"`` for either bug-1 failure mode, otherwise ``"allow"``.
+
+    Decision table (only cell 1 permits the call to proceed):
+    * declared AND granted           → allow
+    * declared AND NOT granted       → deny (user hasn't authorised)
+    * NOT declared AND granted       → deny (plugin never declared it)
+    * NOT declared AND NOT granted   → deny
+    """
+    if not plugin.declared_permissions:
+        return "allow"
+    tool_perm = f"tool:{tool}"
+    declared_tool_perms = {
+        p for p in plugin.declared_permissions if p.startswith("tool:") or p == "*"
+    }
+    if not declared_tool_perms:
+        return "allow"
+    declared_ok = tool_perm in declared_tool_perms or "*" in declared_tool_perms
+    granted_ok = tool_perm in granted or "*" in granted
+    if not declared_ok:
+        log.warning(
+            "deny: tool=%s not in declared_permissions for plugin=%s",
+            tool, plugin.id,
+        )
+        return "deny"
+    if not granted_ok:
+        log.warning(
+            "deny: tool=%s declared but not granted for plugin=%s",
+            tool, plugin.id,
+        )
+        return "deny"
+    return "allow"
+
+
 def evaluate(
     plugin: PluginManifest,
     tool: str,
@@ -125,25 +165,9 @@ def evaluate(
     Returns:
         ``"allow"``, ``"deny"``, or ``"confirm"``.
     """
-    if plugin.declared_permissions:
-        tool_perm = f"tool:{tool}"
-        if tool_perm not in granted and "*" not in granted:
-            declared_tool_perms = {
-                p
-                for p in plugin.declared_permissions
-                if p.startswith("tool:") or p == "*"
-            }
-            if (
-                declared_tool_perms
-                and tool_perm not in declared_tool_perms
-                and "*" not in declared_tool_perms
-            ):
-                log.warning(
-                    "deny: tool=%s not in declared_permissions for plugin=%s",
-                    tool,
-                    plugin.id,
-                )
-                return "deny"
+    tool_decision = _check_tool_permission(plugin, tool, granted)
+    if tool_decision == "deny":
+        return "deny"
 
     for condition_name in plugin.confirmable_conditions:
         checker = CONDITION_CHECKERS.get(condition_name)

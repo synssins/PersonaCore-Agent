@@ -26,6 +26,7 @@ from __future__ import annotations
 import hashlib
 import importlib.metadata
 import importlib.resources
+import importlib.util
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -229,6 +230,55 @@ def _manifest_dict(manifest: PluginManifest) -> dict[str, Any]:
     }
 
 
+def _resolve_module_paths(module_name: str) -> list[Path]:
+    """Return the .py files backing *module_name* (single file or package)."""
+    try:
+        spec = importlib.util.find_spec(module_name)
+    except (ImportError, ValueError):
+        return []
+    if spec is None:
+        return []
+    paths: list[Path] = []
+    if spec.origin and spec.origin != "built-in":
+        paths.append(Path(spec.origin))
+    if spec.submodule_search_locations:  # it's a package
+        for loc in spec.submodule_search_locations:
+            pkg_dir = Path(loc)
+            for name in ("__init__.py", "__main__.py"):
+                p = pkg_dir / name
+                if p.exists() and p not in paths:
+                    paths.append(p)
+    return paths
+
+
+def _entry_file_paths(entry: list[str], plugin_dir: Path | None = None) -> list[Path]:
+    """Resolve entry command to the set of code files whose hash is signed.
+
+    For ``-m <module>`` entries, uses :func:`importlib.util.find_spec` to
+    resolve the module.  For plain module files, hashes the single file.
+    For packages, hashes ``__init__.py`` and ``__main__.py`` (both if present).
+    Also collects any positional argument that resolves to an existing file
+    on disk (either absolute or relative to *plugin_dir*).
+    """
+    paths: list[Path] = []
+    it = iter(entry)
+    for arg in it:
+        if arg == "-m":
+            module_name = next(it, None)
+            if module_name is None:
+                break
+            for p in _resolve_module_paths(module_name):
+                if p not in paths:
+                    paths.append(p)
+        else:
+            candidate = Path(arg)
+            if not candidate.is_absolute() and plugin_dir is not None:
+                candidate = plugin_dir / arg
+            if candidate.is_file():
+                paths.append(candidate)
+    return paths
+
+
 def _verify_inner(
     manifest: PluginManifest,
     pubkeys: list[bytes],
@@ -239,14 +289,8 @@ def _verify_inner(
         return VerifyResult(status="invalid", reason=f"bad signature length: {len(raw_sig)}")
 
     manifest_bytes = _sig.canonical_json(_manifest_dict(manifest))
-    entry_hash_parts: list[bytes] = []
-    for entry_item in manifest.entry:
-        candidate = Path(entry_item)
-        if not candidate.is_absolute():
-            candidate = manifest.plugin_dir / entry_item
-        if candidate.is_file():
-            h = hashlib.sha256(candidate.read_bytes()).digest()
-            entry_hash_parts.append(h)
+    entry_paths = _entry_file_paths(manifest.entry, manifest.plugin_dir)
+    entry_hash_parts = [hashlib.sha256(p.read_bytes()).digest() for p in entry_paths]
 
     message = manifest_bytes + b"\n" + b"".join(entry_hash_parts)
 

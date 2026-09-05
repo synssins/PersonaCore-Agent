@@ -44,16 +44,14 @@ _SIG_FILE = _HELLO_WORLD_DIR / "signature.sig"
 
 
 def _build_message(manifest_dict: dict, plugin_dir: Path, entry: list[str]) -> bytes:
-    """Reproduce the exact message that loader.verify() checks."""
+    """Reproduce the exact message that loader.verify() checks.
+
+    Delegates to :func:`loader._entry_file_paths` so any change to the loader's
+    hash-set is picked up automatically.
+    """
     manifest_bytes = _sig.canonical_json(manifest_dict)
-    entry_hash_parts: list[bytes] = []
-    for entry_item in entry:
-        candidate = Path(entry_item)
-        if not candidate.is_absolute():
-            candidate = plugin_dir / entry_item
-        if candidate.is_file():
-            h = hashlib.sha256(candidate.read_bytes()).digest()
-            entry_hash_parts.append(h)
+    entry_paths = _loader._entry_file_paths(entry, plugin_dir)
+    entry_hash_parts = [hashlib.sha256(p.read_bytes()).digest() for p in entry_paths]
     return manifest_bytes + b"\n" + b"".join(entry_hash_parts)
 
 

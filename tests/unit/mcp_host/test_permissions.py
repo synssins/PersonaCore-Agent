@@ -5,6 +5,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from workstation_agent.mcp_host.loader import PluginManifest
 from workstation_agent.mcp_host.permissions import (
     CONDITION_CHECKERS,
@@ -201,3 +203,34 @@ def test_domain_outside_allowlist():
     m = _manifest(declared_permissions=["domain:api.example.com"])
     checker = CONDITION_CHECKERS["domain_outside_allowlist"]
     assert checker(m, "tool", {"url": "https://evil.io/steal"})
+
+
+# ---------------------------------------------------------------------------
+# 4-cell permission decision table:
+#     (declared or not) x (granted or not)
+# Only cell (declared AND granted) may allow.  All other cells must deny.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    ("declared", "granted", "expected"),
+    [
+        # cell (True, True)   → declared AND granted → allow
+        (True,  True,  "allow"),
+        # cell (True, False)  → declared but NOT granted → deny (the fixed bug)
+        (True,  False, "deny"),
+        # cell (False, True)  → NOT declared but somehow granted → deny
+        #   (plugin never declared this capability; grant alone is not enough)
+        (False, True,  "deny"),
+        # cell (False, False) → NOT declared, NOT granted → deny
+        (False, False, "deny"),
+    ],
+)
+def test_evaluate_permission_table(declared, granted, expected):
+    """Table-driven proof that only (declared AND granted) yields allow."""
+    # Manifest always declares SOMETHING tool-scoped so the check is active.
+    declared_perms = ["tool:target_tool"] if declared else ["tool:other_tool"]
+    granted_perms: set[str] = {"tool:target_tool"} if granted else set()
+    m = _manifest(declared_permissions=declared_perms)
+    decision = evaluate(m, "target_tool", {}, granted=granted_perms)
+    assert decision == expected, (
+        f"declared={declared}, granted={granted}: expected {expected}, got {decision}"
+    )

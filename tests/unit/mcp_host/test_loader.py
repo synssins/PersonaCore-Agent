@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import importlib.metadata
 from pathlib import Path
@@ -254,6 +255,107 @@ def test_discover_entry_point_source(tmp_path, monkeypatch):
 
     manifests = loader._discover_entry_points()
     assert any(m.id == "ep_plugin" for m in manifests)
+
+
+def _sign_hello_world_bundle(pubkey_bytes: bytes, signing_key: SigningKey) -> None:
+    """Re-sign the bundled hello_world plugin with *signing_key* and register pubkey."""
+    manifests = loader._discover_bundled()
+    hw = next(m for m in manifests if m.id == "hello_world")
+    manifest_dict = loader._manifest_dict(hw)
+    manifest_bytes = _sig.canonical_json(manifest_dict)
+    entry_paths = loader._entry_file_paths(hw.entry, hw.plugin_dir)
+    entry_hash_parts = [
+        hashlib.sha256(p.read_bytes()).digest() for p in entry_paths
+    ]
+    message = manifest_bytes + b"\n" + b"".join(entry_hash_parts)
+    signed = signing_key.sign(message)
+    hw.signature_file.write_bytes(signed.signature)
+    if pubkey_bytes not in loader.TRUSTED_PUBKEYS:
+        loader.TRUSTED_PUBKEYS.append(pubkey_bytes)
+
+
+def test_entry_file_paths_resolves_module_and_package():
+    """_entry_file_paths for hello_world returns both __init__.py and __main__.py."""
+    paths = loader._entry_file_paths(
+        ["-m", "workstation_agent.plugins.hello_world"],
+        _HELLO_WORLD_DIR,
+    )
+    names = {p.name for p in paths}
+    # Package: at least __init__.py and __main__.py must be covered.
+    assert "__init__.py" in names
+    assert "__main__.py" in names
+
+
+def test_entry_file_paths_handles_unknown_module():
+    """Unknown module name returns empty list (no crash)."""
+    paths = loader._entry_file_paths(["-m", "this.module.does.not.exist_xyz"], None)
+    assert paths == []
+
+
+def test_entry_file_paths_handles_dangling_dash_m():
+    """`-m` with no following argument does not raise."""
+    paths = loader._entry_file_paths(["-m"], None)
+    assert paths == []
+
+
+def test_entry_file_hashing_includes_module_files():
+    """Tampering with __main__.py of a signed plugin flips verify → 'invalid'."""
+    signing_key = SigningKey.generate()
+    pubkey = bytes(signing_key.verify_key)
+
+    original_sig = (_HELLO_WORLD_DIR / "signature.sig").read_bytes()
+    main_path = _HELLO_WORLD_DIR / "__main__.py"
+    original_main = main_path.read_bytes()
+    try:
+        # Sign the plugin fresh with the test key.
+        _sign_hello_world_bundle(pubkey, signing_key)
+
+        # Sanity check: unmodified plugin verifies.
+        hw = next(m for m in loader._discover_bundled() if m.id == "hello_world")
+        good = loader.verify(hw, [pubkey], allow_unsigned=False)
+        assert good.status == "valid", good.reason
+
+        # Tamper: change one byte in __main__.py.
+        main_path.write_bytes(original_main + b"\n# tampered\n")
+
+        tampered = loader.verify(hw, [pubkey], allow_unsigned=False)
+        assert tampered.status == "invalid", (
+            f"expected invalid after __main__.py tamper, got {tampered.status}"
+        )
+    finally:
+        main_path.write_bytes(original_main)
+        (_HELLO_WORLD_DIR / "signature.sig").write_bytes(original_sig)
+        with contextlib.suppress(ValueError):
+            loader.TRUSTED_PUBKEYS.remove(pubkey)
+
+
+def test_entry_file_hashing_covers_package_init_and_main():
+    """Tampering with __init__.py of a signed plugin flips verify → 'invalid'."""
+    signing_key = SigningKey.generate()
+    pubkey = bytes(signing_key.verify_key)
+
+    original_sig = (_HELLO_WORLD_DIR / "signature.sig").read_bytes()
+    init_path = _HELLO_WORLD_DIR / "__init__.py"
+    original_init = init_path.read_bytes()
+    try:
+        _sign_hello_world_bundle(pubkey, signing_key)
+
+        hw = next(m for m in loader._discover_bundled() if m.id == "hello_world")
+        good = loader.verify(hw, [pubkey], allow_unsigned=False)
+        assert good.status == "valid", good.reason
+
+        # Tamper: change one byte in __init__.py.
+        init_path.write_bytes(original_init + b"\n# tampered\n")
+
+        tampered = loader.verify(hw, [pubkey], allow_unsigned=False)
+        assert tampered.status == "invalid", (
+            f"expected invalid after __init__.py tamper, got {tampered.status}"
+        )
+    finally:
+        init_path.write_bytes(original_init)
+        (_HELLO_WORLD_DIR / "signature.sig").write_bytes(original_sig)
+        with contextlib.suppress(ValueError):
+            loader.TRUSTED_PUBKEYS.remove(pubkey)
 
 
 def test_discover_deduplication(tmp_path, monkeypatch):
