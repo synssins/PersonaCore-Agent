@@ -1,11 +1,19 @@
 """Audio subsystem: wake word detection, STT, TTS, session management.
 
-Threading pattern (sounddevice):
-    Both MicStream and Speaker use asyncio.to_thread to run the blocking
-    sounddevice read/write loop off the asyncio event loop. Frames are passed
-    through an asyncio.Queue bridged from that thread via
-    asyncio.get_running_loop().call_soon_threadsafe so that the C callback
-    thread never touches the event loop directly.
+Threading patterns (sounddevice):
+    Mic side — MicStream wraps sounddevice.InputStream whose C callback runs
+    on a dedicated PortAudio thread.  Frames are handed into an asyncio.Queue
+    via asyncio.get_running_loop().call_soon_threadsafe; the blocking capture
+    loop itself is offloaded with asyncio.to_thread so it never runs on the
+    event-loop thread.
+
+    Speaker side — Speaker owns a single daemon threading.Thread
+    (``speaker-play``) that blocks on queue.SimpleQueue.get().  PCM chunks are
+    pushed onto that queue by enqueue() (thread-safe); the background thread
+    drains it and calls sounddevice.OutputStream.write().  There is no
+    asyncio.to_thread involved: the thread is created and managed manually so
+    it can be kept alive across multiple play requests and torn down cleanly
+    on stop().
 """
 
 from workstation_agent.audio.mic import AudioFrame, MicStream

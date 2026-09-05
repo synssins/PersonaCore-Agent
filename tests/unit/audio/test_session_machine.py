@@ -294,6 +294,97 @@ async def test_state_property() -> None:
 
 
 @pytest.mark.asyncio
+async def test_barge_in_speaking_goes_to_listening_not_idle() -> None:
+    """SPEAKING -> barge-in fires -> TTS cancelled -> next tick is LISTENING.
+
+    Verifies the fix for the bug where _run_idle() cleared _wake_trigger on
+    entry, causing the agent to hang in IDLE instead of jumping to LISTENING
+    after a barge-in.  With the fix, _barge_in_pending bypasses _run_idle
+    entirely so the machine lands in LISTENING on the very next loop tick.
+    """
+    # Use a slow TTS so we can fire barge-in while the session is in SPEAKING.
+    slow_audio_available = asyncio.Event()
+    slow_audio_ready = asyncio.Event()
+
+    class _SlowTTS:
+        def __init__(self) -> None:
+            self.spoken: list[str] = []
+            self._task: AbortableTask | None = None
+            self.aborted = False
+
+        async def speak(self, text: str) -> AbortableTask:
+            self.spoken.append(text)
+            q: asyncio.Queue[bytes | None] = asyncio.Queue()
+            task_obj = asyncio.create_task(_noop(), name="slow-tts-task")
+            t = AbortableTask(task=task_obj, audio_queue=q)
+            self._task = t
+            return t
+
+        async def audio_chunks(self, task: AbortableTask) -> AsyncIterator[bytes]:  # noqa: ARG002
+            slow_audio_available.set()  # signal: we are now in SPEAKING
+            await slow_audio_ready.wait()  # block until test releases us
+            # Never actually yields a chunk — barge-in will cancel first.
+            # The `if False` branch makes pyright recognize this as an async gen.
+            if False:
+                yield b""
+
+    stt = _FakeSTT("hello")
+    tts = _SlowTTS()
+    speaker = _FakeSpeaker()
+    events: list[AudioEvent] = []
+
+    async def on_transcribed(_text: str) -> str:
+        return "world"
+
+    session = AudioSession(
+        stt=stt,  # type: ignore[arg-type]
+        tts=tts,  # type: ignore[arg-type]
+        speaker=speaker,  # type: ignore[arg-type]
+        on_transcribed=on_transcribed,  # type: ignore[arg-type]
+        on_event=events.append,
+        mode=SessionMode.PERSISTENT,
+        silence_timeout=2.0,
+    )
+
+    run_task = asyncio.create_task(session.run())
+
+    # Trigger first wake -> listening -> thinking -> speaking
+    await asyncio.sleep(0.01)
+    session.on_wake(_wake_event())
+    await asyncio.sleep(0.01)
+    session.push_frame(_fake_frame())
+    session._frame_queue.put_nowait(None)
+
+    # Wait until the state machine is inside SPEAKING (audio_chunks blocking)
+    await asyncio.wait_for(slow_audio_available.wait(), timeout=2.0)
+    assert session.state == "speaking", f"Expected speaking, got {session.state}"
+
+    # Fire barge-in
+    session.on_wake(_wake_event("barge-in"))
+    slow_audio_ready.set()  # unblock audio_chunks so the coroutine can exit
+
+    # Give the loop a few ticks to transition
+    await asyncio.sleep(0.1)
+
+    state_names = [e.state for e in events]
+    # The machine must have visited LISTENING after SPEAKING (not stalled in IDLE)
+    speaking_idx = max(i for i, e in enumerate(events) if e.state == "speaking")
+    post_speaking = [e.state for e in events[speaking_idx + 1:]]
+    assert "listening" in post_speaking, (
+        f"Expected LISTENING after SPEAKING via barge-in, "
+        f"post-speaking states: {post_speaking}  (all: {state_names})"
+    )
+    assert "idle" not in post_speaking, (
+        f"IDLE must NOT appear between SPEAKING and LISTENING during barge-in, "
+        f"post-speaking states: {post_speaking}"
+    )
+
+    run_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await run_task
+
+
+@pytest.mark.asyncio
 async def test_on_event_emits_audio_events() -> None:
     """on_event must be called with AudioEvent on each transition."""
     session, _stt, _tts, _speaker, events = _make_session(mode=SessionMode.SINGLE_SHOT)

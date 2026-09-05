@@ -115,6 +115,9 @@ class AudioSession:
         self._current_tts_task: AbortableTask | None = None
         self._wake_trigger: asyncio.Event = asyncio.Event()
         self._frame_queue: asyncio.Queue[AudioFrame | None] = asyncio.Queue(maxsize=200)
+        # Set to True by _barge_in(); causes the main loop to skip _run_idle
+        # and proceed directly to LISTENING on the next iteration.
+        self._barge_in_pending: bool = False
 
     # ------------------------------------------------------------------
     # External triggers (from WakeDetector / PushToTalk callbacks)
@@ -149,7 +152,12 @@ class AudioSession:
         """Run the state machine until the task is cancelled."""
         self._emit(_State.IDLE)
         while True:
-            await self._run_idle()
+            # If a barge-in fired during SPEAKING, skip IDLE entirely and go
+            # straight to LISTENING so the agent picks up the new utterance.
+            if self._barge_in_pending:
+                self._barge_in_pending = False
+            else:
+                await self._run_idle()
             await self._run_listening()
             transcript = await self._run_thinking()
             if transcript is None:
@@ -168,6 +176,8 @@ class AudioSession:
         self._transition(_State.IDLE)
         self._wake_trigger.clear()
         await self._wake_trigger.wait()
+        # Do NOT clear here — _run_listening will consume the event naturally.
+        # Clearing is deferred to the top of the next _run_idle call above.
 
     async def _run_listening(self) -> None:
         self._transition(_State.LISTENING)
@@ -222,12 +232,17 @@ class AudioSession:
             self._current_tts_task = None
 
     def _barge_in(self) -> None:
-        """Cancel active TTS and transition to LISTENING (barge-in)."""
+        """Cancel active TTS and arrange for the next loop tick to be LISTENING.
+
+        Instead of relying on _wake_trigger (which _run_idle clears on entry),
+        we set _barge_in_pending so run() skips _run_idle altogether and jumps
+        directly to _run_listening on the next iteration.
+        """
         log.info("barge_in")
         if self._current_tts_task is not None:
             self._current_tts_task.abort()
             self._speaker.abort()
-        self._wake_trigger.set()
+        self._barge_in_pending = True
 
     # ------------------------------------------------------------------
     # Helpers

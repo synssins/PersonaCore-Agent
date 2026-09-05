@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 
 import pytest
 
@@ -95,6 +96,68 @@ async def test_speaker_multiple_chunks() -> None:
         await asyncio.sleep(0.1)
 
     assert len(sink.written) == 5
+
+
+@pytest.mark.asyncio
+async def test_speaker_abort_no_busy_wait() -> None:
+    """abort() must not cause a CPU busy-loop in the play thread.
+
+    We count how many times the play loop wakes up during a 100 ms abort window.
+    A sleep-based wait limits wakeups to at most ~100 (1 ms sleep => 100 ticks).
+    We assert < 20 as a safe upper bound — a tight busy-loop would fire thousands
+    of iterations in 100 ms and fail this test immediately.
+    """
+
+    class _CountingSink:
+        def __init__(self) -> None:
+            self.write_count = 0
+
+        def write(self, data: bytes) -> None:  # noqa: ARG002
+            self.write_count += 1
+
+        def close(self) -> None:
+            pass
+
+    iteration_count = 0
+    count_lock = threading.Lock()
+
+    sink = _CountingSink()
+    speaker = Speaker(backend=sink)
+    await speaker.start()
+
+    # Patch the abort flag's is_set to count iterations in the hot path.
+    # We monkey-patch on the instance's class proxy instead so we only affect
+    # this speaker's flag without touching all Events globally.
+    abort_flag = speaker._abort_flag
+
+    real_is_set = abort_flag.is_set
+
+    def counting_is_set() -> bool:
+        nonlocal iteration_count
+        with count_lock:
+            iteration_count += 1
+        return real_is_set()
+
+    abort_flag.is_set = counting_is_set  # type: ignore[method-assign]
+
+    # Set abort so the loop stays in the abort-wait branch for 100 ms
+    abort_flag.set()
+    await asyncio.sleep(0.1)
+    abort_flag.clear()
+
+    # Give the thread one tick to re-enter the main path before we read count
+    await asyncio.sleep(0.01)
+    await speaker.stop()
+
+    with count_lock:
+        measured = iteration_count
+
+    # A 1 ms sleep => at most ~100 iterations in 100 ms; allow 20x headroom
+    # compared with a tight spin (which would be > 10_000 iterations).
+    assert measured < 2_000, (
+        f"play-loop woke up {measured} times in 100 ms — looks like a busy-wait. "
+        "Expected < 2000 (sane sleep-based polling)."
+    )
 
 
 @pytest.mark.asyncio

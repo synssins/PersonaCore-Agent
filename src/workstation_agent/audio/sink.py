@@ -20,6 +20,7 @@ import contextlib
 import logging
 import queue
 import threading
+import time
 from typing import Protocol, Self
 
 log = logging.getLogger(__name__)
@@ -168,15 +169,21 @@ class Speaker:
         if self._backend is None:
             return
         while True:
+            # If abort is active, sleep briefly instead of spinning so we do
+            # not peg a CPU core waiting for the flag to clear.
             if self._abort_flag.is_set():
+                time.sleep(0.001)
                 continue
             try:
-                item = self._queue.get()
+                item = self._queue.get(timeout=0.05)
+            except queue.Empty:
+                continue
             except Exception:  # noqa: BLE001
                 break
             if item is None:
                 break
             if self._abort_flag.is_set():
+                # Drop this chunk — abort was called between the get and now.
                 continue
             with contextlib.suppress(Exception):
                 self._backend.write(item)
