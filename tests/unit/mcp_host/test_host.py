@@ -203,7 +203,7 @@ async def test_invoke_confirm_rejected(isolated_audit_db):
     """invoke() raises PermissionError when user rejects confirm prompt."""
     manifest = _make_manifest("confirm_plugin")
     manifest.confirmable_conditions = ["outside_declared_paths"]
-    manifest.declared_permissions = ["path:/safe/"]
+    manifest.declared_permissions = ["tool:confirm_plugin.write", "path:/safe/"]
 
     vresult = VerifyResult(status="unsigned")
     fake_runtime = host_mod._PluginRuntime(
@@ -211,7 +211,7 @@ async def test_invoke_confirm_rejected(isolated_audit_db):
         verify_result=vresult,
         status="running",
         tools=[{"name": "confirm_plugin.write"}],
-        granted_permissions=set(),
+        granted_permissions={"tool:confirm_plugin.write"},
     )
     fake_runtime.client = AsyncMock()
 
@@ -231,7 +231,7 @@ async def test_invoke_confirm_accepted(isolated_audit_db):
     """invoke() proceeds when confirm_cb returns True."""
     manifest = _make_manifest("confirm_plugin2")
     manifest.confirmable_conditions = ["outside_declared_paths"]
-    manifest.declared_permissions = ["path:/safe/"]
+    manifest.declared_permissions = ["tool:confirm_plugin2.write", "path:/safe/"]
 
     vresult = VerifyResult(status="unsigned")
     fake_client = AsyncMock()
@@ -245,7 +245,7 @@ async def test_invoke_confirm_accepted(isolated_audit_db):
         verify_result=vresult,
         status="running",
         tools=[{"name": "confirm_plugin2.write"}],
-        granted_permissions=set(),
+        granted_permissions={"tool:confirm_plugin2.write"},
         client=fake_client,
     )
 
@@ -348,7 +348,7 @@ async def test_tts_speak_called_on_confirm(isolated_audit_db):
     """_do_confirm calls tts_speak.speak when tts_speak is set."""
     manifest = _make_manifest("tts_test")
     manifest.confirmable_conditions = ["outside_declared_paths"]
-    manifest.declared_permissions = ["path:/safe/"]
+    manifest.declared_permissions = ["tool:tts_test.write", "path:/safe/"]
 
     vresult = VerifyResult(status="unsigned")
     fake_client = AsyncMock()
@@ -361,7 +361,7 @@ async def test_tts_speak_called_on_confirm(isolated_audit_db):
         verify_result=vresult,
         status="running",
         tools=[{"name": "tts_test.write"}],
-        granted_permissions=set(),
+        granted_permissions={"tool:tts_test.write"},
         client=fake_client,
     )
 
@@ -454,7 +454,9 @@ async def test_stop_skips_already_closed(isolated_audit_db):
 @pytest.mark.asyncio
 async def test_invoke_tool_error_logged(isolated_audit_db):
     """When tools_call raises, a tool_error audit event is written."""
-    manifest = _make_manifest("err_plugin")
+    manifest = _make_manifest(
+        "err_plugin", declared_permissions=["tool:err_plugin.fail"],
+    )
     vresult = VerifyResult(status="unsigned")
     fake_client = AsyncMock()
     fake_client.tools_call = AsyncMock(side_effect=RuntimeError("oops"))
@@ -464,7 +466,7 @@ async def test_invoke_tool_error_logged(isolated_audit_db):
         verify_result=vresult,
         status="running",
         tools=[{"name": "err_plugin.fail"}],
-        granted_permissions=set(),
+        granted_permissions={"tool:err_plugin.fail"},
         client=fake_client,
     )
     h = MCPHost()

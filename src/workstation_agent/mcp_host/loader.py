@@ -251,7 +251,7 @@ def _resolve_module_paths(module_name: str) -> list[Path]:
     return paths
 
 
-def _entry_file_paths(entry: list[str], plugin_dir: Path | None = None) -> list[Path]:
+def _entry_file_paths(entry: list[str], plugin_dir: Path) -> list[Path]:
     """Resolve entry command to the set of code files whose hash is signed.
 
     For ``-m <module>`` entries, uses :func:`importlib.util.find_spec` to
@@ -259,6 +259,14 @@ def _entry_file_paths(entry: list[str], plugin_dir: Path | None = None) -> list[
     For packages, hashes ``__init__.py`` and ``__main__.py`` (both if present).
     Also collects any positional argument that resolves to an existing file
     on disk (either absolute or relative to *plugin_dir*).
+
+    When a ``-m <module>`` entry cannot be resolved via ``sys.path`` (typical
+    for external user-installed plugins under ``%APPDATA%\\WorkstationAgent
+    \\plugins\\``), falls back to hashing every ``*.py`` file under
+    *plugin_dir* (recursively, deterministic order) so the signature always
+    covers the plugin's code.  Likewise, if the entry produces zero paths
+    (e.g. entry is just ``["python"]``), falls back to hashing every ``*.py``
+    under *plugin_dir* so the signature is never trivially empty.
     """
     paths: list[Path] = []
     it = iter(entry)
@@ -267,15 +275,28 @@ def _entry_file_paths(entry: list[str], plugin_dir: Path | None = None) -> list[
             module_name = next(it, None)
             if module_name is None:
                 break
-            for p in _resolve_module_paths(module_name):
-                if p not in paths:
-                    paths.append(p)
+            resolved = _resolve_module_paths(module_name)
+            if resolved:
+                for p in resolved:
+                    if p not in paths:
+                        paths.append(p)
+            else:
+                # External plugin whose module isn't on sys.path.
+                # Hash every .py file under plugin_dir (recursive, deterministic).
+                for py_path in sorted(plugin_dir.rglob("*.py")):
+                    if py_path not in paths:
+                        paths.append(py_path)
         else:
             candidate = Path(arg)
-            if not candidate.is_absolute() and plugin_dir is not None:
+            if not candidate.is_absolute():
                 candidate = plugin_dir / arg
             if candidate.is_file():
                 paths.append(candidate)
+    # Fallback: if entry produced ZERO paths (e.g. entry is ["python"] with
+    # no -m and no positional file), hash every .py in plugin_dir so the
+    # signature is never trivially empty.
+    if not paths:
+        paths = sorted(plugin_dir.rglob("*.py"))
     return paths
 
 

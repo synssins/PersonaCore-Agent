@@ -32,11 +32,11 @@ def _manifest(
     )
 
 
-def test_evaluate_allow_no_permissions():
-    """No declared permissions → allow everything."""
+def test_evaluate_deny_no_permissions():
+    """No declared permissions → deny (security default)."""
     m = _manifest()
     decision = evaluate(m, "some.tool", {"x": 1}, granted=set())
-    assert decision == "allow"
+    assert decision == "deny"
 
 
 def test_evaluate_allow_granted_wildcard():
@@ -68,77 +68,85 @@ def test_evaluate_deny_tool_not_in_declared():
 
 
 def test_evaluate_deny_unknown_condition():
-    """Unknown confirmable_condition → deny + WARN."""
-    m = _manifest(confirmable_conditions=["nonexistent_check"])
-    decision = evaluate(m, "any.tool", {}, granted=set())
+    """Unknown confirmable_condition → deny + WARN.
+
+    The manifest must have a valid declared+granted pair so the tool-permission
+    gate does not deny first; the unknown-condition path is what we're
+    exercising here.
+    """
+    m = _manifest(
+        declared_permissions=["tool:any.tool"],
+        confirmable_conditions=["nonexistent_check"],
+    )
+    decision = evaluate(m, "any.tool", {}, granted={"tool:any.tool"})
     assert decision == "deny"
 
 
 def test_evaluate_deny_path_outside_declared():
     """Path argument outside declared paths → deny (hard guard)."""
-    m = _manifest(declared_permissions=["path:/safe/"])
+    m = _manifest(declared_permissions=["tool:file.read", "path:/safe/"])
     args = {"path": "/unsafe/evil/file.txt"}
-    decision = evaluate(m, "file.read", args, granted=set())
+    decision = evaluate(m, "file.read", args, granted={"tool:file.read"})
     assert decision == "deny"
 
 
 def test_evaluate_deny_command_outside_allowlist():
     """Command argument not matching declared cmd patterns → deny (hard guard)."""
-    m = _manifest(declared_permissions=["cmd:ls"])
+    m = _manifest(declared_permissions=["tool:shell.run", "cmd:ls"])
     args = {"command": "rm"}
-    decision = evaluate(m, "shell.run", args, granted=set())
+    decision = evaluate(m, "shell.run", args, granted={"tool:shell.run"})
     assert decision == "deny"
 
 
 def test_evaluate_deny_domain_outside_allowlist():
     """Domain argument not in declared domain allowlist → deny (hard guard)."""
-    m = _manifest(declared_permissions=["domain:safe.example.com"])
+    m = _manifest(declared_permissions=["tool:browser.open", "domain:safe.example.com"])
     args = {"url": "https://evil.com/payload"}
-    decision = evaluate(m, "browser.open", args, granted=set())
+    decision = evaluate(m, "browser.open", args, granted={"tool:browser.open"})
     assert decision == "deny"
 
 
 def test_evaluate_confirm_path_condition():
     """'outside_declared_paths' as confirmable_condition → confirm when triggered."""
     m = _manifest(
-        declared_permissions=["path:/safe/"],
+        declared_permissions=["tool:file.write", "path:/safe/"],
         confirmable_conditions=["outside_declared_paths"],
     )
     args = {"path": "/unsafe/file.txt"}
-    decision = evaluate(m, "file.write", args, granted=set())
+    decision = evaluate(m, "file.write", args, granted={"tool:file.write"})
     assert decision == "confirm"
 
 
 def test_evaluate_confirm_command_condition():
     """'command_outside_allowlist' as confirmable_condition → confirm when triggered."""
     m = _manifest(
-        declared_permissions=["cmd:git"],
+        declared_permissions=["tool:shell.exec", "cmd:git"],
         confirmable_conditions=["command_outside_allowlist"],
     )
     args = {"command": "curl"}
-    decision = evaluate(m, "shell.exec", args, granted=set())
+    decision = evaluate(m, "shell.exec", args, granted={"tool:shell.exec"})
     assert decision == "confirm"
 
 
 def test_evaluate_confirm_domain_condition():
     """'domain_outside_allowlist' as confirmable_condition → confirm when triggered."""
     m = _manifest(
-        declared_permissions=["domain:trusted.org"],
+        declared_permissions=["tool:http.get", "domain:trusted.org"],
         confirmable_conditions=["domain_outside_allowlist"],
     )
     args = {"url": "https://unknown.io/api"}
-    decision = evaluate(m, "http.get", args, granted=set())
+    decision = evaluate(m, "http.get", args, granted={"tool:http.get"})
     assert decision == "confirm"
 
 
 def test_evaluate_confirm_not_triggered_stays_allow():
     """Confirmable condition present but NOT triggered → allow."""
     m = _manifest(
-        declared_permissions=["path:/safe/"],
+        declared_permissions=["tool:file.read", "path:/safe/"],
         confirmable_conditions=["outside_declared_paths"],
     )
     args = {"path": "/safe/data.txt"}
-    decision = evaluate(m, "file.read", args, granted=set())
+    decision = evaluate(m, "file.read", args, granted={"tool:file.read"})
     assert decision == "allow"
 
 
@@ -206,31 +214,40 @@ def test_domain_outside_allowlist():
 
 
 # ---------------------------------------------------------------------------
-# 4-cell permission decision table:
-#     (declared or not) x (granted or not)
-# Only cell (declared AND granted) may allow.  All other cells must deny.
+# 4x2 permission decision table:
+#     declared_permissions ∈ {[], ["path:/x"], ["tool:target_tool"], ["tool:other_tool"]}
+#     granted              ∈ {set(), {"tool:target_tool"}}
+# Only (declared=["tool:target_tool"], granted={"tool:target_tool"}) may allow.
+# All other combinations must deny.  Each row exercises a distinct code path
+# (including both former bypass paths: no declared_permissions, and
+# declared_permissions containing no tool-scoped entries).
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize(
-    ("declared", "granted", "expected"),
+    ("declared_permissions", "granted", "expected"),
     [
-        # cell (True, True)   → declared AND granted → allow
-        (True,  True,  "allow"),
-        # cell (True, False)  → declared but NOT granted → deny (the fixed bug)
-        (True,  False, "deny"),
-        # cell (False, True)  → NOT declared but somehow granted → deny
-        #   (plugin never declared this capability; grant alone is not enough)
-        (False, True,  "deny"),
-        # cell (False, False) → NOT declared, NOT granted → deny
-        (False, False, "deny"),
+        # (1) No declared perms + no grant     → deny (bypass #1 path)
+        ([],                        set(),                  "deny"),
+        # (2) No declared perms + grant        → deny (bypass #1 path)
+        ([],                        {"tool:target_tool"},   "deny"),
+        # (3) Only path perm + no grant        → deny (bypass #2 path)
+        (["path:/x"],               set(),                  "deny"),
+        # (4) Only path perm + grant           → deny (bypass #2 path)
+        (["path:/x"],               {"tool:target_tool"},   "deny"),
+        # (5) Declared target tool + no grant  → deny (declared, not granted)
+        (["tool:target_tool"],      set(),                  "deny"),
+        # (6) Declared target tool + grant     → ALLOW (only permissive cell)
+        (["tool:target_tool"],      {"tool:target_tool"},   "allow"),
+        # (7) Declared OTHER tool + no grant   → deny (not declared, not granted)
+        (["tool:other_tool"],       set(),                  "deny"),
+        # (8) Declared OTHER tool + grant      → deny (not declared)
+        (["tool:other_tool"],       {"tool:target_tool"},   "deny"),
     ],
 )
-def test_evaluate_permission_table(declared, granted, expected):
-    """Table-driven proof that only (declared AND granted) yields allow."""
-    # Manifest always declares SOMETHING tool-scoped so the check is active.
-    declared_perms = ["tool:target_tool"] if declared else ["tool:other_tool"]
-    granted_perms: set[str] = {"tool:target_tool"} if granted else set()
-    m = _manifest(declared_permissions=declared_perms)
-    decision = evaluate(m, "target_tool", {}, granted=granted_perms)
+def test_evaluate_permission_table(declared_permissions, granted, expected):
+    """Table-driven proof that only (declared AND granted) tool perms yield allow."""
+    m = _manifest(declared_permissions=list(declared_permissions))
+    decision = evaluate(m, "target_tool", {}, granted=set(granted))
     assert decision == expected, (
-        f"declared={declared}, granted={granted}: expected {expected}, got {decision}"
+        f"declared={declared_permissions}, granted={granted}: "
+        f"expected {expected}, got {decision}"
     )

@@ -30,9 +30,20 @@ from workstation_agent.mcp_host.host import MCPHost
 
 @pytest.fixture
 def agent_config():
-    """Minimal AgentConfig with allow_unsigned=True (sentinel sig)."""
+    """Minimal AgentConfig with allow_unsigned=True and hello_world tool grant.
+
+    Under the SPEC-03B default-deny permissions model, the plugin must both
+    (a) declare ``tool:hello_world.echo`` in its manifest AND (b) have that
+    permission granted in the user's config.  We do (b) here so the
+    integration test can actually invoke the tool.
+    """
+    from workstation_agent.config.schema import PluginConfig as _PluginCfg
     cfg = AgentConfig()
     cfg.plugins.allow_unsigned = True
+    cfg.plugins.per_plugin["hello_world"] = _PluginCfg(
+        enabled=True,
+        granted_permissions=["tool:hello_world.echo"],
+    )
     return cfg
 
 

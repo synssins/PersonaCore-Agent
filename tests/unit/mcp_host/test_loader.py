@@ -286,16 +286,85 @@ def test_entry_file_paths_resolves_module_and_package():
     assert "__main__.py" in names
 
 
-def test_entry_file_paths_handles_unknown_module():
-    """Unknown module name returns empty list (no crash)."""
-    paths = loader._entry_file_paths(["-m", "this.module.does.not.exist_xyz"], None)
+def test_entry_file_paths_handles_unknown_module(tmp_path):
+    """Unknown module name falls back to hashing every .py in plugin_dir."""
+    # Empty plugin_dir → fallback still yields empty list.
+    paths = loader._entry_file_paths(
+        ["-m", "this.module.does.not.exist_xyz"], tmp_path,
+    )
     assert paths == []
 
 
-def test_entry_file_paths_handles_dangling_dash_m():
-    """`-m` with no following argument does not raise."""
-    paths = loader._entry_file_paths(["-m"], None)
+def test_entry_file_paths_handles_dangling_dash_m(tmp_path):
+    """`-m` with no following argument does not raise; empty dir → empty list."""
+    paths = loader._entry_file_paths(["-m"], tmp_path)
     assert paths == []
+
+
+def test_entry_file_paths_hashes_external_plugin_dir_when_module_not_on_syspath(tmp_path):
+    """External plugin whose module isn't on sys.path → hash all .py in plugin_dir.
+
+    Also verifies that tampering with the external plugin file flips the
+    signature verification result to 'invalid', proving the code IS covered.
+    """
+    plugin_dir = tmp_path / "external_plugin"
+    plugin_dir.mkdir()
+    (plugin_dir / "plugin.toml").write_text(
+        (
+            'id = "ext"\nname = "Ext"\nversion = "0.0.1"\n'
+            'runtime = "python"\nentry = ["-m", "external_module_not_on_syspath_zzz"]\n'
+        ),
+        encoding="utf-8",
+    )
+    ext_module = plugin_dir / "external_module_not_on_syspath_zzz.py"
+    ext_module.write_bytes(b'print("hello from external")\n')
+
+    # Sanity: the module is NOT on sys.path (should return empty from _resolve_module_paths).
+    assert loader._resolve_module_paths("external_module_not_on_syspath_zzz") == []
+
+    # _entry_file_paths should now fall back and include the external .py file.
+    paths = loader._entry_file_paths(
+        ["-m", "external_module_not_on_syspath_zzz"], plugin_dir,
+    )
+    assert ext_module in paths, f"expected {ext_module} in {paths}"
+
+    # Prove the file IS covered by the signature: tamper with it and expect 'invalid'.
+    signing_key = SigningKey.generate()
+    pubkey = bytes(signing_key.verify_key)
+    m = loader._parse_toml(plugin_dir / "plugin.toml")
+    assert m is not None
+    manifest_dict = loader._manifest_dict(m)
+    manifest_bytes = _sig.canonical_json(manifest_dict)
+    entry_paths = loader._entry_file_paths(m.entry, m.plugin_dir)
+    entry_hash_parts = [hashlib.sha256(p.read_bytes()).digest() for p in entry_paths]
+    message = manifest_bytes + b"\n" + b"".join(entry_hash_parts)
+    signed = signing_key.sign(message)
+    m.signature_file.write_bytes(signed.signature)
+
+    # Unmodified: valid.
+    assert loader.verify(m, [pubkey], allow_unsigned=False).status == "valid"
+
+    # Tamper the external module file → signature must invalidate.
+    ext_module.write_bytes(b'print("TAMPERED")\n')
+    tampered = loader.verify(m, [pubkey], allow_unsigned=False)
+    assert tampered.status == "invalid", (
+        f"expected invalid after tampering external module, got {tampered.status}"
+    )
+
+
+def test_entry_file_paths_hashes_all_py_when_entry_has_no_files(tmp_path):
+    """Entry with no -m and no file args → hash every .py under plugin_dir."""
+    plugin_dir = tmp_path / "no_entry_plugin"
+    plugin_dir.mkdir()
+    (plugin_dir / "a.py").write_bytes(b"a = 1\n")
+    (plugin_dir / "b.py").write_bytes(b"b = 2\n")
+    sub = plugin_dir / "sub"
+    sub.mkdir()
+    (sub / "c.py").write_bytes(b"c = 3\n")
+
+    paths = loader._entry_file_paths(["python"], plugin_dir)
+    py_files = {p.name for p in paths}
+    assert py_files == {"a.py", "b.py", "c.py"}, f"got {py_files}"
 
 
 def test_entry_file_hashing_includes_module_files():

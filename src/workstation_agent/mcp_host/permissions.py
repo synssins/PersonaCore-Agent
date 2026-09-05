@@ -114,22 +114,33 @@ def _check_tool_permission(
 ) -> PermissionDecision:
     """Evaluate the tool-identity gate: declared AND granted.
 
-    Returns ``"deny"`` for either bug-1 failure mode, otherwise ``"allow"``.
+    Default-deny: a plugin with no declared permissions (or no tool-scoped
+    permissions) is NEVER allowed to invoke tools.  The only path to
+    ``"allow"`` is that ``tool:<name>`` (or ``"*"``) appears in BOTH the
+    plugin's ``declared_permissions`` AND the caller-supplied ``granted`` set.
 
     Decision table (only cell 1 permits the call to proceed):
     * declared AND granted           → allow
     * declared AND NOT granted       → deny (user hasn't authorised)
     * NOT declared AND granted       → deny (plugin never declared it)
-    * NOT declared AND NOT granted   → deny
+    * NOT declared AND NOT granted   → deny (security default)
     """
     if not plugin.declared_permissions:
-        return "allow"
+        log.warning(
+            "deny: plugin=%s has no declared_permissions; default-deny",
+            plugin.id,
+        )
+        return "deny"
     tool_perm = f"tool:{tool}"
     declared_tool_perms = {
         p for p in plugin.declared_permissions if p.startswith("tool:") or p == "*"
     }
     if not declared_tool_perms:
-        return "allow"
+        log.warning(
+            "deny: plugin=%s declared no tool-scoped permissions; default-deny",
+            plugin.id,
+        )
+        return "deny"
     declared_ok = tool_perm in declared_tool_perms or "*" in declared_tool_perms
     granted_ok = tool_perm in granted or "*" in granted
     if not declared_ok:
