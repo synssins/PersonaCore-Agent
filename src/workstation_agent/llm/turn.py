@@ -192,9 +192,18 @@ class LLMTurn:
         tools: list[dict[str, Any]],
         rounds: int,
     ) -> AsyncIterator[TurnEvent]:
-        """Inner multi-round loop."""
+        """Inner multi-round loop.
+
+        Ordering guarantee
+        ------------------
+        Tool calls are accumulated during the stream.  Only *after* the stream
+        ends do we (1) persist the assistant message (with its ``tool_calls``
+        array) and (2) dispatch + persist each tool result.  This ensures the
+        history always reads: assistant(tool_calls=[...]) → tool → tool → ...
+        as required by the OpenAI API.
+        """
         accumulated_text: list[str] = []
-        pending_tool_calls: list[dict[str, Any]] = []
+        completed_tool_calls: list[ToolCallComplete] = []
         finish: FinishReason | None = None
 
         async for delta in self._client.chat(messages, tools):
@@ -204,13 +213,36 @@ class LLMTurn:
             elif delta.kind == "tool_call_start":
                 yield ToolCallStartedEvent(name=delta.name, call_id=delta.call_id)
             elif isinstance(delta, ToolCallComplete):
-                async for ev in self._handle_tool_call(delta, pending_tool_calls, messages):
-                    yield ev
+                # Accumulate — do NOT dispatch or persist yet.
+                completed_tool_calls.append(delta)
             elif isinstance(delta, FinishReason):
                 finish = delta
 
+        # Build the pending_tool_calls list for _persist_assistant.
+        pending_tool_calls: list[dict[str, Any]] = [
+            {
+                "id": tc.call_id,
+                "type": "function",
+                "function": {"name": tc.name, "arguments": tc.args_json},
+            }
+            for tc in completed_tool_calls
+        ]
+
+        # 1. Persist the assistant message FIRST (with its tool_calls array).
         full_text = "".join(accumulated_text) or None
         await self._persist_assistant(full_text, pending_tool_calls, messages)
+
+        # 2. THEN dispatch each tool call and persist its result.
+        for tc in completed_tool_calls:
+            result_msg = await self._router.dispatch(tc)
+            messages.append(result_msg)
+            self._store.append(
+                self._session_id,
+                "tool",
+                content=result_msg["content"],
+                tool_call_id=tc.call_id,
+            )
+            yield ToolCallDoneEvent(name=tc.name, call_id=tc.call_id)
 
         rounds += 1
         if self._should_loop(finish, pending_tool_calls, rounds):
@@ -223,29 +255,3 @@ class LLMTurn:
                 yield event
         else:
             yield FinishedEvent(total_rounds=rounds)
-
-    async def _handle_tool_call(
-        self,
-        delta: ToolCallComplete,
-        pending_tool_calls: list[dict[str, Any]],
-        messages: list[dict[str, Any]],
-    ) -> AsyncIterator[TurnEvent]:
-        result_msg = await self._router.dispatch(delta)
-        pending_tool_calls.append(
-            {
-                "id": delta.call_id,
-                "type": "function",
-                "function": {
-                    "name": delta.name,
-                    "arguments": delta.args_json,
-                },
-            },
-        )
-        yield ToolCallDoneEvent(name=delta.name, call_id=delta.call_id)
-        messages.append(result_msg)
-        self._store.append(
-            self._session_id,
-            "tool",
-            content=result_msg["content"],
-            tool_call_id=delta.call_id,
-        )

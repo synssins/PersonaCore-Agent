@@ -294,3 +294,73 @@ async def test_system_prompt_default_used(tmp_store: SessionStore) -> None:
 
     assert turn._system_prompt == default_system_prompt()
     await _collect_events(turn, "test")
+
+
+@pytest.mark.asyncio
+async def test_message_ordering_assistant_before_tool_results(tmp_store: SessionStore) -> None:
+    """History ordering: assistant(tool_calls) must appear BEFORE tool results.
+
+    A 2-round loop (tool call in round 1, final text in round 2) must produce
+    the sequence:
+        [system, user, assistant(tool_calls=[A, B]), tool(A), tool(B), assistant(text)]
+
+    This test uses a single-round with TWO simultaneous tool calls so that we
+    can verify both tool result rows appear after the single assistant row,
+    and then validates the full 2-round ordering with a subsequent text reply.
+    """
+    # Round 1: LLM calls two tools simultaneously.
+    # Round 2: LLM gives final text answer.
+    queue = ScenarioQueue()
+    queue.push([
+        # Round 1 — two tool calls in one stream
+        tool_call_response("call_A", "tool_alpha", '{"x": 1}')
+        + tool_call_response("call_B", "tool_beta", '{"y": 2}'),
+        # Round 2 — final text
+        text_response("All done."),
+    ])
+
+    app = build_app(queue)
+    client = _make_client(app)
+    host = FakeMCPHost(
+        tools=[
+            FakeToolDescriptor("tool_alpha", "Alpha tool"),
+            FakeToolDescriptor("tool_beta", "Beta tool"),
+        ],
+        results={
+            "tool_alpha": {"result": "alpha-ok"},
+            "tool_beta": {"result": "beta-ok"},
+        },
+    )
+    sid = tmp_store.start_session("persistent")
+    turn = _make_turn(client, host, tmp_store, sid)
+
+    await _collect_events(turn, "Run both tools please")
+
+    # Retrieve history — excludes the system message (not stored in DB).
+    history = tmp_store.history(sid)
+    roles = [m["role"] for m in history]
+
+    # Expected order: user, assistant(tool_calls), tool, tool, assistant(text)
+    assert roles == ["user", "assistant", "tool", "tool", "assistant"], (
+        f"Unexpected role order: {roles}"
+    )
+
+    # The first assistant message must carry the tool_calls array.
+    first_assistant = history[1]
+    assert "tool_calls" in first_assistant, (
+        "First assistant message must contain tool_calls"
+    )
+    tc_ids = {tc["id"] for tc in first_assistant["tool_calls"]}
+    assert "call_A" in tc_ids
+    assert "call_B" in tc_ids
+
+    # The two tool messages must reference the correct call IDs.
+    tool_msgs = [m for m in history if m["role"] == "tool"]
+    assert len(tool_msgs) == 2
+    tool_call_ids = {m["tool_call_id"] for m in tool_msgs}
+    assert tool_call_ids == {"call_A", "call_B"}
+
+    # The final assistant message must be plain text (no tool_calls).
+    last_assistant = [m for m in history if m["role"] == "assistant"][-1]
+    assert "tool_calls" not in last_assistant
+    assert last_assistant.get("content") == "All done."
