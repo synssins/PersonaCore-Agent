@@ -33,3 +33,10 @@ ignore = [
     "CPY001",  # copyright notice
     "T201",    # print statement
 ]
+"scripts/**" = [
+    "INP001",  # implicit namespace package (scripts/ is intentional)
+    "T201",    # print statement (CLI output)
+    "PLC0415", # import at module level (deferred imports keep --help fast)
+    "C901",    # complex function (multi-step boot check)
+    "PLR0911", # too many return statements (each is a distinct fail step)
+]
