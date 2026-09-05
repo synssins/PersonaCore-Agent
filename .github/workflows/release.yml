@@ -11,6 +11,9 @@ on:
         required: true
         default: "0.1.0"
 
+permissions:
+  contents: write  # required so GITHUB_TOKEN can create releases + upload assets
+
 jobs:
   release:
     runs-on: windows-latest
