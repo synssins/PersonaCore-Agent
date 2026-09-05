@@ -1,4 +1,3 @@
-# ruff: noqa: S101
 """Tests for security.dpapi — Windows-only DPAPI round-trips."""
 
 from __future__ import annotations

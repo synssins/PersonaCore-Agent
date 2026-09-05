@@ -1,5 +1,5 @@
 """Unit tests for workstation_agent.mcp_host.host (non-integration paths)."""
-# ruff: noqa: ANN201, S101, SLF001, ARG001
+# ruff: noqa: ARG001
 
 from __future__ import annotations
 

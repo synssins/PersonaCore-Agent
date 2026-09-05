@@ -5,7 +5,7 @@ End-to-end round trip against ``echo_plugin`` for the SPEC-03A surface:
 the ``notifications()`` async iterator. Also covers timeout, cancellation,
 protocol/remote errors, and closed-client behaviour without the plugin.
 """
-# ruff: noqa: S101, SLF001, ANN201, ANN202, ARG002, EM101, TRY003, TC003
+# ruff: noqa: ARG002, EM101, TRY003, TC003
 
 from __future__ import annotations
 

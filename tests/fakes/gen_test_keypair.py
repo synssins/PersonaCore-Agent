@@ -19,7 +19,6 @@ The fixture:
 6. On teardown: removes the test key from TRUSTED_PUBKEYS and restores the
    original sentinel ``b"UNSIGNED"`` in ``signature.sig``.
 """
-# ruff: noqa: ANN201, SLF001
 
 from __future__ import annotations
 

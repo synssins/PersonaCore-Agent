@@ -1,4 +1,3 @@
-# ruff: noqa: S101
 """Tests for config.schema — Pydantic model validation."""
 
 from __future__ import annotations

@@ -1,4 +1,3 @@
-# ruff: noqa: S101
 """Tests for security.dpapi.redact_key — log sanitisation."""
 
 from __future__ import annotations

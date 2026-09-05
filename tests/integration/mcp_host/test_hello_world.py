@@ -6,7 +6,7 @@ This test exercises the full round-trip:
 3. An audit row for the invocation is present in the audit DB.
 4. MCPHost.stop() cleans up without error.
 """
-# ruff: noqa: ANN201, S101, S603, S607, E402, ARG001, ASYNC221
+# ruff: noqa: S603, S607, E402, ARG001, ASYNC221
 
 from __future__ import annotations
 

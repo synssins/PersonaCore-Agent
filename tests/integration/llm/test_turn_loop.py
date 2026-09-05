@@ -1,4 +1,3 @@
-# ruff: noqa: S101, SLF001
 """Integration tests for LLMTurn's multi-round tool loop.
 
 Uses ``fake_openai`` (FastAPI ASGI) via ``httpx.AsyncClient(app=...)`` transport

@@ -1,5 +1,4 @@
 """Unit tests for workstation_agent.mcp_host.loader."""
-# ruff: noqa: ANN201, S101, SLF001, ANN202
 
 from __future__ import annotations
 

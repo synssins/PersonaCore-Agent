@@ -5,7 +5,7 @@ Covers:
 * Job Object + PID exist after spawn and are cleared after terminate.
 * Low-integrity fallback path when SetTokenInformation raises.
 """
-# ruff: noqa: S101, SLF001, ANN202, ARG001, EM101, TRY003, TC002, TC003
+# ruff: noqa: ARG001, EM101, TRY003, TC002, TC003
 
 from __future__ import annotations
 

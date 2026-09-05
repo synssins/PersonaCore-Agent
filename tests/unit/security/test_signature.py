@@ -1,4 +1,3 @@
-# ruff: noqa: S101
 """Tests for security.signature — verify, canonical_json, load_public_key."""
 
 from __future__ import annotations

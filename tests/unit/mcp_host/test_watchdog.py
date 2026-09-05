@@ -1,5 +1,5 @@
 """SPEC-03A heartbeat watchdog tests."""
-# ruff: noqa: S101, SLF001, ANN401, ARG001, ARG002, EM101, TRY003, TC002
+# ruff: noqa: ANN401, ARG001, ARG002, EM101, TRY003, TC002
 
 from __future__ import annotations
 

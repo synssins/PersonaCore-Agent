@@ -1,4 +1,4 @@
-# ruff: noqa: S101, S603, PLW1510
+# ruff: noqa: S603, PLW1510
 r"""Integration test for the SPEC-06 self-copy relay dance.
 
 The Go updater is designed to break the ERROR_SHARING_VIOLATION that
