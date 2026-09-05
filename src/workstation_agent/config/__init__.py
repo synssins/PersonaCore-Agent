@@ -1,1 +1,1 @@
-"""Configuration management: TOML load/save, atomic writes, validation."""
+"""Configuration: TOML schema (pydantic v2), atomic store, DPAPI-encrypted secrets."""

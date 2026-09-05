@@ -142,3 +142,45 @@ def test_secret_file_is_created(tmp_appdata: Path, patched_store: None) -> None:
     store.save_secret("test_key", b"value")
     dest = tmp_appdata / "secrets" / "test_key.dpapi"
     assert dest.exists()
+
+
+def test_save_secret_hardens_tmp_before_writing_content(
+    tmp_appdata: Path,  # noqa: ARG001
+    patched_store: None,
+) -> None:
+    """harden_file is called on the tmp file BEFORE the blob is written into it.
+
+    This verifies the TOCTOU fix: the temp file's ACL is locked down while it
+    is still empty, so a Low-IL process can never observe the plaintext/blob
+    through the default-ACL window.
+    """
+    _ = patched_store
+    call_log: list[str] = []
+
+    real_harden = store.harden_file
+
+    def fake_harden(path: Path) -> None:
+        call_log.append(f"harden:{path.name}")
+        real_harden(path)
+
+    original_write_bytes = Path.write_bytes
+
+    def fake_write_bytes(self: Path, data: bytes) -> int:
+        if data:  # only log the non-empty write (the actual blob write)
+            call_log.append(f"write_bytes:{self.name}")
+        return original_write_bytes(self, data)
+
+    with (
+        patch.object(store, "harden_file", side_effect=fake_harden),
+        patch.object(Path, "write_bytes", fake_write_bytes),
+    ):
+        store.save_secret("ordering_test", b"secret-payload")
+
+    # The tmp ACL harden must appear before the blob write_bytes call
+    tmp_harden_idx = next(
+        i for i, e in enumerate(call_log) if e.startswith("harden:") and ".tmp" in e
+    )
+    blob_write_idx = next(i for i, e in enumerate(call_log) if e.startswith("write_bytes:"))
+    assert tmp_harden_idx < blob_write_idx, (
+        f"harden_file(tmp) must be called before write_bytes(blob); log={call_log}"
+    )

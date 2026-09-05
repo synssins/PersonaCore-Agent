@@ -241,6 +241,11 @@ def save_secret(name: str, plaintext: bytes) -> None:
     dest = secrets_dir / f"{name}.dpapi"
     tmp = dest.with_suffix(".dpapi.tmp")
 
+    # Create the tmp file empty first, harden its ACL, then write the blob.
+    # This eliminates the TOCTOU window where a Low-IL process could read the
+    # file before the ACL is applied.
+    tmp.write_bytes(b"")
+    harden_file(tmp)
     tmp.write_bytes(blob)
     tmp.replace(dest)
     harden_file(dest)
