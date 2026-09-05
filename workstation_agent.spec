@@ -55,6 +55,13 @@ hiddenimports = [
 
 block_cipher = None
 
+# We ship webrtcvad via the `webrtcvad-wheels` distribution (prebuilt wheels).
+# pyinstaller-hooks-contrib ships a stock `hook-webrtcvad.py` that looks up
+# the ORIGINAL `webrtcvad` distribution metadata and crashes with
+# `PackageNotFoundError` under -wheels. The module itself imports fine —
+# `hiddenimports=["webrtcvad"]` plus disabling the hook is the tidy fix.
+hiddenimports.append("webrtcvad")
+
 a = Analysis(  # noqa: F821
     [str(SRC / "__main__.py")],
     pathex=[str(REPO_ROOT / "src")],
@@ -64,7 +71,7 @@ a = Analysis(  # noqa: F821
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=["_pyinstaller_hooks_contrib.stdhooks.hook-webrtcvad"],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,
