@@ -1,4 +1,4 @@
-# ruff: noqa: S101, S603
+# ruff: noqa: S603
 """Shared fixtures for the updater integration test.
 
 Builds the Go binary exactly once per session, with a fresh Ed25519

@@ -1,0 +1,14 @@
+id = "claude_code_bridge"
+name = "Claude Code Bridge"
+version = "0.1.0"
+runtime = "python"
+entry = ["-m", "workstation_agent.plugins.claude_code_bridge"]
+declared_permissions = [
+    "tool:claude_code.invoke",
+    "tool:claude_code.presence",
+    "tool:claude_code.list_recent_sessions",
+]
+confirmable_conditions = []
+
+[compat]
+min_host_version = "0.1.0"

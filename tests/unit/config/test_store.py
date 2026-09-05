@@ -1,4 +1,3 @@
-# ruff: noqa: S101
 """Tests for config.store — load, save, atomic writes, secret round-trips."""
 
 from __future__ import annotations

@@ -1,4 +1,4 @@
-# ruff: noqa: S101, S603, S607, SLF001, ARG001, ANN202, ANN204, PT011, B017, EM101, PLR0915, PLW1510, RUF059, FURB171
+# ruff: noqa: S603, S607, ARG001, ANN204, PT011, B017, EM101, PLR0915, PLW1510, RUF059, FURB171
 """End-to-end test for SPEC-06 Updater.exe + Python handoff.
 
 The test:

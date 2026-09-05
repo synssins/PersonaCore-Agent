@@ -1,4 +1,3 @@
-# ruff: noqa: S101
 """Unit tests for tool_bridge: MCP descriptor -> OpenAI schema conversion."""
 
 from __future__ import annotations

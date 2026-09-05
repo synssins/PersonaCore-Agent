@@ -17,7 +17,11 @@ class LlmConfig(BaseModel):
     timeout_seconds: int = Field(default=60, gt=0)
     streaming: bool = True
     system_prompt: str | None = None
-    """User-customised system prompt; None means use the built-in default from `llm.system_prompt.default_system_prompt()`."""
+    """User-customised system prompt.
+
+    None means use the built-in default from
+    ``llm.system_prompt.default_system_prompt()``.
+    """
 
 
 class WyomingConfig(BaseModel):

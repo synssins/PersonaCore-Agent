@@ -20,6 +20,7 @@ and tries each supplied public key against the ``signature.sig`` file next to
 ``plugin.toml``.  If ``allow_unsigned`` is ``True`` a missing / zero-byte sig
 file returns ``VerifyResult(status='unsigned')`` instead of ``'quarantined'``.
 """
+# ruff: noqa: C901, PLR0912
 
 from __future__ import annotations
 

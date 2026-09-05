@@ -1,5 +1,5 @@
 """Unit tests for workstation_agent.mcp_host.permissions."""
-# ruff: noqa: ANN201, S101, S108
+# ruff: noqa: S108
 
 from __future__ import annotations
 

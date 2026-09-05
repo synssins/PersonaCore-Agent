@@ -1,4 +1,3 @@
-# ruff: noqa: S101
 """Unit tests for SessionStore: insert, history round-trip, sticky window."""
 
 from __future__ import annotations
