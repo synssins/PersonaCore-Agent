@@ -31,6 +31,27 @@ Write-Host "==> Building PersonaCore-Agent installer v$Version"
 # 1) PyInstaller
 # ---------------------------------------------------------------------------
 Write-Host "==> [1/3] PyInstaller"
+
+# The stock pyinstaller-hooks-contrib ships a webrtcvad hook that calls
+# copy_metadata("webrtcvad"). We ship the module via `webrtcvad-wheels`
+# (drop-in binary distribution with a different distribution name), so the
+# metadata lookup fails with PackageNotFoundError. Delete the offending
+# hook file before PyInstaller runs — the module still imports fine and
+# workstation_agent.spec hiddenimports webrtcvad explicitly.
+$hookInfo = & $Python -c "import _pyinstaller_hooks_contrib.stdhooks.hook_webrtcvad as h; print(h.__file__)" 2>$null
+if ($LASTEXITCODE -eq 0 -and $hookInfo) {
+    $hookPath = $hookInfo.Trim()
+    if (Test-Path $hookPath) {
+        Remove-Item -Force $hookPath
+        Write-Host "    (removed stock webrtcvad hook: $hookPath)"
+    }
+}
+# Also remove the .pyc if PyInstaller cached one already.
+$hookDir = Split-Path $hookPath -Parent 2>$null
+if ($hookDir) {
+    Get-ChildItem -Path $hookDir -Filter "hook-webrtcvad*.pyc" -Recurse -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+}
+
 & $Python -m PyInstaller --noconfirm workstation_agent.spec
 if ($LASTEXITCODE -ne 0) {
     throw "PyInstaller failed with exit code $LASTEXITCODE"
