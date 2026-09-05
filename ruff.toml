@@ -10,13 +10,17 @@ ignore = [
 
 [lint.per-file-ignores]
 "tests/**" = [
-    "ANN001",  # missing type annotations
+    "ANN001",  # missing type annotations on arguments
     "ANN002",  # *args annotations
     "ANN003",  # **kwargs annotations
+    "ANN201",  # missing return type on public functions (pytest style)
+    "ANN202",  # missing return type on private functions
     "CPY001",  # copyright notice
     "D",       # docstrings
     "PLR2004", # magic values
     "PLC0415", # import at module level
+    "S101",    # use of assert (pytest idiom)
+    "SLF001",  # access to private members (common in tests)
 ]
 "**/__init__.py" = [
     "F401",    # unused imports
