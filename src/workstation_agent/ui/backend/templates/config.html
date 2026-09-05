@@ -1,0 +1,80 @@
+<!-- SKELETON — visual design lands in interface-design pass, do not polish here -->
+{% extends "layout.html" %}
+{% block title %}Configuration{% endblock %}
+{% block content %}
+<h1>Configuration</h1>
+
+{% if saved %}<p class="success">Settings saved.</p>{% endif %}
+{% if errors._global is defined %}<p class="error">{{ errors._global }}</p>{% endif %}
+
+<form method="post" action="/config">
+  <fieldset>
+    <legend>LLM</legend>
+    <label>Base URL:
+      <input type="text" name="llm_base_url" value="{{ cfg.llm.base_url if cfg else 'http://192.168.1.150:8053/v1' }}">
+      {% if errors.llm_base_url is defined %}<span class="error">{{ errors.llm_base_url }}</span>{% endif %}
+    </label>
+    <label>Model:
+      <input type="text" name="llm_model" value="{{ cfg.llm.model if cfg else 'gpt-4o' }}">
+    </label>
+    <label>Timeout (s):
+      <input type="number" name="llm_timeout_seconds" value="{{ cfg.llm.timeout_seconds if cfg else 60 }}" min="1">
+      {% if errors.llm_timeout_seconds is defined %}<span class="error">{{ errors.llm_timeout_seconds }}</span>{% endif %}
+    </label>
+    <label>Streaming:
+      <input type="checkbox" name="llm_streaming" value="true" {% if cfg and cfg.llm.streaming %}checked{% endif %}>
+    </label>
+  </fieldset>
+
+  <fieldset>
+    <legend>Wyoming ASR/TTS</legend>
+    <label>Host:
+      <input type="text" name="wyoming_host" value="{{ cfg.wyoming.host if cfg else '192.168.1.150' }}">
+    </label>
+    <label>Port:
+      <input type="number" name="wyoming_port" value="{{ cfg.wyoming.port if cfg else 10300 }}" min="1" max="65535">
+      {% if errors.wyoming_port is defined %}<span class="error">{{ errors.wyoming_port }}</span>{% endif %}
+    </label>
+  </fieldset>
+
+  <fieldset>
+    <legend>Wake Word</legend>
+    <label>Enabled:
+      <input type="checkbox" name="wake_enabled" value="true" {% if cfg and cfg.wake.enabled %}checked{% endif %}>
+    </label>
+    <label>Threshold:
+      <input type="number" name="wake_threshold" step="0.01" min="0" max="1"
+             value="{{ cfg.wake.threshold if cfg else 0.5 }}">
+      {% if errors.wake_threshold is defined %}<span class="error">{{ errors.wake_threshold }}</span>{% endif %}
+    </label>
+  </fieldset>
+
+  <fieldset>
+    <legend>Session</legend>
+    <label>Mode:
+      <select name="session_mode">
+        {% for m in ['single_shot', 'sticky', 'persistent'] %}
+          <option value="{{ m }}" {% if cfg and cfg.session.mode == m %}selected{% endif %}>{{ m }}</option>
+        {% endfor %}
+      </select>
+      {% if errors.session_mode is defined %}<span class="error">{{ errors.session_mode }}</span>{% endif %}
+    </label>
+    <label>Sticky seconds:
+      <input type="number" name="session_sticky_seconds" value="{{ cfg.session.sticky_seconds if cfg else 30 }}" min="1">
+      {% if errors.session_sticky_seconds is defined %}<span class="error">{{ errors.session_sticky_seconds }}</span>{% endif %}
+    </label>
+  </fieldset>
+
+  <fieldset>
+    <legend>Updates</legend>
+    <label>Enabled:
+      <input type="checkbox" name="update_enabled" value="true" {% if cfg and cfg.update.enabled %}checked{% endif %}>
+    </label>
+    <label>Channel:
+      <input type="text" name="update_channel" value="{{ cfg.update.channel if cfg else 'stable' }}">
+    </label>
+  </fieldset>
+
+  <button type="submit">Save</button>
+</form>
+{% endblock %}

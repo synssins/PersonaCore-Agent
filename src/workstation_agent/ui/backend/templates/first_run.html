@@ -1,0 +1,50 @@
+<!-- SKELETON — visual design lands in interface-design pass, do not polish here -->
+{% extends "layout.html" %}
+{% block title %}First Run Wizard{% endblock %}
+{% block content %}
+<h1>First Run Wizard — Step {{ step }} of 3</h1>
+
+{% if errors._global is defined %}
+  <p class="error">{{ errors._global }}</p>
+{% endif %}
+
+{% if step == 1 %}
+<form method="post" action="/first-run/llm">
+  <fieldset>
+    <legend>LLM Settings</legend>
+    <label>Base URL:
+      <input type="url" name="base_url" value="{{ base_url|default('http://192.168.1.150:8053/v1') }}" required>
+      {% if errors.base_url is defined %}<span class="error">{{ errors.base_url }}</span>{% endif %}
+    </label>
+    <label>Model:
+      <input type="text" name="model" value="{{ model|default('gpt-4o') }}" required>
+    </label>
+    <label>API Key Reference:
+      <input type="text" name="api_key_ref" value="{{ api_key_ref|default('') }}">
+    </label>
+    <button type="submit">Next</button>
+  </fieldset>
+</form>
+
+{% elif step == 2 %}
+<form method="post" action="/first-run/wyoming">
+  <fieldset>
+    <legend>Wyoming ASR/TTS Settings</legend>
+    <label>Host:
+      <input type="text" name="wyoming_host" value="{{ wyoming_host|default('192.168.1.150') }}" required>
+    </label>
+    <label>Port:
+      <input type="number" name="wyoming_port" value="{{ wyoming_port|default(10300) }}" min="1" max="65535" required>
+      {% if errors.wyoming_port is defined %}<span class="error">{{ errors.wyoming_port }}</span>{% endif %}
+    </label>
+    <button type="submit">Next</button>
+  </fieldset>
+</form>
+
+{% elif step == 3 %}
+<form method="post" action="/first-run/complete">
+  <p>Configuration complete. Click Finish to launch the dashboard.</p>
+  <button type="submit">Finish</button>
+</form>
+{% endif %}
+{% endblock %}

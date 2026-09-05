@@ -1,0 +1,42 @@
+<!-- SKELETON — visual design lands in interface-design pass, do not polish here -->
+{% extends "layout.html" %}
+{% block title %}Audit Log{% endblock %}
+{% block content %}
+<h1>Audit Log</h1>
+
+{% if errors._global is defined %}<p class="error">{{ errors._global }}</p>{% endif %}
+
+<form method="get" action="/audit">
+  <label>Plugin ID: <input type="text" name="plugin_id" value="{{ filters.plugin_id or '' }}"></label>
+  <label>Tool ID: <input type="text" name="tool_id" value="{{ filters.tool_id or '' }}"></label>
+  <label>Event: <input type="text" name="event" value="{{ filters.event or '' }}"></label>
+  <label>Since: <input type="text" name="since" value="{{ filters.since or '' }}" placeholder="ISO-8601"></label>
+  <label>Until: <input type="text" name="until" value="{{ filters.until or '' }}" placeholder="ISO-8601"></label>
+  <label>Limit: <input type="number" name="limit" value="{{ filters.limit }}" min="1" max="1000"></label>
+  <button type="submit">Filter</button>
+</form>
+
+<table>
+  <thead>
+    <tr>
+      <th>Timestamp</th><th>Event</th><th>Plugin</th><th>Tool</th>
+      <th>Decision</th><th>Result</th><th>Detail</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for row in rows %}
+  <tr>
+    <td>{{ row.ts }}</td>
+    <td>{{ row.event }}</td>
+    <td>{{ row.plugin_id or '' }}</td>
+    <td>{{ row.tool_id or '' }}</td>
+    <td>{{ row.decision or '' }}</td>
+    <td>{{ row.result or '' }}</td>
+    <td>{{ row.detail or '' }}</td>
+  </tr>
+  {% else %}
+  <tr><td colspan="7">No audit records found.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endblock %}
