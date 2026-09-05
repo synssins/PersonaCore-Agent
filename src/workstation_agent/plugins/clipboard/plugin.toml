@@ -1,0 +1,16 @@
+id = "clipboard"
+name = "Clipboard"
+version = "0.1.0"
+runtime = "python"
+entry = ["-m", "workstation_agent.plugins.clipboard"]
+declared_permissions = [
+  "tool:clipboard.get",
+  "tool:clipboard.set",
+  "tool:clipboard.clear",
+  "clipboard.read",
+  "clipboard.write",
+]
+confirmable_conditions = []
+
+[compat]
+min_host_version = "0.1.0"

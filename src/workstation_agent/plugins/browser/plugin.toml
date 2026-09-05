@@ -1,0 +1,18 @@
+id = "browser"
+name = "Browser"
+version = "0.1.0"
+runtime = "python"
+entry = ["-m", "workstation_agent.plugins.browser"]
+declared_permissions = [
+  "tool:browser.open",
+  "tool:browser.screenshot",
+  "tool:browser.click",
+  "tool:browser.type",
+  "tool:browser.eval",
+  "browser.navigate",
+  "browser.script",
+]
+confirmable_conditions = ["domain_outside_allowlist"]
+
+[compat]
+min_host_version = "0.1.0"

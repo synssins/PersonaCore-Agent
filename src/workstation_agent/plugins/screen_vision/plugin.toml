@@ -1,0 +1,15 @@
+id = "screen_vision"
+name = "Screen Vision"
+version = "0.1.0"
+runtime = "python"
+entry = ["-m", "workstation_agent.plugins.screen_vision"]
+declared_permissions = [
+  "tool:screen.capture",
+  "tool:screen.capture_ocr",
+  "tool:screen.list_monitors",
+  "screen.capture",
+]
+confirmable_conditions = []
+
+[compat]
+min_host_version = "0.1.0"

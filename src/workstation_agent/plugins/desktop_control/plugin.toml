@@ -1,0 +1,17 @@
+id = "desktop_control"
+name = "Desktop Control"
+version = "0.1.0"
+runtime = "python"
+entry = ["-m", "workstation_agent.plugins.desktop_control"]
+declared_permissions = [
+  "tool:desktop.click",
+  "tool:desktop.type",
+  "tool:desktop.key",
+  "tool:desktop.list_windows",
+  "tool:desktop.focus_window",
+  "desktop.control",
+]
+confirmable_conditions = []
+
+[compat]
+min_host_version = "0.1.0"
