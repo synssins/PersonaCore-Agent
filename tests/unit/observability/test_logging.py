@@ -220,5 +220,5 @@ def test_tracing_noop_without_otel():
     # Should not raise even if opentelemetry is absent
     tracing.configure(service_name="test-svc", otlp_endpoint="http://localhost:4317")
     tracer = tracing.get_tracer("test")
-    with tracer.start_as_current_span("test-span"):
+    with tracer.start_as_current_span("test-span"):  # type: ignore[attr-defined]
         pass  # no-op or real span — either is fine
