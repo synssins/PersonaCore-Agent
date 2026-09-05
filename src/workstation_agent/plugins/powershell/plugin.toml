@@ -1,0 +1,13 @@
+id = "powershell"
+name = "PowerShell"
+version = "0.1.0"
+runtime = "python"
+entry = ["-m", "workstation_agent.plugins.powershell"]
+declared_permissions = [
+  "tool:powershell.run",
+  "cmd:.*",
+]
+confirmable_conditions = ["cmd_outside_allowlist"]
+
+[compat]
+min_host_version = "0.1.0"

@@ -1,0 +1,17 @@
+id = "filesystem"
+name = "Filesystem"
+version = "0.1.0"
+runtime = "python"
+entry = ["-m", "workstation_agent.plugins.filesystem"]
+declared_permissions = [
+  "tool:filesystem.list",
+  "tool:filesystem.read",
+  "tool:filesystem.write",
+  "tool:filesystem.delete",
+  "path:%USERPROFILE%\\Documents",
+  "path:%USERPROFILE%\\Downloads",
+]
+confirmable_conditions = ["outside_declared_paths"]
+
+[compat]
+min_host_version = "0.1.0"
