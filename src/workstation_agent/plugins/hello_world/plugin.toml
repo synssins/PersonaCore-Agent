@@ -1,0 +1,10 @@
+id = "hello_world"
+name = "Hello World"
+version = "0.1.0"
+runtime = "python"
+entry = ["-m", "workstation_agent.plugins.hello_world"]
+declared_permissions = []
+confirmable_conditions = []
+
+[compat]
+min_host_version = "0.1.0"
