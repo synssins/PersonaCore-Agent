@@ -1,0 +1,23 @@
+<!-- SKELETON — visual design lands in interface-design pass, do not polish here -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PersonaCore-Agent — {% block title %}{% endblock %}</title>
+  <link rel="stylesheet" href="/static/skeleton.css">
+</head>
+<body>
+  <nav>
+    <a href="/dashboard">Dashboard</a> |
+    <a href="/config">Config</a> |
+    <a href="/plugins">Plugins</a> |
+    <a href="/audit">Audit</a> |
+    <a href="/logs">Logs</a> |
+    <a href="/about">About</a>
+  </nav>
+  <main>
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>

@@ -1,0 +1,30 @@
+<!-- SKELETON — visual design lands in interface-design pass, do not polish here -->
+{% extends "layout.html" %}
+{% block title %}Logs{% endblock %}
+{% block content %}
+<h1>Log Viewer</h1>
+<p>File: <code>{{ log_file }}</code></p>
+
+<form method="get" action="/logs">
+  <label>Tail lines: <input type="number" name="tail" value="{{ tail }}" min="1" max="10000"></label>
+  <button type="submit">Refresh</button>
+</form>
+
+<p><a href="/logs/stream" target="_blank">Open SSE stream</a></p>
+
+<table>
+  <thead><tr><th>Timestamp</th><th>Level</th><th>Logger</th><th>Event</th></tr></thead>
+  <tbody>
+  {% for entry in entries %}
+  <tr>
+    <td>{{ entry.get('timestamp', '') }}</td>
+    <td>{{ entry.get('level', '') }}</td>
+    <td>{{ entry.get('logger', '') }}</td>
+    <td>{{ entry.get('event', entry.get('raw', '')) }}</td>
+  </tr>
+  {% else %}
+  <tr><td colspan="4">No log entries found.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

@@ -1,0 +1,31 @@
+<!-- SKELETON — visual design lands in interface-design pass, do not polish here -->
+{% extends "layout.html" %}
+{% block title %}Dashboard{% endblock %}
+{% block content %}
+<h1>Dashboard</h1>
+<section>
+  <h2>Status</h2>
+  <p>Version: {{ version }}</p>
+  {% if cfg %}
+    <p>Session mode: {{ cfg.session.mode }}</p>
+    <p>Wake word: {{ "enabled" if cfg.wake.enabled else "disabled" }}</p>
+  {% else %}
+    <p>Config unavailable.</p>
+  {% endif %}
+</section>
+<section>
+  <h2>Plugins</h2>
+  {% if plugin_statuses %}
+  <table>
+    <thead><tr><th>ID</th><th>Name</th><th>Status</th></tr></thead>
+    <tbody>
+    {% for p in plugin_statuses %}
+      <tr><td>{{ p.id }}</td><td>{{ p.name }}</td><td>{{ p.status }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+    <p>No plugins loaded.</p>
+  {% endif %}
+</section>
+{% endblock %}

@@ -1,0 +1,27 @@
+<!-- SKELETON — visual design lands in interface-design pass, do not polish here -->
+{% extends "layout.html" %}
+{% block title %}About{% endblock %}
+{% block content %}
+<h1>About PersonaCore-Agent</h1>
+
+{% if message %}<p class="info">{{ message }}</p>{% endif %}
+
+<p>Version: <strong>{{ version }}</strong></p>
+
+<section>
+  <h2>Update</h2>
+  <form method="post" action="/about/check-updates">
+    <button type="submit">Check for Updates Now</button>
+  </form>
+</section>
+
+<section>
+  <h2>Rollback</h2>
+  <form method="post" action="/about/rollback">
+    <label>Target version:
+      <input type="text" name="target_version" placeholder="e.g. 0.1.0">
+    </label>
+    <button type="submit">Rollback</button>
+  </form>
+</section>
+{% endblock %}

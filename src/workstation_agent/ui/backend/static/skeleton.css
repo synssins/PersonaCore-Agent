@@ -1,0 +1,49 @@
+/* SKELETON — visual design lands in interface-design pass, do not polish here */
+
+/* Reset */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: system-ui, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  padding: 1rem;
+  color: #111;
+  background: #fff;
+}
+
+nav {
+  border-bottom: 1px solid #ccc;
+  padding-bottom: 0.5rem;
+  margin-bottom: 1rem;
+}
+
+nav a { margin-right: 1rem; text-decoration: none; color: #005faf; }
+nav a:hover { text-decoration: underline; }
+
+main { max-width: 960px; }
+
+h1 { font-size: 1.4rem; margin-bottom: 1rem; }
+h2 { font-size: 1.1rem; margin: 1rem 0 0.5rem; }
+
+section { margin-bottom: 1.5rem; }
+
+fieldset { border: 1px solid #ccc; padding: 0.75rem; margin-bottom: 1rem; }
+legend { font-weight: bold; padding: 0 0.25rem; }
+
+label { display: block; margin-bottom: 0.4rem; }
+input, select, textarea { margin-left: 0.25rem; }
+
+button {
+  padding: 0.25rem 0.75rem;
+  margin-top: 0.5rem;
+  cursor: pointer;
+}
+
+table { border-collapse: collapse; width: 100%; margin-top: 0.5rem; }
+th, td { border: 1px solid #ccc; padding: 0.3rem 0.5rem; text-align: left; }
+th { background: #f0f0f0; }
+
+.error { color: #c00; font-size: 0.875rem; }
+.success { color: #080; font-size: 0.875rem; }
+.info { color: #005faf; font-size: 0.875rem; }

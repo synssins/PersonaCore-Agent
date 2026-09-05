@@ -1,0 +1,65 @@
+<!-- SKELETON — visual design lands in interface-design pass, do not polish here -->
+{% extends "layout.html" %}
+{% block title %}Plugins{% endblock %}
+{% block content %}
+<h1>Plugins</h1>
+
+{% if errors.install is defined %}<p class="error">{{ errors.install }}</p>{% endif %}
+{% if errors._global is defined %}<p class="error">{{ errors._global }}</p>{% endif %}
+
+<section>
+  <h2>Installed Plugins</h2>
+  {% if plugins %}
+  <table>
+    <thead>
+      <tr>
+        <th>ID</th><th>Name</th><th>Version</th><th>Status</th><th>Signature</th><th>Actions</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for p in plugins %}
+    <tr>
+      <td>{{ p.id }}</td>
+      <td>{{ p.name }}</td>
+      <td>{{ p.version }}</td>
+      <td>{{ p.status }}</td>
+      <td>{{ p.signature_status }}</td>
+      <td>
+        <form method="post" action="/plugins/{{ p.id }}/enable" style="display:inline">
+          <button type="submit">Enable</button>
+        </form>
+        <form method="post" action="/plugins/{{ p.id }}/disable" style="display:inline">
+          <button type="submit">Disable</button>
+        </form>
+        <form method="post" action="/plugins/{{ p.id }}/reload" style="display:inline">
+          <button type="submit">Reload</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+    <p>No plugins loaded.</p>
+  {% endif %}
+</section>
+
+<section>
+  <h2>Install from File</h2>
+  <form method="post" action="/plugins/install-file" enctype="multipart/form-data">
+    <label>Plugin archive: <input type="file" name="plugin_file" required></label>
+    <label>I acknowledge this plugin may be unsigned:
+      <input type="checkbox" name="acknowledged" value="true">
+    </label>
+    <button type="submit">Install</button>
+  </form>
+</section>
+
+<section>
+  <h2>Install from Registry</h2>
+  <form method="post" action="/plugins/install-registry">
+    <label>Registry URL: <input type="url" name="registry_url" required></label>
+    <button type="submit">Install</button>
+  </form>
+</section>
+{% endblock %}
