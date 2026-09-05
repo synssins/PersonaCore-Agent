@@ -148,16 +148,16 @@ jobs:
           $tag = "v$v"
           $title = "PersonaCore-Agent $tag"
           $isPrerelease = $tag -match "-(alpha|beta|rc|dev)"
-          $notes = @"
-Automated release for $tag.
-
-**Install:** download ``PersonaCore-Agent-Setup-$v.exe`` below and run it. Per-user by default; pass ``/ALLUSERS`` on the command line for machine-wide install.
-
-**Alpha caveats:**
-- Not code-signed. SmartScreen will warn; click "More info" then "Run anyway".
-- All 6 first-party plugins (filesystem/powershell/desktop_control/browser/screen_vision/clipboard) are stubs returning ``not_implemented``. Real implementations land in v0.2. Voice pipeline (wake -> STT -> LLM -> TTS) is fully wired against your OpenAI-compat + Wyoming endpoints.
-"@
-          # Collect artifacts only if they actually exist — signing/installer steps are conditional.
+          $notesLines = @()
+          $notesLines += "Automated release for $tag."
+          $notesLines += ""
+          $notesLines += "Install: download PersonaCore-Agent-Setup-$v.exe below and run it. Per-user by default; pass /ALLUSERS on the command line for machine-wide install."
+          $notesLines += ""
+          $notesLines += "Alpha caveats:"
+          $notesLines += "- Not code-signed. SmartScreen will warn; click More info then Run anyway."
+          $notesLines += "- The six first-party plugins (filesystem, powershell, desktop_control, browser, screen_vision, clipboard) are stubs returning not_implemented. Real implementations land in v0.2. The voice pipeline (wake, STT, LLM, TTS) is fully wired against your OpenAI-compat and Wyoming endpoints."
+          $notes = ($notesLines -join "`n")
+          # Collect artifacts only if they actually exist - signing/installer steps are conditional.
           $candidates = @(
             "dist\PersonaCore-Agent-Setup-$v.exe"
             "dist\agent-$v-win-x64.zip"
