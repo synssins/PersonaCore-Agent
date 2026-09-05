@@ -5,6 +5,9 @@ __pycache__/
 dist/
 build/
 .pytest_cache/
+.mypy_cache/
+.pyright_cache/
+.ruff_cache/
 .coverage
 htmlcov/
 
@@ -14,16 +17,35 @@ venv/
 env/
 
 # PyInstaller
+*.spec.bak
 _incoming/
 
 # IDE
 .vscode/
 .idea/
+*.swp
 
 # Local state
 logs/
 *.dpapi
 secrets.dpapi
+*.log
+mcp-token
+ui-port
+first_run_completed
+pending_update.json
+audit.sqlite*
+conversations.sqlite*
+
+# Signing keys — never commit private material
+working/signing/*.priv.hex
+working/signing/*.private*
+*.pem
+*.key
 
 # Git worktrees created by executors
 worktree/
+
+# Go build artifacts
+updater/dist/
+updater/*.exe
