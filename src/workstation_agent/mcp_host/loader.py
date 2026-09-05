@@ -37,10 +37,9 @@ import tomlkit
 
 import workstation_agent.config.store as _store
 import workstation_agent.security.signature as _sig
+from workstation_agent.security.first_party_pubkey import FIRST_PARTY_PUBKEY
 
 log = logging.getLogger(__name__)
-
-from workstation_agent.security.first_party_pubkey import FIRST_PARTY_PUBKEY
 
 TRUSTED_PUBKEYS: list[bytes] = [FIRST_PARTY_PUBKEY]
 
