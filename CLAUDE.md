@@ -21,27 +21,26 @@ See `/docs/superpowers/specs/` for the complete design specification and `workin
 - **Development dependencies:** ruff, pyright, pytest, pytest-asyncio, pytest-cov
 - **Windows-only target**
 
-To install locally:
+## Virtual environment — MANDATORY
+
+**This project MUST run from its own venv at `.venv/`.** Never `pip install` against system Python — you will clobber the system's `mcp` (and other) packages that PersonaCore, Vesmark, and other projects on this workstation depend on. That specifically has happened; do not repeat it.
+
+First-time setup (one command):
 
 ```bash
-pip install -e .[dev]
+C:\Python314\python.exe -m venv .venv
+.venv\Scripts\python.exe -m pip install -e .[dev]
 ```
 
-To run tests:
+From then on, every project command runs through `.venv\Scripts\python.exe`:
 
 ```bash
-pytest -q
+.venv\Scripts\python.exe -m pytest -q
+.venv\Scripts\python.exe -m ruff check .
+.venv\Scripts\python.exe -m pyright
+.venv\Scripts\python.exe -m workstation_agent
 ```
 
-To check code quality:
+Or activate the venv once per shell (`.venv\Scripts\activate`) and drop the prefix. Either works; the point is that `python`, `pip`, `pytest` etc. must resolve to the venv, not `C:\Python314\python.exe` directly.
 
-```bash
-ruff check .
-pyright
-```
-
-To run the agent placeholder:
-
-```bash
-python -m workstation_agent
-```
+If a subagent's SPEC or executor instructions say "run `pip install -e .[dev]`" without the venv path, it means "run it inside the venv." Never run bare `pip install` against system Python from this project.
