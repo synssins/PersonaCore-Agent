@@ -12,6 +12,8 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
+from workstation_agent.security.dpapi import redact_key
+
 if TYPE_CHECKING:
     from pathlib import Path
 
@@ -45,11 +47,10 @@ def _redact_value(value: object) -> object:
             k: (_PLACEHOLDER if _REDACT_PATTERN.search(str(k)) else _redact_value(v))
             for k, v in value.items()
         }
-    if isinstance(value, list):
-        return [_redact_value(item) for item in value]
-    if isinstance(value, str) and _REDACT_PATTERN.search(value):
-        # The value itself looks like a key name — redact it.
-        return _PLACEHOLDER
+    if isinstance(value, list | tuple):
+        return type(value)(_redact_value(v) for v in value)
+    if isinstance(value, str):
+        return redact_key(value)  # strip sk-... patterns, otherwise return unchanged
     return value
 
 

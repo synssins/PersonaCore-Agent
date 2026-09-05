@@ -1,6 +1,6 @@
 """Tests: structured logging — JSON output, redaction, rotation."""
 
-# ruff: noqa: S106
+# ruff: noqa: S105, S106
 
 from __future__ import annotations
 
@@ -165,6 +165,52 @@ def test_redaction_token_in_value(tmp_path):
     records = _read_json_lines(log_dir / "agent.log")
     last = records[-1]
     assert last.get("token") != "bearer_abc123"
+
+
+def test_benign_message_with_password_word_not_redacted(tmp_path):
+    """A log message whose TEXT contains 'password' is NOT itself redacted.
+
+    Bug 1 fix: redaction only triggers on matching KEYS, not on value content.
+    """
+    from workstation_agent.observability.logging import configure
+
+    log_dir = tmp_path / "logs_benign"
+    configure(log_dir, level="DEBUG")
+
+    log = structlog.get_logger("test_benign")
+    log.info("user set a new password today")
+
+    records = _read_json_lines(log_dir / "agent.log")
+    assert len(records) >= 1
+    last = records[-1]
+    event_text = last.get("event", last.get("message", ""))
+    # The benign message must survive intact — no redaction on plain string values
+    assert "user set a new password today" in event_text
+
+
+def test_openai_key_in_string_value_is_redacted(tmp_path):
+    """An sk-... key embedded in a string VALUE is stripped by redact_key.
+
+    Bug 2 fix: _redact_value now calls redact_key() on string values so that
+    actual API keys are stripped even when the dict key name is innocuous.
+    """
+    from workstation_agent.observability.logging import configure
+
+    log_dir = tmp_path / "logs_sk"
+    configure(log_dir, level="DEBUG")
+
+    secret = "sk-abc123456789012345678901234567890"
+    log = structlog.get_logger("test_sk_redact")
+    log.info("api call", trace=f"call to api with key {secret}")
+
+    records = _read_json_lines(log_dir / "agent.log")
+    assert len(records) >= 1
+    last = records[-1]
+    # The 'trace' key itself must survive (it is not a sensitive key name)
+    assert "trace" in last
+    # The sk-... token must have been stripped from the value
+    assert secret not in str(last.get("trace", ""))
+    assert "[REDACTED]" in str(last.get("trace", ""))
 
 
 def test_tracing_noop_without_otel():
