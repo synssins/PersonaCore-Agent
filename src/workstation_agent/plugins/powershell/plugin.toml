@@ -7,7 +7,7 @@ declared_permissions = [
   "tool:powershell.run",
   "cmd:.*",
 ]
-confirmable_conditions = ["cmd_outside_allowlist"]
+confirmable_conditions = ["command_outside_allowlist"]
 
 [compat]
 min_host_version = "0.1.0"
