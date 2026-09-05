@@ -49,7 +49,8 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 PIPE_NAME = r"\\.\pipe\PC-Agent-MCP"
-_APPDATA = Path(os.environ.get("APPDATA", "")) or (Path.home() / "AppData" / "Roaming")
+_appdata_env = os.environ.get("APPDATA")
+_APPDATA = Path(_appdata_env) if _appdata_env else Path.home() / ".config"
 TOKEN_DIR = _APPDATA / "WorkstationAgent"
 TOKEN_FILE = TOKEN_DIR / "mcp-token"
 _JSONRPC = "2.0"

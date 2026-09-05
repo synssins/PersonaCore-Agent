@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -719,3 +720,141 @@ def test_main_generates_token_when_missing(tmp_path: Any, monkeypatch: Any) -> N
             srv.main()
 
     assert len(generated_tokens) == 1
+
+
+# ---------------------------------------------------------------------------
+# Tests: APPDATA path resolution
+# ---------------------------------------------------------------------------
+
+
+def test_token_path_uses_appdata_when_set(tmp_path: Any, monkeypatch: Any) -> None:
+    """TOKEN_DIR/TOKEN_FILE are rooted under APPDATA when APPDATA is set."""
+    import importlib
+    import sys
+
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    # Remove cached module so constants are re-evaluated with new env
+    monkeypatch.delitem(sys.modules, "workstation_agent.mcp_host.mcp_server", raising=False)
+    import workstation_agent.mcp_host.mcp_server as srv_fresh
+
+    try:
+        assert srv_fresh.TOKEN_DIR.is_relative_to(tmp_path), (
+            f"TOKEN_DIR {srv_fresh.TOKEN_DIR!r} should be under APPDATA={tmp_path!r}"
+        )
+        assert srv_fresh.TOKEN_FILE.is_relative_to(tmp_path), (
+            f"TOKEN_FILE {srv_fresh.TOKEN_FILE!r} should be under APPDATA={tmp_path!r}"
+        )
+    finally:
+        # Re-import the original module so other tests are not affected
+        importlib.reload(srv_fresh)
+
+
+def test_token_path_falls_back_when_appdata_unset(tmp_path: Any, monkeypatch: Any) -> None:
+    """When APPDATA is absent, TOKEN_DIR falls back to home/.config/… not cwd."""
+    import importlib
+    import sys
+
+    monkeypatch.delenv("APPDATA", raising=False)
+    monkeypatch.delitem(sys.modules, "workstation_agent.mcp_host.mcp_server", raising=False)
+    import workstation_agent.mcp_host.mcp_server as srv_fresh
+
+    try:
+        cwd = Path()
+        # Must not be rooted in the current working directory
+        try:
+            rel = srv_fresh.TOKEN_DIR.relative_to(cwd.resolve())
+        except ValueError:
+            rel = None
+
+        assert rel is None or str(srv_fresh.TOKEN_DIR.resolve()) != str(cwd.resolve()), (
+            "TOKEN_DIR must not be the current working directory"
+        )
+        # Must not start with '.' (i.e. Path('.') / ...)
+        assert str(srv_fresh.TOKEN_DIR)[0] != ".", (
+            f"TOKEN_DIR {srv_fresh.TOKEN_DIR!r} must not be relative/cwd-rooted"
+        )
+        # Must be rooted under home directory
+        assert srv_fresh.TOKEN_DIR.is_relative_to(Path.home()), (
+            f"TOKEN_DIR {srv_fresh.TOKEN_DIR!r} should be under home={Path.home()!r}"
+        )
+    finally:
+        importlib.reload(srv_fresh)
+
+
+def test_token_file_hardened_after_save(tmp_path: Any, monkeypatch: Any) -> None:
+    """generate_and_store_token() calls harden_file with the token path."""
+    import sys
+    import types
+
+    import workstation_agent.mcp_host.mcp_server as srv
+
+    monkeypatch.setattr(srv, "TOKEN_DIR", tmp_path)
+    monkeypatch.setattr(srv, "TOKEN_FILE", tmp_path / "mcp-token")
+
+    harden_calls: list[Any] = []
+
+    def fake_harden(path: Any) -> None:
+        harden_calls.append(path)
+
+    fake_dpapi = types.ModuleType("workstation_agent.security.dpapi")
+    fake_dpapi.harden_file = fake_harden  # type: ignore[attr-defined]
+
+    with patch.dict(sys.modules, {"workstation_agent.security.dpapi": fake_dpapi}):
+        srv.generate_and_store_token()
+
+    assert len(harden_calls) == 1, "harden_file must be called exactly once"
+    assert harden_calls[0] == tmp_path / "mcp-token", (
+        f"harden_file called with {harden_calls[0]!r}, expected {tmp_path / 'mcp-token'!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tests: run_pipe_server when _create_pipe_server returns None
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_pipe_server_exits_on_bind_failure() -> None:
+    """run_pipe_server returns immediately when _create_pipe_server fails."""
+    from workstation_agent.mcp_host import mcp_server as srv
+
+    async def _return_none() -> None:
+        return None
+
+    with patch.object(srv, "_create_pipe_server", side_effect=_return_none) as mock_create:
+        # Should return immediately without raising
+        await srv.run_pipe_server("test-token", max_clients=3)
+    mock_create.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Tests: serve() IncompleteReadError path
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_serve_handles_incomplete_read() -> None:
+    """serve() exits cleanly when readline raises IncompleteReadError."""
+    from workstation_agent.mcp_host.mcp_server import AgentMCPServer
+
+    done_event = asyncio.Event()
+
+    async def _handler(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        session = AgentMCPServer(r, w, token=TOKEN)
+        # Patch the reader so readline raises IncompleteReadError
+        async def _bad_readline() -> bytes:
+            _partial: bytes = b""
+            raise asyncio.IncompleteReadError(_partial, None)
+
+        r.readline = _bad_readline  # type: ignore[method-assign]
+        await session.serve()
+        done_event.set()
+
+    mini_server = await asyncio.start_server(_handler, "127.0.0.1", 0)
+    mp = mini_server.sockets[0].getsockname()[1]  # type: ignore[union-attr]
+
+    _r, _w = await asyncio.open_connection("127.0.0.1", mp)
+    await asyncio.wait_for(done_event.wait(), timeout=3.0)
+    _w.close()
+    mini_server.close()
+    await mini_server.wait_closed()
