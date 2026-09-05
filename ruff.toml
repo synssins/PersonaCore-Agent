@@ -1,0 +1,31 @@
+line-length = 100
+target-version = "py312"
+
+[lint]
+select = ["ALL"]
+ignore = [
+    "CPY001",  # missing copyright notice
+    "D",       # pydocstyle – handled separately
+]
+
+[lint.per-file-ignores]
+"tests/**" = [
+    "ANN001",  # missing type annotations
+    "ANN002",  # *args annotations
+    "ANN003",  # **kwargs annotations
+    "CPY001",  # copyright notice
+    "D",       # docstrings
+    "PLR2004", # magic values
+    "PLC0415", # import at module level
+]
+"**/__init__.py" = [
+    "F401",    # unused imports
+    "CPY001",  # copyright notice
+]
+"src/workstation_agent/protocols.py" = [
+    "CPY001",  # copyright notice
+]
+"src/workstation_agent/__main__.py" = [
+    "CPY001",  # copyright notice
+    "T201",    # print statement
+]
