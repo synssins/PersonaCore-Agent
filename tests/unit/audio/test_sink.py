@@ -170,3 +170,37 @@ async def test_speaker_start_stop_explicit() -> None:
     await asyncio.sleep(0.05)
     await speaker.stop()
     assert sink.closed
+
+
+@pytest.mark.asyncio
+async def test_speaker_abort_then_stop_thread_exits() -> None:
+    """Bug 2: abort() followed by stop() must not leave the play thread running.
+
+    Before the fix, abort() drained the queue including the None sentinel that
+    stop() enqueued.  The daemon thread never saw the sentinel and spun forever.
+
+    With the fix (dedicated _stop_event instead of sentinel-in-queue), abort()
+    only drains audio chunks and the stop event is separate — so the thread
+    always sees the stop signal and exits within 200 ms.
+    """
+    sink = _FakeSink()
+    speaker = Speaker(backend=sink)
+    await speaker.start()
+
+    assert speaker._thread is not None
+    assert speaker._thread.is_alive(), "Play thread should be running after start()"
+
+    # Enqueue some audio so the queue is not empty when we abort
+    for _ in range(10):
+        speaker.enqueue(b"\x00" * 320)
+
+    # Rapid succession: abort() drains the queue, stop() signals the thread
+    speaker.abort()
+    await speaker.stop()
+
+    # Thread must have exited
+    alive = speaker._thread.is_alive()
+    assert not alive, (
+        "Play thread is still alive 200 ms after abort()+stop() — "
+        "the None sentinel was likely consumed by abort() (Bug 2 not fixed)."
+    )

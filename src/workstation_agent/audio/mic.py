@@ -146,9 +146,9 @@ class MicStream:
                 await self._thread_task
         if self._source is not None:
             self._source.close()
-        # Signal the consumer
-        with contextlib.suppress(asyncio.QueueFull):
-            self._queue.put_nowait(None)
+        # Signal the consumer — use blocking put() so the sentinel is always
+        # delivered even when the queue is at capacity.
+        await self._queue.put(None)
 
     # ------------------------------------------------------------------
     # Async iterator
@@ -197,7 +197,9 @@ class MicStream:
             frame = AudioFrame(pcm=pcm, ts_ms=int(time.time() * 1000))
             temp.put(frame)
             loop.call_soon_threadsafe(self._drain_temp_queue, temp)
-        loop.call_soon_threadsafe(self._queue.put_nowait, None)
+        # Use a coroutine-based put so the sentinel is *always* delivered even
+        # when the queue is full — put() will wait rather than raise QueueFull.
+        asyncio.run_coroutine_threadsafe(self._queue.put(None), loop)
 
     def _drain_temp_queue(self, temp: queue.SimpleQueue[AudioFrame | None]) -> None:
         """Called on the event loop thread to move frames from temp into async queue."""

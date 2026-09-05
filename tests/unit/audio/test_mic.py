@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 
 import pytest
 
@@ -112,3 +113,57 @@ async def test_mic_source_closed_on_stop() -> None:
     async with MicStream(source=source):
         pass
     assert source.closed
+
+
+@pytest.mark.asyncio
+async def test_mic_sentinel_delivered_when_queue_full() -> None:
+    """Bug 1: stop() must deliver the None sentinel even when the queue is full.
+
+    Before the fix, MicStream.stop() used put_nowait(None) which silently
+    dropped the sentinel when the queue was at capacity — the consumer's
+    ``async for`` would then block forever.
+
+    With the fix (await queue.put(None)), the sentinel waits for a slot and
+    always arrives, so the consumer exits within 100 ms.
+    """
+    # Use a very small queue so it fills quickly
+    mic = MicStream(source=_FakeSource([]))
+    mic._queue = asyncio.Queue(maxsize=3)
+
+    # Fill the queue to capacity with dummy frames
+    for _ in range(3):
+        mic._queue.put_nowait(AudioFrame(pcm=b"\x00" * 320, ts_ms=1))
+
+    # Now call stop() — the queue is full; the sentinel MUST still arrive.
+    # We run a consumer concurrently so the queue can drain while stop() puts.
+    consumer_done = asyncio.Event()
+
+    async def consume() -> None:
+        # Drain the dummy frames then wait for the sentinel
+        count = 0
+        while True:
+            item = await asyncio.wait_for(mic._queue.get(), timeout=0.5)
+            if item is None:
+                consumer_done.set()
+                return
+            count += 1
+
+    # Start consumer first, then trigger stop (which must put the sentinel)
+    consumer_task = asyncio.create_task(consume())
+    # stop() needs the thread task to be present; just call the sentinel path
+    # directly (the internal stop helper) without the full start/stop lifecycle.
+    await mic.stop()  # must not drop the sentinel
+
+    try:
+        await asyncio.wait_for(consumer_done.wait(), timeout=0.5)
+    except TimeoutError:
+        pytest.fail(
+            "Consumer did not exit within 500 ms — sentinel was likely dropped "
+            "because the queue was full (Bug 1 not fixed).",
+        )
+    finally:
+        consumer_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await consumer_task
+
+

@@ -12,6 +12,13 @@ Barge-in cancel
 ``Speaker.abort()`` sets a flag read by the background thread.  The thread
 stops writing immediately and the queue is drained, giving sub-frame latency
 for the cancel signal.
+
+Stop signalling
+---------------
+``Speaker.stop()`` signals the daemon thread via a separate ``threading.Event``
+(``_stop_event``) rather than enqueuing a ``None`` sentinel.  This avoids a
+race where ``abort()`` drains the queue and consumes the ``None`` before the
+thread sees it, causing the thread to spin forever.
 """
 
 from __future__ import annotations
@@ -92,8 +99,11 @@ class Speaker:
         self._channels = channels
         self._backend_arg = backend
         self._backend: _SinkBackend | None = None
-        self._queue: queue.SimpleQueue[bytes | None] = queue.SimpleQueue()
+        self._queue: queue.SimpleQueue[bytes] = queue.SimpleQueue()
         self._abort_flag = threading.Event()
+        # Dedicated stop signal — kept separate from the audio queue so that
+        # abort() draining the queue can never consume the stop signal.
+        self._stop_event = threading.Event()
         self._muted = False
         self._thread: threading.Thread | None = None
 
@@ -118,6 +128,7 @@ class Speaker:
                 channels=self._channels,
                 dtype=_DTYPE,
             )
+        self._stop_event.clear()
         self._thread = threading.Thread(
             target=self._play_loop, name="speaker-play", daemon=True,
         )
@@ -125,7 +136,9 @@ class Speaker:
 
     async def stop(self) -> None:
         """Stop playback and close the stream."""
-        self._queue.put(None)
+        # Signal the daemon thread via a dedicated Event — NOT via a None in
+        # the audio queue, which abort() could consume before the thread sees it.
+        self._stop_event.set()
         if self._thread is not None:
             self._thread.join(timeout=2.0)
         if self._backend is not None:
@@ -143,7 +156,8 @@ class Speaker:
     def abort(self) -> None:
         """Immediately stop playback; discard buffered audio (barge-in)."""
         self._abort_flag.set()
-        # Drain the queue
+        # Drain audio chunks only — the stop signal lives in _stop_event, so
+        # draining here can never accidentally consume it.
         while True:
             try:
                 self._queue.get_nowait()
@@ -168,7 +182,7 @@ class Speaker:
         """Blocking playback loop - runs in a daemon thread."""
         if self._backend is None:
             return
-        while True:
+        while not self._stop_event.is_set():
             # If abort is active, sleep briefly instead of spinning so we do
             # not peg a CPU core waiting for the flag to clear.
             if self._abort_flag.is_set():
@@ -179,8 +193,6 @@ class Speaker:
             except queue.Empty:
                 continue
             except Exception:  # noqa: BLE001
-                break
-            if item is None:
                 break
             if self._abort_flag.is_set():
                 # Drop this chunk — abort was called between the get and now.
