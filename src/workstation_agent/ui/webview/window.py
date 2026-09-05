@@ -20,7 +20,6 @@ from __future__ import annotations
 import logging
 import queue
 import threading
-import time
 from typing import TYPE_CHECKING, Any
 
 import webview
@@ -136,24 +135,31 @@ class WebviewWindow:
     # ------------------------------------------------------------------
 
     def _process_queue(self) -> None:
-        """Drain pending operations.  Called periodically by pywebview on the main thread."""
-        while True:
+        """Process pending operations for the lifetime of the process.
+
+        Runs on a background worker thread (spawned by ``webview.start``).
+        Uses a blocking ``get`` with a short timeout so ops are handled with
+        low latency while idle CPU remains near zero.
+        """
+        log.debug("WebviewWindow worker thread up")
+        while not self._stopped.is_set():
             try:
-                op, arg = self._pending_ops.get_nowait()
+                op, arg = self._pending_ops.get(timeout=0.1)
             except queue.Empty:
-                break
-
-            if op == "open":
-                self._do_open(str(arg))
-            elif op == "close":
-                self._do_close()
-            elif op == "stop":
-                self._do_stop()
-            else:
-                log.warning("WebviewWindow: unknown op %r", op)
-
-            # yield after each op so the loop stays responsive
-            time.sleep(0)
+                continue
+            try:
+                if op == "open":
+                    self._do_open(str(arg))
+                elif op == "close":
+                    self._do_close()
+                elif op == "stop":
+                    self._do_stop()
+                    break  # stop op exits worker
+                else:
+                    log.warning("WebviewWindow: unknown op %r", op)
+            except Exception:
+                log.exception("op %r failed", op)
+        log.debug("WebviewWindow worker thread exiting")
 
     def _do_open(self, path: str) -> None:
         """Navigate to *path*; create window on first call."""
