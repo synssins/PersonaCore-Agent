@@ -4,14 +4,129 @@ on:
   push:
     tags:
       - "v*"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build (without leading v)"
+        required: true
+        default: "0.1.0"
 
 jobs:
   release:
     runs-on: windows-latest
+    env:
+      PC_AGENT_SIGNING_PUBKEY: ${{ secrets.PC_AGENT_SIGNING_PUBKEY }}
+      PC_AGENT_SIGNING_PRIVATE_KEY: ${{ secrets.PC_AGENT_SIGNING_PRIVATE_KEY }}
+      PC_AGENT_CODESIGN_CERT_PATH: ${{ secrets.PC_AGENT_CODESIGN_CERT_PATH }}
+      PC_AGENT_CODESIGN_CERT_PASSWORD: ${{ secrets.PC_AGENT_CODESIGN_CERT_PASSWORD }}
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Release build placeholder
-        run: echo "release build placeholder — SPEC-10 fills this in"
+      - name: Compute version
+        id: ver
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF -like "refs/tags/v*") {
+            $v = $env:GITHUB_REF.Substring("refs/tags/v".Length)
+          } elseif ("${{ github.event.inputs.version }}") {
+            $v = "${{ github.event.inputs.version }}"
+          } else {
+            $v = "0.0.0-dev"
+          }
+          "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "version=$v"
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Go 1.22
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .[dev]
+
+      - name: Run pytest (informational; does not gate publish)
+        continue-on-error: true
+        run: pytest -q
+
+      - name: Boot check (gates publish)
+        run: python scripts/boot_check.py --fake-backends
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          ./installer/build.ps1 -Version "${{ steps.ver.outputs.version }}" -Python "python"
+
+      - name: Prepare release manifest
+        shell: pwsh
+        run: |
+          $v = "${{ steps.ver.outputs.version }}"
+          $dist = "dist"
+          Compress-Archive -Path "$dist\Agent\*" -DestinationPath "$dist\agent-$v-win-x64.zip" -Force
+          Copy-Item "$dist\Updater.exe" "$dist\updater-$v-win-x64.exe" -Force
+          $agentZip = "$dist\agent-$v-win-x64.zip"
+          $updaterExe = "$dist\updater-$v-win-x64.exe"
+          $agentSha = (Get-FileHash -Algorithm SHA256 $agentZip).Hash.ToLower()
+          $updSha   = (Get-FileHash -Algorithm SHA256 $updaterExe).Hash.ToLower()
+          $agentSize = (Get-Item $agentZip).Length
+          $updSize   = (Get-Item $updaterExe).Length
+          $manifest = @{
+            version              = $v
+            channel              = "stable"
+            released_at          = (Get-Date -AsUTC).ToString("o")
+            mandatory            = $false
+            notes_url            = "https://github.com/${{ github.repository }}/releases/tag/v$v"
+            min_updater_version  = "0.1.0"
+            artifacts = @{
+              agent   = @{ url = "https://github.com/${{ github.repository }}/releases/download/v$v/agent-$v-win-x64.zip";   sha256 = $agentSha; size = $agentSize }
+              updater = @{ url = "https://github.com/${{ github.repository }}/releases/download/v$v/updater-$v-win-x64.exe"; sha256 = $updSha;   size = $updSize }
+            }
+          }
+          $manifest | ConvertTo-Json -Depth 6 | Out-File "$dist\manifest.json" -Encoding utf8
+
+      - name: Sign manifest (Ed25519)
+        if: env.PC_AGENT_SIGNING_PRIVATE_KEY != ''
+        run: python scripts/sign_manifest.py dist/manifest.json
+
+      - name: Authenticode-sign binaries
+        if: env.PC_AGENT_CODESIGN_CERT_PATH != ''
+        shell: pwsh
+        run: |
+          $signtool = (Get-Command signtool.exe -ErrorAction SilentlyContinue)
+          if (-not $signtool) {
+            Write-Warning "signtool.exe not found on PATH; skipping Authenticode signing"
+            exit 0
+          }
+          & signtool.exe sign /f "$env:PC_AGENT_CODESIGN_CERT_PATH" /p "$env:PC_AGENT_CODESIGN_CERT_PASSWORD" /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 dist\Agent\Agent.exe dist\Updater.exe
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: personacore-agent-${{ steps.ver.outputs.version }}
+          path: |
+            dist/agent-*.zip
+            dist/updater-*.exe
+            dist/manifest.json
+            dist/manifest.json.sig
+            dist/PersonaCore-Agent-Setup-*.exe
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/agent-*.zip
+            dist/updater-*.exe
+            dist/manifest.json
+            dist/manifest.json.sig
+            dist/PersonaCore-Agent-Setup-*.exe
+          fail_on_unmatched_files: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
