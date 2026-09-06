@@ -120,6 +120,20 @@ class WebviewWindow:
         SPEC-10 drives this from the composition root.
         """
         log.debug("WebviewWindow.start() — entering main loop")
+        # pywebview requires at least one window created BEFORE start() —
+        # otherwise it raises "You must create a window first before calling
+        # this function." Create a hidden bootstrap window pointing at the
+        # base URL; subsequent .open(path) calls will .load_url + .show it.
+        if self._window is None:
+            base_url = self._url_provider()
+            self._window = webview.create_window(
+                self._title,
+                url=base_url,
+                width=1100,
+                height=720,
+                resizable=True,
+                hidden=True,
+            )
         self._started.set()
         webview.start(
             func=self._process_queue,
@@ -162,24 +176,20 @@ class WebviewWindow:
         log.debug("WebviewWindow worker thread exiting")
 
     def _do_open(self, path: str) -> None:
-        """Navigate to *path*; create window on first call."""
+        """Navigate to *path*; show the (already-created) window."""
         base_url = self._url_provider()
         url = f"{base_url}{path}"
-
         if self._window is None:
-            log.debug("Creating pywebview window: %s", url)
-            self._window = webview.create_window(
-                self._title,
-                url=url,
-                width=1100,
-                height=720,
-                resizable=True,
-            )
-        else:
-            if not self._window.hidden:
-                self._window.show()
-            self._window.load_url(url)
-            log.debug("Navigated window to %s", url)
+            # start() creates the bootstrap window before webview.start;
+            # if we're here, something skipped start() (e.g., a test).
+            log.warning("WebviewWindow._do_open before start(); nothing to do")
+            return
+        self._window.load_url(url)
+        try:
+            self._window.show()
+        except Exception:  # noqa: BLE001
+            log.debug("window.show() no-op'd", exc_info=True)
+        log.debug("Navigated window to %s", url)
 
     def _do_close(self) -> None:
         """Hide the window."""

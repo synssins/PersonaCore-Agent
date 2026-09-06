@@ -60,9 +60,12 @@ class TestWebviewWindowQueueing:
             assert ww._pending_ops.qsize() == 2  # open + stop
             ww.start()
 
+        # New behavior: create_window is called once at start() with the base URL
+        # (pywebview requires a window to exist BEFORE start()). Subsequent
+        # open("/dashboard") is delivered via load_url on the worker thread.
         fake_webview.create_window.assert_called_once()
-        _, kwargs = fake_webview.create_window.call_args
-        assert "/dashboard" in kwargs["url"]
+        fake_win.load_url.assert_called()
+        assert "/dashboard" in fake_win.load_url.call_args[0][0]
 
     def test_open_after_start_navigates_existing_window(self) -> None:
         fake_win = _make_fake_window()
@@ -136,9 +139,12 @@ class TestWebviewWindowQueueing:
             ww.stop()  # ensures worker exits after draining both ops
             ww.start()
 
+        # create_window fires once (at start) then two load_url calls follow.
         assert call_order[0] == "create"
-        assert "load" in call_order[1]
-        assert "/b" in call_order[1]
+        loads = [c for c in call_order if c.startswith("load:")]
+        assert len(loads) == 2, f"expected 2 load_url calls, got {call_order}"
+        assert "/a" in loads[0]
+        assert "/b" in loads[1]
 
     def test_configure_replaces_url_provider(self) -> None:
         fake_win = _make_fake_window()
@@ -152,10 +158,12 @@ class TestWebviewWindowQueueing:
             ww.configure(lambda: "http://new:2222")
             ww.open("/x")
             ww.stop()  # sentinel so the loop exits
-            ww._process_queue()
+            ww.start()  # create_window happens here, using the configured provider
 
         _, kwargs = fake_webview.create_window.call_args
         assert "new:2222" in kwargs["url"]
+        fake_win.load_url.assert_called()
+        assert "new:2222" in fake_win.load_url.call_args[0][0]
 
     def test_start_sets_started_and_stopped_events(self) -> None:
         fake_win = _make_fake_window()
