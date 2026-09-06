@@ -31,6 +31,15 @@ def _startup_log_path() -> str:
     return os.path.join(log_dir, "startup.log")
 
 
+def _startup_write(msg: str) -> None:
+    """Best-effort write to the startup log — never raises."""
+    try:
+        with open(_startup_log_path(), "a", encoding="utf-8") as f:  # noqa: PTH123
+            f.write(msg)
+    except OSError:
+        pass
+
+
 def _ensure_std_streams() -> None:
     """PyInstaller windowed builds (--noconsole) set sys.stdout/stderr to None.
 
@@ -189,18 +198,27 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    # Belt-and-suspenders: if anything in main() throws before logging is
-    # configured, capture the traceback to the startup log so we can debug
-    # windowed-EXE failures that would otherwise vanish into stderr=devnull.
+    # Log a heartbeat BEFORE anything else so we can confirm Agent.exe ran
+    # at all, then wrap main() so any exception at startup lands in
+    # %APPDATA%\WorkstationAgent\startup.log — including uvicorn's log-config
+    # crash, missing DLL fallout, etc.
+    import datetime as _dt  # noqa: PLC0415
+    _startup_write(
+        f"\n=== agent boot pid={os.getpid()} at={_dt.datetime.now().isoformat()} "
+        f"argv={sys.argv!r} frozen={getattr(sys, 'frozen', False)} "
+        f"executable={sys.executable!r} ===\n"
+    )
     try:
-        sys.exit(main())
+        rc = main()
+        _startup_write(f"=== agent exit rc={rc} ===\n")
+        sys.exit(rc)
     except SystemExit:
         raise
     except BaseException:  # noqa: BLE001
         import traceback  # noqa: PLC0415
+        _startup_write("\n=== unhandled exception at startup ===\n")
         try:
             with open(_startup_log_path(), "a", encoding="utf-8") as f:  # noqa: PTH123
-                f.write("\n=== unhandled exception at startup ===\n")
                 traceback.print_exc(file=f)
         except OSError:
             pass

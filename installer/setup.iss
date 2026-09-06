@@ -106,8 +106,17 @@ Filename: "schtasks.exe"; \
     Parameters: "/create /F /TN ""WorkstationAgent\Startup"" /TR ""\""{app}\current\{#AppExeName}\"" --autostart"" /SC ONLOGON /RL LIMITED"; \
     Flags: runhidden; Tasks: autostart_task; Check: IsAdminInstall
 ; Optional: launch the app after install (default checked on Finish page).
-Filename: "{app}\current\{#AppExeName}"; Description: "Launch {#AppName}"; \
-    Flags: postinstall skipifsilent nowait
+; Use the direct versioned path (NOT the junction) + shellexec so Inno's
+; postinstall launcher doesn't crash with "CreateProcess failed; code 2" —
+; the junction is real (verified via mklink+dir /A:L) but something about
+; how Inno's postinstall Run resolves it on some machines is broken. The
+; direct path bypasses that entirely. The junction still exists and the
+; Start Menu shortcut + Registry Run key still use `current\` so future
+; updates via the updater EXE swap correctly.
+Filename: "{app}\app\{#AppVersion}\{#AppExeName}"; \
+    WorkingDir: "{app}\app\{#AppVersion}"; \
+    Description: "Launch {#AppName}"; \
+    Flags: postinstall skipifsilent nowait shellexec
 
 [UninstallRun]
 Filename: "schtasks.exe"; Parameters: "/delete /F /TN ""WorkstationAgent\Startup"""; \
