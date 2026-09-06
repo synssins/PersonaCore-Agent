@@ -23,22 +23,37 @@ import runpy
 import sys
 
 
+def _startup_log_path() -> str:
+    """Return the file path where windowed-EXE startup output is captured."""
+    appdata = os.environ.get("APPDATA") or os.path.expanduser("~")
+    log_dir = os.path.join(appdata, "WorkstationAgent")
+    os.makedirs(log_dir, exist_ok=True)
+    return os.path.join(log_dir, "startup.log")
+
+
 def _ensure_std_streams() -> None:
     """PyInstaller windowed builds (--noconsole) set sys.stdout/stderr to None.
 
     Uvicorn's default log config instantiates ``ColourizedFormatter`` which
     calls ``sys.stdout.isatty()`` — that blows up with
     ``AttributeError: 'NoneType' object has no attribute 'isatty'`` and
-    prevents the agent from starting. Give it a sink that answers ``isatty()``
-    with ``False`` so uvicorn's TTY check just returns False and skips colours.
+    prevents the agent from starting.
 
-    This is the canonical PyInstaller-windowed workaround; safe in every mode
-    because it only replaces streams that are truly ``None``.
+    Rather than pipe to /dev/null (which hides real crashes), redirect both
+    streams to ``%APPDATA%\\WorkstationAgent\\startup.log`` so any traceback
+    at startup is captured to a file the user can send us. Falls back to
+    devnull if the log dir can't be written.
     """
-    if sys.stdout is None:
-        sys.stdout = open(os.devnull, "w", encoding="utf-8", buffering=1)  # noqa: SIM115, PTH123
-    if sys.stderr is None:
-        sys.stderr = open(os.devnull, "w", encoding="utf-8", buffering=1)  # noqa: SIM115, PTH123
+    if sys.stdout is None or sys.stderr is None:
+        try:
+            log = open(_startup_log_path(), "a", encoding="utf-8", buffering=1)  # noqa: SIM115, PTH123
+            log.write(f"\n=== startup {os.getpid()} ===\n")
+        except OSError:
+            log = open(os.devnull, "w", encoding="utf-8", buffering=1)  # noqa: SIM115, PTH123
+        if sys.stdout is None:
+            sys.stdout = log
+        if sys.stderr is None:
+            sys.stderr = log
     if sys.stdin is None:
         sys.stdin = io.StringIO("")
 
@@ -174,4 +189,19 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # Belt-and-suspenders: if anything in main() throws before logging is
+    # configured, capture the traceback to the startup log so we can debug
+    # windowed-EXE failures that would otherwise vanish into stderr=devnull.
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except BaseException:  # noqa: BLE001
+        import traceback  # noqa: PLC0415
+        try:
+            with open(_startup_log_path(), "a", encoding="utf-8") as f:  # noqa: PTH123
+                f.write("\n=== unhandled exception at startup ===\n")
+                traceback.print_exc(file=f)
+        except OSError:
+            pass
+        raise
