@@ -42,6 +42,17 @@ class WakeConfig(BaseModel):
     mic_device: str | None = None
 
 
+class AudioConfig(BaseModel):
+    """Audio input/output device selection.
+
+    Values are the human-readable device names returned by
+    ``sounddevice.query_devices()``. ``None`` means "use OS default".
+    """
+
+    input_device: str | None = None
+    output_device: str | None = None
+
+
 class PttConfig(BaseModel):
     """Push-to-talk configuration."""
 
@@ -100,6 +111,7 @@ class AgentConfig(BaseModel):
     llm: LlmConfig = Field(default_factory=LlmConfig)
     wyoming: WyomingConfig = Field(default_factory=WyomingConfig)
     wake: WakeConfig = Field(default_factory=WakeConfig)
+    audio: AudioConfig = Field(default_factory=AudioConfig)
     ptt: PttConfig = Field(default_factory=PttConfig)
     session: SessionConfig = Field(default_factory=SessionConfig)
     update: UpdateConfig = Field(default_factory=UpdateConfig)

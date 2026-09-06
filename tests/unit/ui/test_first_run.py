@@ -15,14 +15,15 @@ def test_first_run_page_renders(tmp_path):
 
 
 def test_first_run_llm_step_saves_config(tmp_path):
-    """POST /first-run/llm saves LLM settings to config store."""
+    """POST /first-run/llm saves LLM settings (host+port -> base_url) to store."""
     store = FakeConfigStore()
     client = make_client(config_store=store, tmp_path=tmp_path)
 
     resp = client.post(
         "/first-run/llm",
         data={
-            "base_url": "http://example.com/v1",
+            "llm_host": "example.com",
+            "llm_port": "8053",
             "model": "my-model",
             "api_key_ref": "my-key",
         },
@@ -31,20 +32,44 @@ def test_first_run_llm_step_saves_config(tmp_path):
     assert resp.status_code == 200
     assert store._cfg.llm.model == "my-model"
     assert store._cfg.llm.api_key_ref == "my-key"
+    # Backend assembled http://example.com:8053/v1 automatically.
+    assert "example.com" in str(store._cfg.llm.base_url)
+    assert "8053" in str(store._cfg.llm.base_url)
+    assert str(store._cfg.llm.base_url).rstrip("/").endswith("/v1")
 
 
-def test_first_run_llm_invalid_url_shows_error(tmp_path):
-    """POST /first-run/llm with invalid URL re-renders with error."""
+def test_first_run_llm_empty_model_shows_error(tmp_path):
+    """POST /first-run/llm with empty model re-renders with error."""
     store = FakeConfigStore()
     client = make_client(config_store=store, tmp_path=tmp_path)
 
     resp = client.post(
         "/first-run/llm",
-        data={"base_url": "not-a-url", "model": "gpt-4o", "api_key_ref": ""},
+        data={"llm_host": "example.com", "llm_port": "8053", "model": "  ", "api_key_ref": ""},
         follow_redirects=False,
     )
     assert resp.status_code == 200
-    assert "error" in resp.text.lower() or "Must be a valid" in resp.text
+    assert "error" in resp.text.lower() or "required" in resp.text.lower()
+
+
+def test_first_run_llm_accepts_full_url_pasted_into_host(tmp_path):
+    """A user who pastes 'http://x.y:9000/v1' into Host still gets it parsed."""
+    store = FakeConfigStore()
+    client = make_client(config_store=store, tmp_path=tmp_path)
+
+    resp = client.post(
+        "/first-run/llm",
+        data={
+            "llm_host": "http://api.example.com:9000/v1",
+            "llm_port": "8053",   # ignored — port from the URL wins
+            "model": "prose",
+            "api_key_ref": "",
+        },
+        follow_redirects=False,
+    )
+    assert resp.status_code == 200
+    assert "api.example.com" in str(store._cfg.llm.base_url)
+    assert "9000" in str(store._cfg.llm.base_url)
 
 
 def test_first_run_wyoming_step_saves_config(tmp_path):

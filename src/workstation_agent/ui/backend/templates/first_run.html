@@ -2,34 +2,106 @@
 {% extends "layout.html" %}
 {% block title %}First Run Wizard{% endblock %}
 {% block content %}
-<h1>First Run Wizard — Step {{ step }} of 3</h1>
+<h1>First Run Wizard — Step {{ step }} of 4</h1>
 
 {% if errors._global is defined %}
   <p class="error">{{ errors._global }}</p>
 {% endif %}
 
 {% if step == 1 %}
-<form method="post" action="/first-run/llm">
+<form method="post" action="/first-run/llm" id="llm-form">
   <fieldset>
     <legend>LLM Settings</legend>
-    <label>Base URL:
-      <input type="url" name="base_url" value="{{ base_url|default('http://192.168.1.150:8053/v1') }}" required>
-      {% if errors.base_url is defined %}<span class="error">{{ errors.base_url }}</span>{% endif %}
+    <p class="hint">
+      Enter the host + port of your OpenAI-compatible endpoint. The <code>/v1</code>
+      suffix is added automatically. Click <em>Detect models</em> to fetch the list from
+      your server and pick from it.
+    </p>
+    <label>Host:
+      <input type="text" name="llm_host" id="llm_host"
+             value="{{ llm_host|default('192.168.1.150') }}"
+             placeholder="192.168.1.150 or api.example.com" required>
+      {% if errors.llm_host is defined %}<span class="error">{{ errors.llm_host }}</span>{% endif %}
+    </label>
+    <label>Port:
+      <input type="number" name="llm_port" id="llm_port"
+             value="{{ llm_port|default(8053) }}" min="1" max="65535" required>
+      {% if errors.llm_port is defined %}<span class="error">{{ errors.llm_port }}</span>{% endif %}
+    </label>
+    <label>API Key (optional):
+      <input type="password" name="api_key_ref" id="api_key_ref"
+             value="{{ api_key_ref|default('') }}"
+             placeholder="leave blank if your endpoint accepts anonymous access"
+             autocomplete="off">
     </label>
     <label>Model:
-      <input type="text" name="model" value="{{ model|default('gpt-4o') }}" required>
+      <input type="text" name="model" id="model"
+             list="detected-models"
+             value="{{ model|default('gpt-4o') }}" required>
+      <datalist id="detected-models"></datalist>
+      {% if errors.model is defined %}<span class="error">{{ errors.model }}</span>{% endif %}
     </label>
-    <label>API Key Reference:
-      <input type="text" name="api_key_ref" value="{{ api_key_ref|default('') }}">
-    </label>
+    <div class="row">
+      <button type="button" id="detect-btn">Detect models</button>
+      <span id="detect-status" class="hint"></span>
+    </div>
     <button type="submit">Next</button>
   </fieldset>
 </form>
+
+<script>
+(function () {
+  const btn = document.getElementById('detect-btn');
+  const status = document.getElementById('detect-status');
+  const dl = document.getElementById('detected-models');
+  const modelInput = document.getElementById('model');
+  btn.addEventListener('click', async function () {
+    const host = document.getElementById('llm_host').value.trim();
+    const port = document.getElementById('llm_port').value.trim();
+    const key = document.getElementById('api_key_ref').value;
+    if (!host || !port) {
+      status.textContent = 'enter host and port first';
+      return;
+    }
+    status.textContent = 'probing…';
+    btn.disabled = true;
+    try {
+      const url = '/first-run/detect-models?host=' + encodeURIComponent(host)
+                + '&port=' + encodeURIComponent(port)
+                + (key ? '&api_key=' + encodeURIComponent(key) : '');
+      const resp = await fetch(url, {cache: 'no-store'});
+      const data = await resp.json();
+      dl.innerHTML = '';
+      if (data.error) {
+        status.textContent = 'error: ' + data.error;
+      } else if (!data.models || data.models.length === 0) {
+        status.textContent = 'no models returned';
+      } else {
+        data.models.forEach(function (id) {
+          const opt = document.createElement('option');
+          opt.value = id;
+          dl.appendChild(opt);
+        });
+        status.textContent = 'found ' + data.models.length + ' model(s) — pick one from the dropdown';
+        // If current model isn't in list, auto-select the first detected one.
+        if (!data.models.includes(modelInput.value) && data.models.length > 0) {
+          modelInput.value = data.models[0];
+        }
+      }
+    } catch (e) {
+      status.textContent = 'fetch failed: ' + e;
+    } finally {
+      btn.disabled = false;
+    }
+  });
+})();
+</script>
 
 {% elif step == 2 %}
 <form method="post" action="/first-run/wyoming">
   <fieldset>
     <legend>Wyoming ASR/TTS Settings</legend>
+    <p class="hint">Wyoming protocol server for speech-to-text and text-to-speech (10300 by convention).</p>
     <label>Host:
       <input type="text" name="wyoming_host" value="{{ wyoming_host|default('192.168.1.150') }}" required>
     </label>
@@ -42,6 +114,38 @@
 </form>
 
 {% elif step == 3 %}
+<form method="post" action="/first-run/audio">
+  <fieldset>
+    <legend>Audio Devices</legend>
+    <p class="hint">
+      Pick the microphone and speaker the agent should use. Leave a field as
+      <em>System default</em> to inherit the OS choice; change it later from
+      Config.
+    </p>
+    <label>Microphone (input):
+      <select name="input_device">
+        <option value=""{% if not selected_input %} selected{% endif %}>System default</option>
+        {% for dev in input_devices %}
+        <option value="{{ dev }}"{% if dev == selected_input %} selected{% endif %}>{{ dev }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>Speaker (output):
+      <select name="output_device">
+        <option value=""{% if not selected_output %} selected{% endif %}>System default</option>
+        {% for dev in output_devices %}
+        <option value="{{ dev }}"{% if dev == selected_output %} selected{% endif %}>{{ dev }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    {% if not input_devices and not output_devices %}
+    <p class="error">No audio devices detected. You can still finish the wizard and pick devices from Config later.</p>
+    {% endif %}
+    <button type="submit">Next</button>
+  </fieldset>
+</form>
+
+{% elif step == 4 %}
 <form method="post" action="/first-run/complete">
   <p>Configuration complete. Click Finish to launch the dashboard.</p>
   <button type="submit">Finish</button>
