@@ -72,6 +72,15 @@ log = logging.getLogger(__name__)
 _HTTP_OK = 200
 
 
+def _pkg_version() -> str:
+    """Return the installed package version, falling back to a sentinel."""
+    try:
+        from importlib.metadata import version as _v  # noqa: PLC0415
+        return _v("workstation-agent")
+    except Exception:  # noqa: BLE001
+        return "0.1.0"
+
+
 def _ensure_tests_on_path() -> None:
     """Make ``tests.fakes`` importable when running from a checkout.
 
@@ -597,16 +606,21 @@ class Application:
 
     async def _start_fastapi_backend(self) -> None:
         """Bind FastAPI on an ephemeral port; write ``ui-port`` for pywebview."""
-        from workstation_agent.ui.backend.app import (
+        import workstation_agent.config.store as _config_store  # noqa: PLC0415
+        from workstation_agent.mcp_host import audit as _audit  # noqa: PLC0415
+        from workstation_agent.ui.backend.app import (  # noqa: PLC0415
             BackendContext,
             create_app,
             write_port_file,
         )
 
         ctx = BackendContext(
+            config_store=_config_store,
             session_store=self._subs.session_store,
             mcp_host=self._subs.mcp_host,
-            current_version="0.1.0",
+            update_poller=self._subs.update_poller,
+            audit_reader=_audit.query,
+            current_version=_pkg_version(),
         )
         app = create_app(ctx)
 
