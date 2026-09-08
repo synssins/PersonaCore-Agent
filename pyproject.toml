@@ -37,12 +37,29 @@ dependencies = [
     "sounddevice>=0.4,<1.0",
     "webrtcvad-wheels>=2.0,<3.0",
     "psutil>=5.0,<6.0",
+    "mcp>=2.1.1,<2.2",
 ]
-# Note: the `mcp` PyPI package was intentionally dropped. SPEC-03A implements the
-# MCP JSON-RPC stdio protocol inline (see src/workstation_agent/mcp_host/mcp_client.py)
-# because the `mcp` package's stdio_client bypasses our subprocess env-whitelist +
-# Job Object isolation. Do not add `mcp` back — it will conflict with system tools
-# (e.g. PersonaCore's pinned mcp 2.x) with zero benefit to us.
+# Note on `mcp`, amended by subtask B4 (full reasoning in
+# src/workstation_agent/network_mcp/DECISION.md):
+#
+#   * The STDIO CLIENT rejection still stands. SPEC-03A implements the MCP
+#     JSON-RPC stdio protocol inline (mcp_host/mcp_client.py) because the `mcp`
+#     package's stdio_client spawns the subprocess itself and bypasses our
+#     env-whitelist and Job Object isolation. Do not replace MCPStdioClient.
+#   * The SERVER TRANSPORT is now the package's. The LAN endpoint
+#     (network_mcp/) uses mcp's streamable-HTTP server so that the wire protocol
+#     matches, byte for byte, the mcp client PersonaCore's core connects with —
+#     session ids, protocol-version negotiation, SSE framing and resumability.
+#     A tool-list/manifest mismatch is a terminal load failure on the core and
+#     hands-on acceptance is externally blocked, so protocol conformance cannot
+#     be verified by hand and must not be hand-rolled. That transport spawns no
+#     subprocess, so the isolation objection above does not reach it.
+#   * The old "it will conflict with PersonaCore's pinned mcp 2.x" reason is
+#     obsolete: this project has its own venv at .venv/ (see CLAUDE.md). The
+#     package was already resolved into it as a direct requirement of
+#     claude-agent-sdk; declaring it here makes an existing dependency honest.
+#   * Authentication and every input bound live in our own ASGI middleware in
+#     front of the SDK app, not in the SDK. See network_mcp/hardening.py.
 
 [project.optional-dependencies]
 dev = [

@@ -46,7 +46,25 @@ if TYPE_CHECKING:  # pragma: no cover
 log = logging.getLogger(__name__)
 
 _JSONRPC_VERSION = "2.0"
-_DEFAULT_TIMEOUT = 10.0
+
+# Raised from 10.0 deliberately, for three reasons that all point the same way:
+#
+# 1. This is the *innermost* leg of a call — host -> plugin over stdio. A tool
+#    that is job-capable takes ``wait_s`` up to 25 s (contract §5.4), and the
+#    plugin blocks for that long by design. At 10 s a perfectly legal
+#    ``shell_run(wait_s=25)`` timed out here before the work could finish.
+# 2. A confirmable condition puts a 20 s prompt in front of the call
+#    (contract §7). Any path where the wait lands inside this client's budget
+#    would have burned three-quarters of it before the plugin was even asked.
+# 3. The core's own read timeout for an HTTP plugin is 30 s
+#    (PersonaCore ``plugins/mcp_client.py:667``). Matching it means the Agent
+#    does not give up before the thing waiting on the Agent does, so a slow
+#    call surfaces as one timeout with one explanation rather than two.
+#
+# 30 s therefore sits above both the 25 s job ceiling and the 20 s confirmation
+# window, and level with the core. Individual call sites still pass a shorter
+# ``timeout=`` where they have a tighter budget.
+_DEFAULT_TIMEOUT = 30.0
 
 
 class MCPProtocolError(RuntimeError):

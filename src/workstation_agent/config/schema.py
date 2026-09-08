@@ -105,6 +105,80 @@ class PluginsConfig(BaseModel):
     per_plugin: dict[str, PluginConfig] = Field(default_factory=dict)
 
 
+class NetworkMcpConfig(BaseModel):
+    """The LAN-facing MCP endpoint PersonaCore connects to (contract §1-§3).
+
+    Off by default. Turning it on puts this workstation's capability families on
+    the network, so it is an explicit operator decision, not a default.
+    """
+
+    enabled: bool = False
+    """Serve the endpoint. Default off: the operator opts in."""
+
+    bind_host: str = "127.0.0.1"
+    """The interface to bind.
+
+    Contract §3: **never 0.0.0.0 by default**. This goes further and refuses a
+    wildcard outright — see :meth:`_reject_wildcard_bind`. The default is
+    loopback, which is useless to PersonaCore on purpose: the operator has to
+    name the interface they mean, and naming it is the moment they decide to
+    expose the machine.
+    """
+
+    port: int = Field(default=8765, ge=0, le=65535)
+    """The port to bind. 0 lets the OS pick an ephemeral port (tests use this)."""
+
+    max_connections: int = Field(default=16, ge=1, le=1024)
+    """Concurrent in-flight requests, including long-lived SSE streams."""
+
+    max_request_bytes: int = Field(default=1024 * 1024, ge=1024, le=64 * 1024 * 1024)
+    """Post-authentication request-body ceiling.
+
+    An unauthenticated peer's body is never read at all, so this bounds only
+    already-authenticated requests. ~17x the largest legitimate payload (§5.3
+    caps results at 60,000 characters). Raise it only if a real ``files_write``
+    needs more.
+    """
+
+    max_json_depth: int = Field(default=64, ge=4, le=512)
+    """JSON nesting ceiling. Deeper bodies are rejected before the parser runs."""
+
+    body_read_timeout_seconds: float = Field(default=10.0, gt=0, le=120)
+    """Seconds a client gets to finish streaming a body. Bounds slow-loris sends."""
+
+    keep_alive_seconds: float = Field(default=5.0, gt=0, le=300)
+    """Idle keep-alive timeout for an established connection."""
+
+    graceful_shutdown_seconds: int = Field(default=3, ge=1, le=60)
+    """Seconds to let in-flight requests finish when stopping the endpoint."""
+
+    max_sessions: int = Field(default=8, ge=1, le=1024)
+    """Concurrent MCP sessions the SDK will track."""
+
+    session_idle_seconds: float = Field(default=300.0, gt=0)
+    """Idle MCP session lifetime before the SDK reclaims it."""
+
+    @field_validator("bind_host")
+    @classmethod
+    def _reject_wildcard_bind(cls, v: str) -> str:
+        """Refuse a wildcard bind (contract §3: an operator-chosen interface).
+
+        ``0.0.0.0``, ``::``, ``*`` and empty all mean "every interface this
+        machine has, including ones the operator has not thought about". The
+        brief forbids that as a default; refusing it as a *value* is the safer
+        reading, and costs an operator who really wants every interface only the
+        effort of naming the one they mean.
+        """
+        host = v.strip()
+        if host.lower() in {"", "0.0.0.0", "::", "[::]", "*", "0", "::0"}:  # noqa: S104
+            msg = (
+                "network_mcp.bind_host must name one interface (a LAN IP or a "
+                f"hostname); {v!r} binds every interface on this machine"
+            )
+            raise ValueError(msg)
+        return host
+
+
 class AgentConfig(BaseModel):
     """Root configuration model for PersonaCore-Agent."""
 
@@ -118,6 +192,7 @@ class AgentConfig(BaseModel):
     notifications: NotificationsConfig = Field(default_factory=NotificationsConfig)
     ui: UIConfig = Field(default_factory=UIConfig)
     plugins: PluginsConfig = Field(default_factory=PluginsConfig)
+    network_mcp: NetworkMcpConfig = Field(default_factory=NetworkMcpConfig)
 
     @field_validator("session", mode="before")
     @classmethod
