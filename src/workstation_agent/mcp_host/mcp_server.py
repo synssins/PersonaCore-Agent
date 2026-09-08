@@ -35,13 +35,17 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import inspect
 import json
 import logging
 import os
 import secrets
 import sys
+import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+from workstation_agent.mcp_host.permissions import SessionContext
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -161,6 +165,30 @@ def _toast_action_logger(action_id: str) -> Callable[[], None]:
     return _on_click
 
 
+def _accepts_session(invoke: Any) -> bool:
+    """Report whether *invoke* will accept the ``session=`` keyword.
+
+    Checked by introspection rather than by calling and retrying on
+    ``TypeError``: a ``TypeError`` raised from *inside* a tool would be
+    indistinguishable from a rejected keyword, and the retry would run a
+    side-effecting tool a second time.  ``MCPHost.invoke`` accepts it; a
+    third-party object satisfying only ``protocols.MCPHost`` (whose
+    signature is ``(tool_id, args)``) does not, and still works.
+
+    A callable whose signature cannot be read — a mock, a C function — is
+    assumed to accept it, since ``**kwargs``-shaped objects are the common
+    case there.
+    """
+    try:
+        sig = inspect.signature(invoke)
+    except (TypeError, ValueError):
+        return True
+    params = sig.parameters
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return True
+    return "session" in params
+
+
 # ---------------------------------------------------------------------------
 # Tool definitions
 # ---------------------------------------------------------------------------
@@ -263,6 +291,7 @@ class AgentMCPServer:
         state_getter: Any | None = None,
         transcript_getter: Any | None = None,
         pause_listener: Any | None = None,
+        session_id: str | None = None,
     ) -> None:
         self._reader = reader
         self._writer = writer
@@ -274,6 +303,13 @@ class AgentMCPServer:
         self._transcript_getter = transcript_getter
         self._pause_listener = pause_listener
         self._authenticated = False
+        # One identity per connection.  This is the key §7's per-tool
+        # "remember for this session" is keyed on (B3): the transport owns
+        # the session boundary, the gate does not.  Random rather than a
+        # counter, so ids are never reused across agent restarts (§5.5:
+        # sessions die with the Agent) and nothing can guess another
+        # connection's id.
+        self.session_id = session_id or uuid.uuid4().hex
 
     async def serve(self) -> None:
         """Read and dispatch JSON-RPC messages until the client disconnects.
@@ -406,7 +442,7 @@ class AgentMCPServer:
         args = params.get("arguments") or {}
 
         try:
-            result = await self._invoke_tool(tool_name, args)
+            result = await self._invoke_tool(tool_name, args, request_id=req_id)
             content = [{"type": "text", "text": json.dumps(result, default=_json_default)}]
             self._writer.write(_reply(req_id, {"content": content, "isError": False}))
         except Exception as exc:  # noqa: BLE001
@@ -414,7 +450,13 @@ class AgentMCPServer:
             self._writer.write(_reply(req_id, {"content": content, "isError": True}))
         await self._writer.drain()
 
-    async def _invoke_tool(self, tool_name: str, args: dict[str, Any]) -> Any:
+    async def _invoke_tool(
+        self,
+        tool_name: str,
+        args: dict[str, Any],
+        *,
+        request_id: Any = None,
+    ) -> Any:
         if tool_name == "agent.speak":
             text = str(args.get("text", ""))
             if self._tts is not None:
@@ -466,9 +508,40 @@ class AgentMCPServer:
             tool = str(args.get("tool", ""))
             tool_args = dict(args.get("args") or {})
             if self._mcp_host is None:
-                return {"result": None, "error": "mcp_host not available"}
-            result = await self._mcp_host.invoke(f"{plugin_id}.{tool}", tool_args)
-            return {"result": result}
+                return {
+                    "ok": False,
+                    "code": "error",
+                    "reason": "The agent's plugin host is not available.",
+                    "result": None,
+                    "error": "mcp_host not available",
+                }
+
+            # MCPHost.invoke now returns the §5.2 envelope instead of raising
+            # on a refusal, so this call site no longer needs (and no longer
+            # has) an exception path that turns a denial into a JSON-RPC
+            # error.  It carries the connection's session id and this call's
+            # MCP request id down to the gate, which is where §5.7's audit
+            # row gets both.
+            session = SessionContext(
+                session_id=self.session_id,
+                transport="named_pipe",
+                request_id=None if request_id is None else str(request_id),
+            )
+            invoke = self._mcp_host.invoke
+            result = (
+                await invoke(f"{plugin_id}.{tool}", tool_args, session=session)
+                if _accepts_session(invoke)
+                else await invoke(f"{plugin_id}.{tool}", tool_args)
+            )
+            return {
+                # §5.2's `ok` is lifted to the top of the pipe payload so a
+                # client can gate on it without reaching into `result`.
+                "ok": bool(getattr(result, "ok", not getattr(result, "is_error", False))),
+                "code": getattr(result, "code", None),
+                "reason": getattr(result, "reason", None),
+                "session_id": self.session_id,
+                "result": result,
+            }
 
         msg = f"unknown tool: {tool_name}"
         raise ValueError(msg)

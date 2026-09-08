@@ -11,6 +11,7 @@ This test exercises the full round-trip:
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import subprocess
 import sys
@@ -130,15 +131,25 @@ async def test_hello_world_audit_on_start_stop(agent_config, isolated_audit_db):
 
 
 @pytest.mark.asyncio
-async def test_invoke_unknown_tool_raises(agent_config, isolated_audit_db):
-    """Invoking a tool that doesn't exist raises KeyError."""
+async def test_invoke_unknown_tool_returns_not_found(agent_config, isolated_audit_db):
+    """Invoking a tool that doesn't exist returns §5.2 `not_found`.
+
+    Replaces the former ``pytest.raises(KeyError)``: every outcome of
+    ``invoke`` is a §5.2 envelope now, so a transport that just serialises
+    the result reports this correctly without a bespoke except-clause.
+    """
     host = MCPHost()
     await host.start(agent_config)
     try:
-        with pytest.raises(KeyError):
-            await host.invoke("nonexistent.tool", {})
+        result = await host.invoke("nonexistent.tool", {})
     finally:
         await host.stop()
+
+    assert result.ok is False
+    assert result.code == "not_found"
+    assert result.is_error is True
+    payload = json.loads(result.content[0]["text"])
+    assert payload == {"ok": False, "code": "not_found", "reason": result.reason}
 
 
 @pytest.mark.asyncio

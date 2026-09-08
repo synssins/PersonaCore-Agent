@@ -17,8 +17,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
+import re
 import sys
+import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -39,11 +42,104 @@ from workstation_agent.mcp_host.loader import (
     verify,
 )
 from workstation_agent.mcp_host.mcp_client import MCPStdioClient
-from workstation_agent.mcp_host.permissions import evaluate
+from workstation_agent.mcp_host.permissions import SessionContext, evaluate_detailed
 from workstation_agent.mcp_host.supervisor import PluginSupervisor, ResourceLimits, SubprocessHandle
 from workstation_agent.mcp_host.watchdog import HeartbeatWatchdog
 
 log = logging.getLogger(__name__)
+
+__all__ = [
+    "MAX_RESULT_CHARS",
+    "ConfirmationRequestImpl",
+    "MCPHost",
+    "PluginInfoImpl",
+    "SessionContext",
+    "ToolDescriptorImpl",
+    "ToolResultImpl",
+    "strip_special_tokens",
+]
+
+
+# ---------------------------------------------------------------------------
+# §5.6 — special-token stripping for untrusted content
+# ---------------------------------------------------------------------------
+
+#: Anything shaped like a self-hosted chat template's angle-pipe token:
+#: ``<|im_start|>``, ``<|im_end|>``, ``<|eot_id|>``, ``<|start_header_id|>``,
+#: ``<|endoftext|>``, ``<|python_tag|>`` … "and their kin" (§5.6).  Matching
+#: the *shape* rather than a fixed list is deliberate — the list of models
+#: and their tokens grows, and this code must not need editing each time.
+#: ``<`` and ``>`` are excluded from the body so a nested construction
+#: cannot make one token's body swallow another's opening delimiter.
+_ANGLE_PIPE_TOKEN = re.compile(r"<\|[^<>|]{0,64}\|>")
+
+#: The bracket-and-tag forms: Llama-2 / Mistral instruction markers and the
+#: SentencePiece sentence delimiters.
+_BRACKET_TOKEN = re.compile(
+    r"\[/?INST\]|\[/?SYS\]|<</?SYS>>|</?s>|<\|?/?im_(?:start|end)\|?>",
+    re.IGNORECASE,
+)
+
+_STRIP_PASSES = 8
+
+#: §5.3 — text results are capped by the Agent at 60,000 characters.
+MAX_RESULT_CHARS = 60_000
+
+
+def strip_special_tokens(text: str) -> str:
+    """Remove chat-template special tokens from untrusted content (§5.6).
+
+    Applied **to a fixed point**, not in a single pass.  A single pass is
+    defeated by nesting: ``<|im_<|im_start|>start|>`` contains
+    ``<|im_start|>``, and removing the inner one leaves a freshly-assembled
+    ``<|im_start|>`` behind.  Repeating until the text stops changing (with
+    a hard bound, so a pathological input cannot spin here) removes the
+    reassembled token too.
+    """
+    if not text:
+        return text
+    current = text
+    for _ in range(_STRIP_PASSES):
+        stripped = _BRACKET_TOKEN.sub("", _ANGLE_PIPE_TOKEN.sub("", current))
+        if stripped == current:
+            return current
+        current = stripped
+    return current
+
+
+def _cap_text(text: str) -> str:
+    """Apply §5.3's 60,000-character cap with its stated trailing marker."""
+    if len(text) <= MAX_RESULT_CHARS:
+        return text
+    remaining = len(text) - MAX_RESULT_CHARS
+    return (
+        text[:MAX_RESULT_CHARS]
+        + f"[... {remaining} more characters; use jobs_output to page ...]"
+    )
+
+
+#: Anything path-shaped.  The drive-letter alternative deliberately does NOT
+#: require a following separator: ``C:secret.txt`` is the drive-*relative*
+#: form and is just as much an absolute-path leak as ``C:\secret.txt``.
+_ABS_PATH = re.compile(r"(?:[A-Za-z]:|\\\\|(?<![\w.])/)[^\s'\"]*")
+
+
+def sanitise_reason(text: str) -> str:
+    """Make an arbitrary error message safe to hand back as a §5.2 ``reason``.
+
+    §5.2: "The Agent never returns a stack trace, an absolute path outside a
+    declared root, or the token."  An exception message from a plugin is
+    none of those things by construction, so all three are removed rather
+    than hoped for: only the first line survives (a traceback is multi-line),
+    anything path-shaped is replaced, and the result is bounded.
+    """
+    first_line = str(text).splitlines()[0] if text else ""
+    redacted = _ABS_PATH.sub("<path>", first_line)
+    redacted = strip_special_tokens(redacted)
+    limit = 300
+    if len(redacted) > limit:
+        redacted = redacted[:limit] + "…"
+    return redacted or "the tool failed without a message"
 
 
 @dataclass
@@ -58,11 +154,126 @@ class ToolDescriptorImpl:
 
 @dataclass
 class ToolResultImpl:
-    """Concrete :class:`workstation_agent.protocols.ToolResult`."""
+    """Concrete :class:`workstation_agent.protocols.ToolResult`, §5.2-shaped.
+
+    ``content`` is what the core receives and fences as untrusted data.  The
+    §5.2 envelope keys are mirrored onto the dataclass so a caller can gate
+    on them without re-parsing the text:
+
+    * ``ok`` — false for every non-success outcome.
+    * ``code`` — one of §5.2's codes when ``ok`` is false, else ``None``.
+    * ``reason`` — one plain-English sentence when ``ok`` is false.
+
+    ``is_error`` is the MCP-level flag and is **not** a synonym for ``not
+    ok``.  §7: "A refused or unconfirmed call is a normal result (§5.2), not
+    an error" — the persona is meant to read the reason and say it plainly,
+    not report a tool crash.  So ``denied`` and ``unconfirmed`` carry
+    ``ok=False`` with ``is_error=False``, while ``error``/``not_found``
+    (something actually went wrong) carry both.
+    """
 
     content: list[dict[str, Any]]
     is_error: bool = False
     raw: dict[str, Any] = field(default_factory=dict)
+    ok: bool = True
+    code: str | None = None
+    reason: str | None = None
+
+
+#: §5.2 codes.  ``unknown_job``/``unknown_session`` belong to the families
+#: (§5.4, §5.5) and are produced by B6/B8, not by the gate.
+CODE_DENIED = "denied"
+CODE_UNCONFIRMED = "unconfirmed"
+CODE_NOT_FOUND = "not_found"
+CODE_TIMEOUT = "timeout"
+CODE_ERROR = "error"
+
+
+def _envelope_text(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Render a §5.2 envelope as the single text content block."""
+    return [{"type": "text", "text": json.dumps(payload, separators=(",", ": "))}]
+
+
+def failure_result(code: str, reason: str, *, is_error: bool) -> ToolResultImpl:
+    """Build a §5.2 failure envelope.
+
+    The reason is sanitised on the way in rather than at each call site, so
+    a future caller cannot forget and leak a path or a traceback.
+    """
+    clean = sanitise_reason(reason)
+    payload: dict[str, Any] = {"ok": False, "code": code, "reason": clean}
+    return ToolResultImpl(
+        content=_envelope_text(payload),
+        is_error=is_error,
+        raw=dict(payload),
+        ok=False,
+        code=code,
+        reason=clean,
+    )
+
+
+def _conform_text_block(block: dict[str, Any], *, ok: bool) -> dict[str, Any]:
+    """Strip special tokens, guarantee ``ok``, and cap one text block."""
+    text = strip_special_tokens(str(block.get("text", "")))
+
+    # §5.2: "where structure matters a JSON object rendered as text ... Every
+    # family's result object carries `ok`".  A family that renders a JSON
+    # object without `ok` is a defect; rather than passing it through, fill
+    # it in.  Plain (non-JSON) text is a legitimate §5.2 result and is left
+    # exactly as it is.
+    stripped = text.lstrip()
+    if stripped.startswith("{"):
+        try:
+            parsed = json.loads(text)
+        except (json.JSONDecodeError, RecursionError):
+            parsed = None
+        if isinstance(parsed, dict) and "ok" not in parsed:
+            text = json.dumps({"ok": ok, **parsed}, separators=(",", ": "))
+
+    return {**block, "type": "text", "text": _cap_text(text)}
+
+
+def conform_result(raw: dict[str, Any]) -> ToolResultImpl:
+    """Turn a plugin's raw MCP result into a §5.2-conformant result.
+
+    Applies §5.6 stripping and §5.3's cap to every text block, guarantees the
+    ``ok`` key on structured results, and refuses to forward binary: §5.3
+    says binary never travels in v1, so a non-text content block is replaced
+    by the error §5.3 prescribes instead of being passed through in the hope
+    that nothing downstream looks at it.
+    """
+    is_error = bool(raw.get("isError", False))
+    blocks = raw.get("content")
+    if not isinstance(blocks, list):
+        blocks = []
+
+    out: list[dict[str, Any]] = []
+    binary_kinds: list[str] = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            out.append({"type": "text", "text": _cap_text(strip_special_tokens(str(block)))})
+            continue
+        if block.get("type") == "text":
+            out.append(_conform_text_block(block, ok=not is_error))
+            continue
+        binary_kinds.append(str(block.get("type", "unknown")))
+
+    if binary_kinds:
+        kinds = ", ".join(sorted(set(binary_kinds)))
+        return failure_result(
+            CODE_ERROR,
+            f"the tool returned {kinds} content; binary transfer is not available yet",
+            is_error=True,
+        )
+
+    return ToolResultImpl(
+        content=out,
+        is_error=is_error,
+        raw=raw,
+        ok=not is_error,
+        code=CODE_ERROR if is_error else None,
+        reason=None,
+    )
 
 
 @dataclass
@@ -312,86 +523,136 @@ class MCPHost:
             )
         return result
 
-    async def invoke(self, tool_id: str, args: dict[str, Any]) -> ToolResultImpl:
-        """Resolve *tool_id* to a plugin, evaluate permissions, dispatch, audit."""
+    async def invoke(
+        self,
+        tool_id: str,
+        args: dict[str, Any],
+        *,
+        session: SessionContext | None = None,
+    ) -> ToolResultImpl:
+        """Resolve *tool_id* to a plugin, evaluate permissions, dispatch, audit.
+
+        Always returns a §5.2-conformant :class:`ToolResultImpl`; a refusal is
+        a result, not an exception.  §7 is explicit about this — "A refused or
+        unconfirmed call is a normal result (§5.2), not an error: the persona
+        says plainly that nobody confirmed it on the workstation" — and §11
+        item 6 requires the refusal to reach the operator *in plain English*,
+        which it cannot do if every transport has to remember to catch a
+        ``PermissionError`` and translate it back into prose.  Making the
+        envelope the return value means a transport that simply serialises
+        the result is compliant by default rather than by diligence.
+
+        ``asyncio.CancelledError`` is the one thing that still propagates: it
+        is shutdown, not a tool outcome.
+
+        ``session`` identifies the transport connection the call arrived on
+        (§5.7's audit row, and the key B3's "remember for this session" will
+        need).  It is optional so in-process callers need not invent one.
+        """
+        started = time.perf_counter()
+        session_id = session.session_id if session is not None else None
+        request_id = session.request_id if session is not None else None
+
+        def _elapsed_ms() -> float:
+            return round((time.perf_counter() - started) * 1000.0, 3)
+
+        def _audit(event: str, decision: str, code: str | None, **kw: Any) -> None:
+            audit_log(AuditEvent(
+                event=event,
+                plugin_id=kw.pop("plugin_id", None),
+                tool_id=tool_id,
+                args=args,
+                decision=decision,
+                code=code,
+                duration_ms=_elapsed_ms(),
+                request_id=request_id,
+                session_id=session_id,
+                **kw,
+            ))
+
         runtime = self._resolve_tool(tool_id)
         if runtime is None:
-            msg = f"no running plugin owns tool {tool_id!r}"
-            raise KeyError(msg)
+            _audit("tool_not_found", "deny", CODE_NOT_FOUND, result="error")
+            return failure_result(
+                CODE_NOT_FOUND,
+                f"There is no tool called {tool_id!r} running on this workstation.",
+                is_error=True,
+            )
 
-        decision = evaluate(
+        plugin_id = runtime.manifest.id
+        outcome = evaluate_detailed(
             runtime.manifest,
             tool_id,
             args,
             runtime.granted_permissions,
+            session=session,
         )
 
-        if decision == "deny":
-            audit_log(AuditEvent(
-                event="tool_denied",
-                plugin_id=runtime.manifest.id,
-                tool_id=tool_id,
-                args=args,
-                decision="deny",
-            ))
-            msg = f"tool {tool_id!r} denied by permissions model"
-            raise PermissionError(msg)
+        if outcome.decision == "deny":
+            _audit(
+                "tool_denied",
+                "deny",
+                CODE_DENIED,
+                plugin_id=plugin_id,
+                result="denied",
+                detail=outcome.rule,
+            )
+            return failure_result(CODE_DENIED, outcome.reason, is_error=False)
 
-        correlation_id = ""
-        if decision == "confirm":
-            confirmed, correlation_id = await self._do_confirm(runtime, tool_id, args)
+        correlation_id: str | None = None
+        if outcome.decision == "confirm":
+            confirmed, correlation_id = await self._do_confirm(
+                runtime, tool_id, args, condition=outcome.condition,
+            )
             if not confirmed:
-                audit_log(AuditEvent(
-                    event="tool_denied",
-                    plugin_id=runtime.manifest.id,
-                    tool_id=tool_id,
-                    args=args,
-                    decision="confirm_rejected",
-                    detail=f"correlation_id={correlation_id}",
-                ))
-                msg = f"tool {tool_id!r} rejected by user confirmation"
-                raise PermissionError(msg)
-            audit_log(AuditEvent(
-                event="tool_confirmed",
-                plugin_id=runtime.manifest.id,
-                tool_id=tool_id,
-                args=args,
-                decision="confirm_allowed",
-                detail=f"correlation_id={correlation_id}",
-            ))
+                _audit(
+                    "tool_denied",
+                    "confirm_rejected",
+                    CODE_UNCONFIRMED,
+                    plugin_id=plugin_id,
+                    result="unconfirmed",
+                    correlation_id=correlation_id,
+                    detail=outcome.rule,
+                )
+                return failure_result(
+                    CODE_UNCONFIRMED,
+                    f"Nobody confirmed {tool_id} on the workstation, so it was not run.",
+                    is_error=False,
+                )
+            _audit(
+                "tool_confirmed",
+                "confirm_allowed",
+                None,
+                plugin_id=plugin_id,
+                correlation_id=correlation_id,
+                detail=outcome.rule,
+            )
 
         if runtime.client is None:  # pragma: no cover — invariant
-            msg = f"plugin {runtime.manifest.id!r} has no client"
-            raise RuntimeError(msg)
-        detail = f"correlation_id={correlation_id}" if correlation_id else None
-        try:
-            raw = await runtime.client.tools_call(tool_id, args)
-        except Exception:
-            audit_log(AuditEvent(
-                event="tool_error",
-                plugin_id=runtime.manifest.id,
-                tool_id=tool_id,
-                args=args,
-                decision=decision,
-                detail=detail,
-            ))
-            raise
+            _audit(
+                "tool_error",
+                outcome.decision,
+                CODE_ERROR,
+                plugin_id=plugin_id,
+                result="error",
+                correlation_id=correlation_id,
+            )
+            return failure_result(
+                CODE_ERROR,
+                f"The plugin {plugin_id!r} is not connected, so {tool_id} could not run.",
+                is_error=True,
+            )
 
-        result = ToolResultImpl(
-            content=raw.get("content", []),
-            is_error=bool(raw.get("isError", False)),
-            raw=raw,
+        result, dispatch_failed = await _call_plugin(runtime.client, tool_id, args)
+
+        _audit(
+            "tool_error" if dispatch_failed else "tool_invoke",
+            outcome.decision,
+            result.code,
+            plugin_id=plugin_id,
+            result="ok" if result.ok else "error",
+            correlation_id=correlation_id,
         )
-
-        audit_log(AuditEvent(
-            event="tool_invoke",
-            plugin_id=runtime.manifest.id,
-            tool_id=tool_id,
-            args=args,
-            result="ok" if not result.is_error else "error",
-            decision=decision,
-            detail=detail,
-        ))
 
         return result
 
@@ -430,6 +691,8 @@ class MCPHost:
         runtime: _PluginRuntime,
         tool_id: str,
         args: dict[str, Any],
+        *,
+        condition: str = "",
     ) -> tuple[bool, str]:
         """Present a confirmation prompt.  Returns ``(allowed, correlation_id)``.
 
@@ -442,6 +705,7 @@ class MCPHost:
             plugin_id=runtime.manifest.id,
             tool_id=tool_id,
             args=args,
+            condition=condition,
             correlation_id=correlation_id,
         )
 
@@ -538,6 +802,38 @@ class MCPHost:
             except Exception:
                 log.exception("reload spawn failed for plugin=%s", plugin_id)
                 runtime.status = "stopped"
+
+
+async def _call_plugin(
+    client: MCPStdioClient,
+    tool_id: str,
+    args: dict[str, Any],
+) -> tuple[ToolResultImpl, bool]:
+    """Dispatch to the plugin and shape the outcome as §5.2.
+
+    Returns ``(result, dispatch_failed)``.  ``dispatch_failed`` distinguishes
+    "the call itself blew up" from "the tool ran and reported a problem", so
+    the audit row says which — a plugin returning ``isError`` is a
+    ``tool_invoke``, an exception out of the transport is a ``tool_error``.
+
+    ``asyncio.CancelledError`` propagates: that is shutdown, not a tool
+    outcome, and swallowing it into an ``error`` envelope would leave a
+    cancelled task looking like a completed one.
+    """
+    try:
+        raw = await client.tools_call(tool_id, args)
+    except asyncio.CancelledError:
+        raise
+    except TimeoutError as exc:
+        return failure_result(
+            CODE_TIMEOUT, f"{tool_id} ran out of time: {exc}", is_error=True,
+        ), True
+    except Exception as exc:
+        log.exception("tool %s raised", tool_id)
+        return failure_result(
+            CODE_ERROR, f"{tool_id} failed: {exc}", is_error=True,
+        ), True
+    return conform_result(raw if isinstance(raw, dict) else {}), False
 
 
 def _resolve_entry(manifest: PluginManifest) -> list[str]:

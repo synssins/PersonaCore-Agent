@@ -682,6 +682,10 @@ def test_json_default_serialises_dataclass() -> None:
         "content": [{"type": "text", "text": "hi"}],
         "is_error": False,
         "raw": {},
+        # B2: the §5.2 envelope keys travel with the dataclass.
+        "ok": True,
+        "code": None,
+        "reason": None,
     }
 
 
@@ -869,13 +873,29 @@ async def test_agent_execute_local_with_host() -> None:
     # This is the regression assertion: a successful call must report
     # isError: False, not True from a swallowed serialisation TypeError.
     assert resp["result"]["isError"] is False
-    mock_host.invoke.assert_awaited_once_with("my_plugin.my_tool", {"x": 1})
+
+    # B2: the call site now carries a session identity and the MCP request id
+    # down to the gate.  Asserted rather than dropped, so a regression that
+    # stops plumbing the session — silently breaking B3's "remember for this
+    # session", which has nothing else to key on — fails here.
+    mock_host.invoke.assert_awaited_once()
+    call = mock_host.invoke.await_args
+    assert call.args == ("my_plugin.my_tool", {"x": 1})
+    session = call.kwargs["session"]
+    assert session.session_id
+    assert session.transport == "named_pipe"
+    assert session.request_id == "2"
 
     payload = json.loads(resp["result"]["content"][0]["text"])
+    assert payload["ok"] is True
+    assert payload["session_id"] == session.session_id
     assert payload["result"] == {
         "content": [{"type": "text", "text": "ok"}],
         "is_error": False,
         "raw": {"exit_code": 0},
+        "ok": True,
+        "code": None,
+        "reason": None,
     }
     w2.close()
     mini_server.close()

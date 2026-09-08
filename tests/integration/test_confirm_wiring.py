@@ -233,10 +233,15 @@ async def test_host_invoke_denies_when_nobody_answers_the_toast():
         await host.start(AgentConfig(), confirm_cb=presenter, tts_speak=None)
     host._runtimes["e2e_timeout"] = _confirm_runtime("e2e_timeout", client)
 
-    with pytest.raises(PermissionError):
-        await host.invoke("e2e_timeout.write", {"path": "/unsafe/x.txt"})
+    # B2: the unanswered prompt now comes back as §5.2's `unconfirmed`
+    # result rather than a PermissionError — §7: "A refused or unconfirmed
+    # call is a normal result (§5.2), not an error".  The load-bearing part
+    # of B1's assertion (the tool never ran) is kept and the code is pinned.
+    result = await host.invoke("e2e_timeout.write", {"path": "/unsafe/x.txt"})
     await host.stop()
 
+    assert result.ok is False
+    assert result.code == "unconfirmed"
     client.tools_call.assert_not_called()
 
 
@@ -260,9 +265,10 @@ async def test_host_invoke_denies_when_the_toast_stack_is_absent(monkeypatch):
 
     loop = asyncio.get_running_loop()
     started = loop.time()
-    with pytest.raises(PermissionError):
-        await host.invoke("e2e_nowinrt.write", {"path": "/unsafe/x.txt"})
+    result = await host.invoke("e2e_nowinrt.write", {"path": "/unsafe/x.txt"})
     await host.stop()
 
+    assert result.ok is False
+    assert result.code == "unconfirmed"
     assert loop.time() - started < 5.0
     client.tools_call.assert_not_called()

@@ -284,9 +284,15 @@ async def test_invoke_returns_not_implemented(agent_config, isolated_audit_db):
     await host.start(agent_config, confirm_cb=_auto_approve)
 
     try:
-        # Test one tool from each plugin
+        # Test one tool from each plugin.  filesystem.read is given a path
+        # INSIDE the plugin's declared roots: an out-of-roots read is denied
+        # outright now (contract §11 item 6) and can no longer be waved
+        # through by the auto-approver, which is asserted separately in
+        # test_filesystem_read_outside_roots_is_denied below.
         test_cases = [
-            ("filesystem.read", {"path": "/home/test"}),
+            ("filesystem.read", {"path": os.path.expandvars(
+                r"%USERPROFILE%\Documents\probe.txt",
+            )}),
             ("powershell.run", {"intent": "test", "command": "echo test"}),
             ("desktop.click", {"x": 100, "y": 100}),
             ("browser.open", {"url": "http://example.com"}),
@@ -320,3 +326,91 @@ async def test_invoke_returns_not_implemented(agent_config, isolated_audit_db):
 
     finally:
         await host.stop()
+
+
+# ---------------------------------------------------------------------------
+# The read/action split, end to end through the real filesystem plugin
+# (contract §11 item 6).  The unit-level proof lives in
+# tests/unit/mcp_host/test_read_action_split.py; this asserts it holds with
+# the real plugin.toml, the real signature check and a real subprocess.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_filesystem_read_outside_roots_is_denied(agent_config, isolated_audit_db):
+    """An out-of-roots read is DENIED, is not ALLOWED, and raises no prompt.
+
+    Three separate assertions on purpose.  "No prompt appeared" passes both
+    for the correct fix and for the catastrophic one (falling through to
+    allow), so it cannot be the only thing checked; and "denied" is asserted
+    positively rather than inferred from "not allowed".
+    """
+    prompts: list[object] = []
+
+    async def _record_and_approve(req) -> bool:
+        prompts.append(req)
+        return True  # would approve — so a prompt means the read went through
+
+    host = MCPHost()
+    await host.start(agent_config, confirm_cb=_record_and_approve)
+    try:
+        result = await host.invoke("filesystem.read", {"path": r"C:\Windows\System32\config\SAM"})
+    finally:
+        await host.stop()
+
+    # 1. It is denied.
+    assert result.ok is False
+    assert result.code == "denied"
+
+    # 2. It is NOT allowed.  The catastrophic regression (a checker that
+    #    returns False for reads, skipping the confirm AND the hard guard,
+    #    falling through to `return "allow"`) produces a successful
+    #    not_implemented payload here with ok=True and no code.
+    assert result.code != "allow"
+    assert result.ok is not True
+    body = result.content[0]["text"]
+    assert "not_implemented" not in body, "the tool ran: the read was allowed, not denied"
+
+    # 3. No prompt was raised.  The brief forbids prompting for reads.
+    assert prompts == [], "an out-of-roots read must never be put to the operator"
+
+    # …and it says so in plain English without echoing the path back (§5.2
+    # forbids returning an absolute path outside a declared root).
+    assert result.reason
+    assert "SAM" not in result.reason
+    assert "C:" not in result.reason
+
+    rows = audit_mod.query(
+        audit_mod.AuditQuery(event="tool_denied"), db_path=isolated_audit_db,
+    )
+    assert any(r.tool_id == "filesystem.read" and r.code == "denied" for r in rows)
+
+
+@pytest.mark.asyncio
+async def test_filesystem_write_outside_roots_still_confirms(agent_config, isolated_audit_db):
+    """An out-of-roots *write* still goes to the operator — the split is a split.
+
+    If the read fix had been implemented by disabling the path condition
+    wholesale, this would silently allow instead of prompting.
+    """
+    from workstation_agent.mcp_host.host import ConfirmationRequestImpl
+
+    prompts: list[ConfirmationRequestImpl] = []
+
+    async def _record_and_approve(req: ConfirmationRequestImpl) -> bool:
+        prompts.append(req)
+        return True
+
+    host = MCPHost()
+    await host.start(agent_config, confirm_cb=_record_and_approve)
+    try:
+        result = await host.invoke(
+            "filesystem.write", {"path": r"C:\Windows\System32\evil.txt", "content": "x"},
+        )
+    finally:
+        await host.stop()
+
+    assert len(prompts) == 1, "an out-of-roots write must be put to the operator"
+    assert prompts[0].tool_id == "filesystem.write"
+    assert prompts[0].condition == "outside_declared_paths"
+    assert result.ok is True  # the operator approved it

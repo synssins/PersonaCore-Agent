@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -177,30 +178,50 @@ async def test_start_skips_disabled_plugin(cfg_allow_unsigned, isolated_audit_db
 
 
 @pytest.mark.asyncio
-async def test_invoke_deny_raises_permission_error(isolated_audit_db):
-    """invoke() raises PermissionError when permissions evaluate to deny."""
+async def test_invoke_deny_returns_denied_envelope(isolated_audit_db):
+    """invoke() returns a §5.2 `denied` envelope when permissions deny.
+
+    Replaces the former ``pytest.raises(PermissionError)``: §7 says a refusal
+    is a normal result, not an error, and §11 item 6 needs the refusal to
+    reach the operator in plain English.  Strictly stronger than the raise it
+    replaces — it also pins the code, checks the tool never ran, and checks
+    the audit row.
+    """
     manifest = _make_manifest("perm_plugin", declared_permissions=["tool:other.tool"])
     vresult = VerifyResult(status="unsigned")
 
+    fake_client = AsyncMock()
     fake_runtime = host_mod._PluginRuntime(
         manifest=manifest,
         verify_result=vresult,
         status="running",
         tools=[{"name": "perm_plugin.restricted"}],
         granted_permissions=set(),
+        client=fake_client,
     )
-    fake_runtime.client = AsyncMock()
 
     h = MCPHost()
     h._runtimes["perm_plugin"] = fake_runtime
 
-    with pytest.raises(PermissionError):
-        await h.invoke("perm_plugin.restricted", {"x": 1})
+    result = await h.invoke("perm_plugin.restricted", {"x": 1})
+
+    assert result.ok is False
+    assert result.code == "denied"
+    assert result.reason
+    fake_client.tools_call.assert_not_called()
+
+    payload = json.loads(result.content[0]["text"])
+    assert payload["ok"] is False
+    assert payload["code"] == "denied"
+
+    rows = audit_mod.query(audit_mod.AuditQuery(event="tool_denied"), db_path=isolated_audit_db)
+    assert len(rows) == 1
+    assert rows[0].code == "denied"
 
 
 @pytest.mark.asyncio
 async def test_invoke_confirm_rejected(isolated_audit_db):
-    """invoke() raises PermissionError when user rejects confirm prompt."""
+    """invoke() returns `unconfirmed` when the user rejects the confirm prompt."""
     manifest = _make_manifest("confirm_plugin")
     manifest.confirmable_conditions = ["outside_declared_paths"]
     manifest.declared_permissions = ["tool:confirm_plugin.write", "path:/safe/"]
@@ -222,8 +243,11 @@ async def test_invoke_confirm_rejected(isolated_audit_db):
     h._confirm_cb = _deny_cb
     h._runtimes["confirm_plugin"] = fake_runtime
 
-    with pytest.raises(PermissionError):
-        await h.invoke("confirm_plugin.write", {"path": "/unsafe/x.txt"})
+    result = await h.invoke("confirm_plugin.write", {"path": "/unsafe/x.txt"})
+    assert result.ok is False
+    assert result.code == "unconfirmed"
+    assert result.is_error is False, "§7: a refusal is a normal result, not an error"
+    fake_runtime.client.tools_call.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -423,8 +447,9 @@ async def test_do_confirm_denies_when_no_callback(isolated_audit_db):
     h = MCPHost()
     h._runtimes["nocb"] = fake_runtime
 
-    with pytest.raises(PermissionError):
-        await h.invoke("nocb.write", {"path": "/unsafe/x.txt"})
+    result = await h.invoke("nocb.write", {"path": "/unsafe/x.txt"})
+    assert result.ok is False
+    assert result.code == "unconfirmed"
     fake_client.tools_call.assert_not_called()
 
 
@@ -453,8 +478,9 @@ async def test_do_confirm_denies_when_callback_raises(isolated_audit_db):
     h._confirm_cb = _boom
     h._runtimes["boomcb"] = fake_runtime
 
-    with pytest.raises(PermissionError):
-        await h.invoke("boomcb.write", {"path": "/unsafe/x.txt"})
+    result = await h.invoke("boomcb.write", {"path": "/unsafe/x.txt"})
+    assert result.ok is False
+    assert result.code == "unconfirmed"
     fake_client.tools_call.assert_not_called()
 
 
@@ -483,8 +509,9 @@ async def test_do_confirm_requires_literal_true(isolated_audit_db, answer):
     h._confirm_cb = _weird
     h._runtimes["truthy"] = fake_runtime
 
-    with pytest.raises(PermissionError):
-        await h.invoke("truthy.write", {"path": "/unsafe/x.txt"})
+    result = await h.invoke("truthy.write", {"path": "/unsafe/x.txt"})
+    assert result.ok is False
+    assert result.code == "unconfirmed"
     fake_client.tools_call.assert_not_called()
 
 
@@ -524,9 +551,34 @@ async def test_do_confirm_passes_correlation_id(isolated_audit_db):
     assert len(seen) == 1
     assert seen[0]
 
+    # B2 folds the correlation id into its own column instead of leaving it
+    # in the free-text `detail` blob, so it is queryable rather than
+    # grep-able.  Asserted on the column AND via the filter.
     rows = audit_mod.query(audit_mod.AuditQuery(plugin_id="corr"))
-    details = [r.detail for r in rows if r.detail]
-    assert any(f"correlation_id={seen[0]}" == d for d in details)
+    assert [r.correlation_id for r in rows] == [seen[0], seen[0]]
+    assert all("correlation_id=" not in (r.detail or "") for r in rows)
+
+    by_corr = audit_mod.query(audit_mod.AuditQuery(correlation_id=seen[0]))
+    assert {r.event for r in by_corr} == {"tool_confirmed", "tool_invoke"}
+
+
+@pytest.mark.asyncio
+async def test_legacy_correlation_id_in_detail_is_recovered_on_read(isolated_audit_db):
+    """A pre-migration row keeps its id in `detail`; query() recovers it.
+
+    Those rows cannot be rewritten — that is what append-only means — so the
+    backfill has to happen on the read side.
+    """
+    audit_mod.log(
+        audit_mod.AuditEvent(
+            event="tool_confirmed",
+            plugin_id="legacy",
+            detail="correlation_id=abc123def",
+        ),
+        db_path=isolated_audit_db,
+    )
+    rows = audit_mod.query(audit_mod.AuditQuery(plugin_id="legacy"), db_path=isolated_audit_db)
+    assert rows[0].correlation_id == "abc123def"
 
 
 @pytest.mark.asyncio
@@ -620,8 +672,15 @@ async def test_invoke_tool_error_logged(isolated_audit_db):
     h = MCPHost()
     h._runtimes["err_plugin"] = fake_runtime
 
-    with pytest.raises(RuntimeError, match="oops"):
-        await h.invoke("err_plugin.fail", {})
+    result = await h.invoke("err_plugin.fail", {})
+
+    # §5.2: `error` is "anything else, with the underlying message" — a
+    # result, not an exception thrown at whatever caller happens to be there.
+    assert result.ok is False
+    assert result.code == "error"
+    assert result.is_error is True
+    assert "oops" in (result.reason or "")
 
     rows = audit_mod.query(audit_mod.AuditQuery(event="tool_error"), db_path=isolated_audit_db)
     assert len(rows) == 1
+    assert rows[0].code == "error"

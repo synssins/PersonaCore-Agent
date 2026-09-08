@@ -150,11 +150,36 @@ def test_evaluate_confirm_not_triggered_stays_allow():
     assert decision == "allow"
 
 
-def test_outside_declared_paths_no_restriction():
-    """No 'path:' permissions → checker returns False (not applicable)."""
+def test_outside_declared_paths_no_declared_root_denies_every_path():
+    """No 'path:' permission → NO path access, not unrestricted path access.
+
+    This test previously asserted the opposite ("not applicable"), which is
+    precisely the fail-open the rework fixes: a plugin granted
+    ``tool:filesystem.read`` while declaring no root could read anywhere,
+    because "no roots" meant "no restriction to violate" and the call fell
+    through both loops to ``return "allow"``.
+    """
     m = _manifest(declared_permissions=[])
     checker = CONDITION_CHECKERS["outside_declared_paths"]
-    assert not checker(m, "tool", {"path": "/any/path"})
+    assert checker(m, "tool", {"path": "/any/path"})
+
+
+def test_outside_declared_paths_no_root_and_no_path_argument_is_fine():
+    """The rule bites on path *arguments*; a call with none is not a violation."""
+    m = _manifest(declared_permissions=[])
+    checker = CONDITION_CHECKERS["outside_declared_paths"]
+    assert not checker(m, "tool", {"text": "hello", "count": 3})
+
+
+def test_path_star_is_the_explicit_everywhere_declaration():
+    """``path:/`` (or ``path:*``) is how a plugin opts out of confinement.
+
+    Auditable in the manifest, unlike the previous behaviour where saying
+    nothing at all achieved the same thing silently.
+    """
+    checker = CONDITION_CHECKERS["outside_declared_paths"]
+    assert not checker(_manifest(declared_permissions=["path:/"]), "tool", {"path": "/any"})
+    assert not checker(_manifest(declared_permissions=["path:*"]), "tool", {"path": "/any"})
 
 
 def test_outside_declared_paths_inside():
@@ -171,11 +196,17 @@ def test_outside_declared_paths_outside():
     assert checker(m, "tool", {"path": "/tmp/evil.sh"})
 
 
-def test_command_outside_allowlist_no_restriction():
-    """No 'cmd:' permissions → checker returns False."""
+def test_command_no_declared_allowlist_denies_every_command():
+    """No 'cmd:' permission → NO command access (was: unrestricted)."""
     m = _manifest(declared_permissions=[])
     checker = CONDITION_CHECKERS["command_outside_allowlist"]
-    assert not checker(m, "tool", {"command": "anything"})
+    assert checker(m, "tool", {"command": "anything"})
+
+
+def test_command_no_allowlist_and_no_command_argument_is_fine():
+    m = _manifest(declared_permissions=[])
+    checker = CONDITION_CHECKERS["command_outside_allowlist"]
+    assert not checker(m, "tool", {"text": "hello"})
 
 
 def test_command_inside_allowlist():
@@ -192,11 +223,22 @@ def test_command_outside_allowlist():
     assert checker(m, "tool", {"command": "curl"})
 
 
-def test_domain_outside_allowlist_no_restriction():
-    """No 'domain:' permissions → checker returns False."""
+def test_domain_no_declared_allowlist_denies_every_domain():
+    """No 'domain:' permission → NO network access (was: unrestricted).
+
+    The shipped ``browser`` manifest is exactly this shape: it declares
+    ``domain_outside_allowlist`` as confirmable but lists no ``domain:``
+    permission, so every navigation now prompts rather than sailing through.
+    """
     m = _manifest(declared_permissions=[])
     checker = CONDITION_CHECKERS["domain_outside_allowlist"]
-    assert not checker(m, "tool", {"url": "https://anywhere.com"})
+    assert checker(m, "tool", {"url": "https://anywhere.com"})
+
+
+def test_domain_no_allowlist_and_no_url_argument_is_fine():
+    m = _manifest(declared_permissions=[])
+    checker = CONDITION_CHECKERS["domain_outside_allowlist"]
+    assert not checker(m, "tool", {"selector": "#main"})
 
 
 def test_domain_inside_allowlist():
