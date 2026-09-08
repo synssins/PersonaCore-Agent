@@ -34,13 +34,17 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import json
 import logging
 import os
 import secrets
 import sys
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 log = logging.getLogger(__name__)
 
@@ -95,6 +99,33 @@ def load_token() -> str | None:
 # JSON-RPC helpers
 # ---------------------------------------------------------------------------
 
+def _json_default(obj: Any) -> Any:
+    """``json.dumps(default=...)`` hook for types the stdlib can't serialise.
+
+    Tool results routed through :meth:`MCPHost.invoke` come back as
+    ``ToolResultImpl`` (and similar) plain dataclasses, not dicts — see
+    ``workstation_agent.mcp_host.host``. ``json.dumps`` has no idea how to
+    encode a dataclass instance on its own, so every successful
+    ``agent.execute_local`` call raised ``TypeError`` and was reported as
+    ``isError: True`` before this hook existed.
+
+    Anything that isn't a known-serialisable shape raises ``TypeError``
+    here (matching ``json.dumps``'s own contract for a failing ``default``)
+    rather than falling back to ``str()``. A permissive string fallback
+    would silently turn an unexpected type — a ``set``, an exception, a
+    function — into a plausible-looking string instead of surfacing the
+    failure, which is exactly the class of bug this hook exists to fix.
+    ``_handle_tools_call``'s surrounding ``except Exception`` still turns a
+    ``TypeError`` raised here into a proper ``isError: True`` response with
+    the real message, so the failure is reported honestly instead of either
+    crashing the connection or masquerading as success.
+    """
+    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+        return dataclasses.asdict(obj)
+    msg = f"Object of type {type(obj).__name__} is not JSON serializable"
+    raise TypeError(msg)
+
+
 def _reply(req_id: Any, result: Any) -> bytes:
     payload = {"jsonrpc": _JSONRPC, "id": req_id, "result": result}
     return (json.dumps(payload, separators=(",", ":")) + "\n").encode()
@@ -112,6 +143,22 @@ def _error(req_id: Any, code: int, message: str) -> bytes:
 def _notification(method: str, params: dict[str, Any]) -> bytes:
     payload = {"jsonrpc": _JSONRPC, "method": method, "params": params}
     return (json.dumps(payload, separators=(",", ":")) + "\n").encode()
+
+
+def _toast_action_logger(action_id: str) -> Callable[[], None]:
+    """Build a ``ToastPresenter`` action callback that just logs the click.
+
+    ``agent.toast`` is invoked over the pipe and its ``tools/call`` response
+    is sent back before the user can possibly have clicked a toast button —
+    there is no MCP request left in flight to report the click through. The
+    callback exists only so the toast is well-formed and the click is
+    observable in the log, not lost silently.
+    """
+
+    def _on_click() -> None:
+        log.info("agent.toast: action %r activated (no MCP channel to report it)", action_id)
+
+    return _on_click
 
 
 # ---------------------------------------------------------------------------
@@ -229,18 +276,40 @@ class AgentMCPServer:
         self._authenticated = False
 
     async def serve(self) -> None:
-        """Read and dispatch JSON-RPC messages until the client disconnects."""
+        """Read and dispatch JSON-RPC messages until the client disconnects.
+
+        The pre-auth input bound here is deliberately left at asyncio's
+        default ``readline()`` limit (64 KiB) rather than a considered
+        value: this pipe is local-only today. A real, considered bound —
+        and systematic hostile-input coverage generally (oversized
+        payloads, rate limiting, connection caps, etc.) — is the
+        responsibility of whichever subtask puts this transport on a
+        network (B4), not this one.
+        """
         try:
             while True:
                 try:
                     raw = await self._reader.readline()
-                except (asyncio.IncompleteReadError, ConnectionResetError, BrokenPipeError):
+                except (
+                    asyncio.IncompleteReadError,
+                    ConnectionResetError,
+                    BrokenPipeError,
+                    # readline() raises this (wrapping LimitOverrunError)
+                    # when a line exceeds the buffer limit with no newline
+                    # in sight — an oversized/malformed line disconnects
+                    # cleanly rather than crashing the session.
+                    ValueError,
+                ):
                     break
                 if not raw:
                     break
                 try:
                     msg = json.loads(raw.decode("utf-8", errors="replace"))
-                except json.JSONDecodeError:
+                except (json.JSONDecodeError, RecursionError):
+                    # RecursionError: deeply nested JSON (e.g. "[[[[...]]]]")
+                    # blows the interpreter's recursion limit inside the
+                    # decoder. Treated the same as malformed JSON — skip the
+                    # line rather than letting it crash the read loop.
                     continue
                 await self._dispatch(msg)
         finally:
@@ -290,8 +359,34 @@ class AgentMCPServer:
 
     async def _handle_initialize(self, req_id: Any, params: dict[str, Any]) -> None:
         """Validate token and complete the MCP handshake."""
-        client_token = params.get("token", "")
-        if client_token != self._token:
+        client_token = params.get("token")
+        # This field has now had three variations of the same mistake fixed
+        # on it: `!=` assumed both sides were comparable strings, then
+        # `compare_digest` on `str` assumed the client's string was
+        # ASCII-only, then `.encode("utf-8")` assumed the client's string
+        # was well-formed Unicode. It isn't guaranteed to be any of those —
+        # this is JSON-RPC params from an untrusted, pre-authentication
+        # client, and B4 is about to put this same pattern on a LAN. So:
+        # nothing here is trusted until it is safely bytes. A non-str is
+        # rejected immediately; a str that fails to encode (e.g. an unpaired
+        # surrogate like "\ud800", which json.loads() happily accepts as a
+        # value but UTF-8 cannot represent) is caught and rejected the same
+        # way, rather than being allowed to raise out of the handshake.
+        # Deliberately *rejecting* on a bad encode rather than substituting
+        # `errors="replace"`: a replacement policy maps many different
+        # malformed inputs onto the same output bytes, which is exactly the
+        # kind of collision a token comparison must not tolerate.
+        token_bytes: bytes | None = None
+        if isinstance(client_token, str):
+            try:
+                token_bytes = client_token.encode("utf-8")
+            except UnicodeEncodeError:
+                token_bytes = None
+
+        token_ok = token_bytes is not None and secrets.compare_digest(
+            token_bytes, self._token.encode("utf-8"),
+        )
+        if not token_ok:
             self._writer.write(_error(req_id, -32000, "invalid token"))
             await self._writer.drain()
             log.warning("MCP client presented bad token; rejecting")
@@ -312,7 +407,7 @@ class AgentMCPServer:
 
         try:
             result = await self._invoke_tool(tool_name, args)
-            content = [{"type": "text", "text": json.dumps(result)}]
+            content = [{"type": "text", "text": json.dumps(result, default=_json_default)}]
             self._writer.write(_reply(req_id, {"content": content, "isError": False}))
         except Exception as exc:  # noqa: BLE001
             content = [{"type": "text", "text": str(exc)}]
@@ -329,12 +424,24 @@ class AgentMCPServer:
         if tool_name == "agent.toast":
             title = str(args.get("title", ""))
             body = str(args.get("body", ""))
-            actions = args.get("actions", [])
+            raw_actions = args.get("actions") or []
             if self._toast is not None:
-                result = await self._toast.present(
-                    title=title, body=body, actions=actions,
-                )
-                return {"ok": True, "action": result}
+                toast_actions = {
+                    str(action_id): (str(action_id), _toast_action_logger(str(action_id)))
+                    for action_id in raw_actions
+                }
+                # ToastPresenter.show() is synchronous and fire-and-forget: it
+                # queues the toast with the OS and returns immediately. It has
+                # no "wait for the click" mode, and building one here would
+                # mean blocking this already-in-flight tools/call response on
+                # a user action that may come seconds later or never — the
+                # named-pipe client has no timeout budget for that. Building
+                # a real awaitable "wait for user response" primitive is
+                # SPEC B1's confirm primitive, not this tool. So we show the
+                # toast and acknowledge; any click is only logged, since
+                # there is no channel left to report it back through once
+                # this call has returned.
+                self._toast.show(title=title, body=body, actions=toast_actions or None)
             return {"ok": True}
 
         if tool_name == "agent.status":
