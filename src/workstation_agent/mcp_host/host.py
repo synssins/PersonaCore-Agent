@@ -19,6 +19,7 @@ import asyncio
 import contextlib
 import logging
 import sys
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -66,12 +67,18 @@ class ToolResultImpl:
 
 @dataclass
 class ConfirmationRequestImpl:
-    """Concrete :class:`workstation_agent.protocols.ConfirmationRequest`."""
+    """Concrete :class:`workstation_agent.protocols.ConfirmationRequest`.
+
+    ``correlation_id`` is minted by the host for every prompt and echoed by
+    the confirm adapter, so the prompt, its outcome and the audit rows that
+    follow can be tied together after the fact.
+    """
 
     plugin_id: str
     tool_id: str
     args: dict[str, Any]
     condition: str = ""
+    correlation_id: str = ""
 
 
 @dataclass
@@ -120,10 +127,23 @@ class MCPHost:
         confirm_cb: Callable[[ConfirmationRequestImpl], Awaitable[bool]] | None = None,
         tts_speak: Any | None = None,
     ) -> None:
-        """Discover, verify, and spawn every enabled plugin."""
+        """Discover, verify, and spawn every enabled plugin.
+
+        ``confirm_cb`` is the awaitable confirmation primitive (see
+        :mod:`workstation_agent.confirm`).  When it is ``None`` every
+        confirmable condition is denied — the host never falls through to
+        an implicit allow.
+
+        ``tts_speak`` is the voice channel for confirmation prompts.  The
+        prompt is presented by ``confirm_cb`` — toast and spoken line have
+        to share one timeout and one answer — so the host hands the voice
+        to the callback via its ``attach_voice`` hook rather than speaking
+        over it.
+        """
         self._config = config
         self._confirm_cb = confirm_cb
         self._tts_speak = tts_speak
+        self._attach_voice()
 
         manifests = discover()
         allow_unsigned = config.plugins.allow_unsigned
@@ -317,8 +337,9 @@ class MCPHost:
             msg = f"tool {tool_id!r} denied by permissions model"
             raise PermissionError(msg)
 
+        correlation_id = ""
         if decision == "confirm":
-            confirmed = await self._do_confirm(runtime, tool_id, args)
+            confirmed, correlation_id = await self._do_confirm(runtime, tool_id, args)
             if not confirmed:
                 audit_log(AuditEvent(
                     event="tool_denied",
@@ -326,13 +347,23 @@ class MCPHost:
                     tool_id=tool_id,
                     args=args,
                     decision="confirm_rejected",
+                    detail=f"correlation_id={correlation_id}",
                 ))
                 msg = f"tool {tool_id!r} rejected by user confirmation"
                 raise PermissionError(msg)
+            audit_log(AuditEvent(
+                event="tool_confirmed",
+                plugin_id=runtime.manifest.id,
+                tool_id=tool_id,
+                args=args,
+                decision="confirm_allowed",
+                detail=f"correlation_id={correlation_id}",
+            ))
 
         if runtime.client is None:  # pragma: no cover — invariant
             msg = f"plugin {runtime.manifest.id!r} has no client"
             raise RuntimeError(msg)
+        detail = f"correlation_id={correlation_id}" if correlation_id else None
         try:
             raw = await runtime.client.tools_call(tool_id, args)
         except Exception:
@@ -342,6 +373,7 @@ class MCPHost:
                 tool_id=tool_id,
                 args=args,
                 decision=decision,
+                detail=detail,
             ))
             raise
 
@@ -358,6 +390,7 @@ class MCPHost:
             args=args,
             result="ok" if not result.is_error else "error",
             decision=decision,
+            detail=detail,
         ))
 
         return result
@@ -372,27 +405,68 @@ class MCPHost:
                     return runtime
         return None
 
+    def _attach_voice(self) -> None:
+        """Hand ``tts_speak`` to the confirm callback if it accepts one.
+
+        Presentation lives in one place (the confirm adapter) so the toast
+        and the spoken line share a single timeout and a single answer.
+        A callback without the hook simply does not get a voice; that is
+        never an error and never changes a decision.
+        """
+        cb = self._confirm_cb
+        if cb is None or self._tts_speak is None:
+            return
+        attach = getattr(cb, "attach_voice", None)
+        if not callable(attach):
+            log.debug("confirm callback has no attach_voice hook; prompts stay silent")
+            return
+        try:
+            attach(self._tts_speak)
+        except Exception:
+            log.exception("failed to attach voice to confirm callback")
+
     async def _do_confirm(
         self,
         runtime: _PluginRuntime,
         tool_id: str,
         args: dict[str, Any],
-    ) -> bool:
-        """Present a confirmation prompt to the user."""
+    ) -> tuple[bool, str]:
+        """Present a confirmation prompt.  Returns ``(allowed, correlation_id)``.
+
+        **Fail-closed.**  No confirm callback, a callback that raises, or a
+        callback that returns anything other than ``True`` all deny.  The
+        only path to ``True`` is an explicit affirmative answer.
+        """
+        correlation_id = uuid.uuid4().hex
         req = ConfirmationRequestImpl(
             plugin_id=runtime.manifest.id,
             tool_id=tool_id,
             args=args,
+            correlation_id=correlation_id,
         )
 
-        if self._tts_speak is not None:
-            with contextlib.suppress(Exception):
-                msg = f"Plugin {runtime.manifest.name} wants to call {tool_id}. Allow?"
-                await self._tts_speak.speak(msg)
+        cb = self._confirm_cb
+        if cb is None:
+            log.warning(
+                "confirm[%s]: no confirmation callback wired — denying %s",
+                correlation_id,
+                tool_id,
+            )
+            return False, correlation_id
 
-        if self._confirm_cb is not None:
-            return await self._confirm_cb(req)
-        return False
+        try:
+            answer = await cb(req)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception(
+                "confirm[%s]: confirmation callback raised — denying %s",
+                correlation_id,
+                tool_id,
+            )
+            return False, correlation_id
+
+        return answer is True, correlation_id
 
     async def plugins(self) -> list[PluginInfoImpl]:
         """Return status for every known plugin."""

@@ -344,13 +344,157 @@ async def test_on_plugin_died_updates_status(isolated_audit_db):
 
 
 @pytest.mark.asyncio
-async def test_tts_speak_called_on_confirm(isolated_audit_db):
-    """_do_confirm calls tts_speak.speak when tts_speak is set."""
-    manifest = _make_manifest("tts_test")
-    manifest.confirmable_conditions = ["outside_declared_paths"]
-    manifest.declared_permissions = ["tool:tts_test.write", "path:/safe/"]
+async def test_start_hands_tts_speak_to_confirm_callback(cfg_allow_unsigned):
+    """start() attaches tts_speak to a confirm callback that accepts a voice.
 
-    vresult = VerifyResult(status="unsigned")
+    Presentation (toast + spoken line) lives in the confirm adapter so the two
+    share one timeout and one answer; the host's job is to hand the adapter the
+    voice the application configured.
+    """
+    class _Cb:
+        def __init__(self) -> None:
+            self.voice = None
+
+        def attach_voice(self, voice) -> None:
+            self.voice = voice
+
+        async def __call__(self, req) -> bool:  # noqa: ARG002
+            return True
+
+    cb = _Cb()
+    mock_tts = AsyncMock()
+
+    h = MCPHost()
+    with patch.object(host_mod, "discover", return_value=[]):
+        await h.start(cfg_allow_unsigned, confirm_cb=cb, tts_speak=mock_tts)
+    await h.stop()
+
+    assert cb.voice is mock_tts
+
+
+@pytest.mark.asyncio
+async def test_start_tolerates_callback_without_attach_voice(cfg_allow_unsigned):
+    """A plain-function confirm callback simply gets no voice — not an error."""
+    async def _accept(req: ConfirmationRequestImpl) -> bool:
+        return True
+
+    h = MCPHost()
+    with patch.object(host_mod, "discover", return_value=[]):
+        await h.start(cfg_allow_unsigned, confirm_cb=_accept, tts_speak=AsyncMock())
+    await h.stop()
+
+    assert h._confirm_cb is _accept
+
+
+@pytest.mark.asyncio
+async def test_start_tolerates_attach_voice_raising(cfg_allow_unsigned):
+    """An attach_voice that raises must not take the host down."""
+    class _Cb:
+        def attach_voice(self, voice) -> None:  # noqa: ARG002
+            msg = "nope"
+            raise RuntimeError(msg)
+
+        async def __call__(self, req) -> bool:  # noqa: ARG002
+            return True
+
+    h = MCPHost()
+    with patch.object(host_mod, "discover", return_value=[]):
+        await h.start(cfg_allow_unsigned, confirm_cb=_Cb(), tts_speak=AsyncMock())
+    await h.stop()
+
+
+@pytest.mark.asyncio
+async def test_do_confirm_denies_when_no_callback(isolated_audit_db):
+    """No confirm callback wired => deny.  The 'silently denied' bug, asserted."""
+    manifest = _make_manifest("nocb")
+    manifest.confirmable_conditions = ["outside_declared_paths"]
+    manifest.declared_permissions = ["tool:nocb.write", "path:/safe/"]
+
+    fake_client = AsyncMock()
+    fake_runtime = host_mod._PluginRuntime(
+        manifest=manifest,
+        verify_result=VerifyResult(status="unsigned"),
+        status="running",
+        tools=[{"name": "nocb.write"}],
+        granted_permissions={"tool:nocb.write"},
+        client=fake_client,
+    )
+
+    h = MCPHost()
+    h._runtimes["nocb"] = fake_runtime
+
+    with pytest.raises(PermissionError):
+        await h.invoke("nocb.write", {"path": "/unsafe/x.txt"})
+    fake_client.tools_call.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_do_confirm_denies_when_callback_raises(isolated_audit_db):
+    """An exception inside the confirm callback denies; it never allows."""
+    manifest = _make_manifest("boomcb")
+    manifest.confirmable_conditions = ["outside_declared_paths"]
+    manifest.declared_permissions = ["tool:boomcb.write", "path:/safe/"]
+
+    fake_client = AsyncMock()
+    fake_runtime = host_mod._PluginRuntime(
+        manifest=manifest,
+        verify_result=VerifyResult(status="unsigned"),
+        status="running",
+        tools=[{"name": "boomcb.write"}],
+        granted_permissions={"tool:boomcb.write"},
+        client=fake_client,
+    )
+
+    async def _boom(req: ConfirmationRequestImpl) -> bool:
+        msg = "presenter exploded"
+        raise RuntimeError(msg)
+
+    h = MCPHost()
+    h._confirm_cb = _boom
+    h._runtimes["boomcb"] = fake_runtime
+
+    with pytest.raises(PermissionError):
+        await h.invoke("boomcb.write", {"path": "/unsafe/x.txt"})
+    fake_client.tools_call.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("answer", [None, 0, "", "yes", 1, object()])
+async def test_do_confirm_requires_literal_true(isolated_audit_db, answer):
+    """Only ``True`` allows — a truthy or odd return value still denies."""
+    manifest = _make_manifest("truthy")
+    manifest.confirmable_conditions = ["outside_declared_paths"]
+    manifest.declared_permissions = ["tool:truthy.write", "path:/safe/"]
+
+    fake_client = AsyncMock()
+    fake_runtime = host_mod._PluginRuntime(
+        manifest=manifest,
+        verify_result=VerifyResult(status="unsigned"),
+        status="running",
+        tools=[{"name": "truthy.write"}],
+        granted_permissions={"tool:truthy.write"},
+        client=fake_client,
+    )
+
+    async def _weird(req: ConfirmationRequestImpl):
+        return answer
+
+    h = MCPHost()
+    h._confirm_cb = _weird
+    h._runtimes["truthy"] = fake_runtime
+
+    with pytest.raises(PermissionError):
+        await h.invoke("truthy.write", {"path": "/unsafe/x.txt"})
+    fake_client.tools_call.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_do_confirm_passes_correlation_id(isolated_audit_db):
+    """Every prompt carries a correlation id, and it reaches the audit row."""
+    manifest = _make_manifest("corr")
+    manifest.confirmable_conditions = ["outside_declared_paths"]
+    manifest.declared_permissions = ["tool:corr.write", "path:/safe/"]
+
     fake_client = AsyncMock()
     fake_client.tools_call = AsyncMock(return_value={
         "content": [{"type": "text", "text": "ok"}],
@@ -358,27 +502,31 @@ async def test_tts_speak_called_on_confirm(isolated_audit_db):
     })
     fake_runtime = host_mod._PluginRuntime(
         manifest=manifest,
-        verify_result=vresult,
+        verify_result=VerifyResult(status="unsigned"),
         status="running",
-        tools=[{"name": "tts_test.write"}],
-        granted_permissions={"tool:tts_test.write"},
+        tools=[{"name": "corr.write"}],
+        granted_permissions={"tool:corr.write"},
         client=fake_client,
     )
 
-    mock_tts = AsyncMock()
-    mock_tts.speak = AsyncMock()
+    seen: list[str] = []
 
     async def _accept(req: ConfirmationRequestImpl) -> bool:
+        seen.append(req.correlation_id)
         return True
 
     h = MCPHost()
-    h._tts_speak = mock_tts
     h._confirm_cb = _accept
-    h._runtimes["tts_test"] = fake_runtime
+    h._runtimes["corr"] = fake_runtime
 
-    result = await h.invoke("tts_test.write", {"path": "/unsafe/x.txt"})
+    result = await h.invoke("corr.write", {"path": "/unsafe/x.txt"})
     assert not result.is_error
-    mock_tts.speak.assert_called_once()
+    assert len(seen) == 1
+    assert seen[0]
+
+    rows = audit_mod.query(audit_mod.AuditQuery(plugin_id="corr"))
+    details = [r.detail for r in rows if r.detail]
+    assert any(f"correlation_id={seen[0]}" == d for d in details)
 
 
 @pytest.mark.asyncio

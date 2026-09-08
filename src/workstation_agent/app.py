@@ -75,9 +75,9 @@ _HTTP_OK = 200
 def _pkg_version() -> str:
     """Return the installed package version, falling back to a sentinel."""
     try:
-        from importlib.metadata import version as _v  # noqa: PLC0415
+        from importlib.metadata import version as _v
         return _v("workstation-agent")
-    except Exception:  # noqa: BLE001
+    except Exception:
         return "0.1.0"
 
 
@@ -131,6 +131,7 @@ class _Subsystems:
     llm_client: Any = None
     llm_session_id: Any = None
     toast: Any = None
+    confirm_presenter: Any = None
     tray: Any = None
     update_poller: Any = None
     claude_code: Any = None
@@ -433,12 +434,57 @@ class Application:
         self._subs.started["session_store"] = Health(ok=True, detail=str(db_path))
         return store
 
+    def _build_confirm_presenter(self) -> Any:
+        """Build the awaitable confirm primitive for confirmable conditions.
+
+        Both providers resolve **lazily**: the MCP host starts at step 3 but
+        the ``ToastPresenter`` is not built until step 8 and the TTS client
+        not until step 4, so anything captured eagerly here would be
+        ``None`` forever.  A provider that still returns ``None`` at prompt
+        time is a denial, not an allow.
+        """
+        from workstation_agent.confirm import ConfirmPresenter
+
+        presenter = ConfirmPresenter(
+            toast_provider=lambda: self._subs.toast,
+            config_provider=lambda: self._subs.config,
+        )
+        self._subs.confirm_presenter = presenter
+        return presenter
+
+    def _confirm_voice(self) -> Any:
+        """Voice channel for confirmation prompts (``tts_speak``).
+
+        Wraps the Wyoming TTS client so ``await voice.speak(text)`` actually
+        emits audio: ``WyomingTTSClient.speak`` only returns a task that has
+        to be drained into the speaker.
+        """
+        subs = self._subs
+
+        class _ConfirmVoice:
+            async def speak(self, text: str) -> None:
+                tts = subs.tts
+                if tts is None:
+                    log.warning("confirm: no TTS client — prompt not spoken")
+                    return
+                task = await tts.speak(text)
+                async for chunk in tts.audio_chunks(task):
+                    speaker = subs.speaker
+                    if speaker is not None:
+                        speaker.enqueue(chunk)
+
+        return _ConfirmVoice()
+
     async def _start_mcp_host(self, cfg: Any) -> Any:
         from workstation_agent.mcp_host.host import MCPHost
 
         host = MCPHost()
         try:
-            await host.start(cfg)
+            await host.start(
+                cfg,
+                confirm_cb=self._build_confirm_presenter(),
+                tts_speak=self._confirm_voice(),
+            )
         except Exception as exc:
             log.warning("MCPHost start reported error: %s", exc)
             self._subs.started["mcp_host"] = Health(ok=False, detail=repr(exc))
@@ -606,9 +652,9 @@ class Application:
 
     async def _start_fastapi_backend(self) -> None:
         """Bind FastAPI on an ephemeral port; write ``ui-port`` for pywebview."""
-        import workstation_agent.config.store as _config_store  # noqa: PLC0415
-        from workstation_agent.mcp_host import audit as _audit  # noqa: PLC0415
-        from workstation_agent.ui.backend.app import (  # noqa: PLC0415
+        import workstation_agent.config.store as _config_store
+        from workstation_agent.mcp_host import audit as _audit
+        from workstation_agent.ui.backend.app import (
             BackendContext,
             create_app,
             write_port_file,
