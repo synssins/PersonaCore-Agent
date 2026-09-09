@@ -39,7 +39,39 @@ dependencies = [
     "psutil>=5.0,<6.0",
     "mcp>=2.1.1,<2.2",
     "pyserial>=3.5,<4.0",
+    "winrt-runtime>=3.2,<3.3",
+    "winrt-Windows.UI.Notifications>=3.2,<3.3",
+    "winrt-Windows.Data.Xml.Dom>=3.2,<3.3",
+    "winrt-Windows.Foundation>=3.2,<3.3",
 ]
+# Note on the `winrt-*` set, added by subtask P5 (contract §11 items 2 and 7 —
+# `shell_run`, `adb_*`, `files_write`, `serial_*` all require an operator
+# confirmation, and the only presentation surface for that is a Windows
+# toast): `toast.py` imports two namespaces directly
+# (`winrt.windows.ui.notifications`, `winrt.windows.data.xml.dom`), but that
+# is NOT the complete runtime dependency set. `ToastNotification.add_activated`
+# — used for every confirm-flow toast, since Allow/Deny buttons are wired via
+# it — takes a `Windows.Foundation.TypedEventHandler`, so
+# `winrt-Windows.Foundation` is required too even though no code in this repo
+# imports it by name; without it, `add_activated()` raises
+# `ModuleNotFoundError` the first time a confirm toast is shown, which
+# `ToastPresenter.show()` catches and logs, silently turning every
+# always-prompt tool into a no-op toast (and, via `confirm.py`'s
+# fail-closed design, a deny — safe, but not what an operator installing
+# these four packages would expect "toasts enabled" to mean). Verified by
+# hand: `create_toast_notifier_with_id(...)` and a bare `.show(notif)`
+# succeed with just the two directly-imported namespaces installed;
+# `notif.add_activated(...)` only succeeds once `winrt-Windows.Foundation`
+# is present too. `winrt-Windows.Foundation.Collections` (needed only for
+# `ToastNotificationManager.history.get_history_with_id`, which this repo
+# never calls) is deliberately NOT declared here.
+#   * Licence: MIT (each of these four is the `winrt` project's own PyPI
+#     distribution, https://pypi.org/project/winrt-runtime/ and siblings).
+#   * All four are pinned to the same `3.2.x` line because they are
+#     independently-versioned native-extension namespace packages generated
+#     from the same WinRT metadata sweep; mixing major/minor versions across
+#     them is unsupported by the project.
+
 # Note on `pyserial` (import name `serial`), added by subtask B8 for the
 # `serial` family (contract §5.5, §6): `serial.Serial` backs
 # serial_open/write/read/close's actual device I/O, and `serial.tools.list_ports`

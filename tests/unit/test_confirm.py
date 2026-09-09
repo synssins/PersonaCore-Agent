@@ -386,6 +386,35 @@ async def test_absent_toast_stack_denies_and_never_shows(monkeypatch):
     assert await presenter.confirm(make_req()) is False
 
 
+@pytest.mark.asyncio
+async def test_broken_toast_stack_denies_even_with_winrt_present(monkeypatch):
+    """Fail-closed also covers "winrt genuinely present, notifier is not".
+
+    Distinct from ``test_absent_toast_stack_denies_and_never_shows`` (no
+    winrt at all): here ``_WINRT_AVAILABLE`` is True — the packages are
+    installed — but ``ToastPresenter._notifier`` is ``None``, the shape a
+    construction-time WinRT failure leaves behind (see
+    ``toast.py``'s ``ToastPresenter.__init__``, which catches exactly this
+    and never lets it raise). ``toast_stack_available`` must still say
+    "unavailable", and the confirm call must still deny rather than sit out
+    the timeout or auto-allow.
+    """
+    monkeypatch.setattr(toast_mod, "_WINRT_AVAILABLE", True, raising=False)
+    real = toast_mod.ToastPresenter(app_id="test")
+    real._notifier = None  # the outcome of a caught construction failure
+    presenter = ConfirmPresenter(toast_provider=lambda: real, timeout_s=30.0)
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    decision = await presenter.request(make_req())
+
+    assert decision.outcome == OUTCOME_DENIED
+    assert decision.reason == "toast_unavailable"
+    assert not decision.allowed
+    assert loop.time() - started < 1.0
+    assert await presenter.confirm(make_req()) is False
+
+
 # ---------------------------------------------------------------------------
 # Fail-closed: anything else
 # ---------------------------------------------------------------------------

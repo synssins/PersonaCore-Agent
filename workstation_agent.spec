@@ -13,6 +13,8 @@
 
 from pathlib import Path
 
+from PyInstaller.utils.hooks import collect_submodules
+
 REPO_ROOT = Path(SPECPATH)  # noqa: F821 — provided by PyInstaller
 SRC = REPO_ROOT / "src" / "workstation_agent"
 
@@ -83,6 +85,44 @@ block_cipher = None
 # `PackageNotFoundError` under -wheels. The module itself imports fine —
 # `hiddenimports=["webrtcvad"]` plus disabling the hook is the tidy fix.
 hiddenimports.append("webrtcvad")
+
+# ---------------------------------------------------------------------------
+# winrt (subtask P5) — toast.py's real notification backend.
+#
+# The `winrt` distribution ships each `Windows.*` namespace as its own PyPI
+# package (winrt-runtime, winrt-Windows.UI.Notifications,
+# winrt-Windows.Data.Xml.Dom, winrt-Windows.Foundation — see pyproject.toml
+# for why all four are required) but they all install INTO ONE SHARED,
+# `winrt` PEP 420 *implicit namespace package* with no `__init__.py` at
+# `winrt/`, `winrt/windows/`, `winrt/windows/data/` or `winrt/windows/ui/` —
+# only the leaf packages (`winrt.windows.data.xml.dom`,
+# `winrt.windows.foundation`, `winrt.windows.ui.notifications`) carry a real
+# `__init__.py`. Verified by hand:
+# `PyInstaller.utils.hooks.collect_submodules("winrt")` cannot walk PAST
+# those intermediate namespace levels (it returns the top-level native
+# extension modules and `winrt.runtime`/`winrt.system`, but never discovers
+# `winrt.windows`, `winrt.windows.ui`, `winrt.windows.ui.notifications`,
+# `winrt.windows.data`, `winrt.windows.data.xml`,
+# `winrt.windows.data.xml.dom` or `winrt.windows.foundation`) — so those
+# namespace/leaf packages are listed explicitly below rather than trusted to
+# the automatic sweep. Each leaf package's real `__init__.py` then imports
+# its backing native extension by name (e.g.
+# `from winrt._winrt_windows_ui_notifications import ...`); PyInstaller's
+# own import-following picks up the matching `.pyd` binaries once it can
+# actually reach and scan those leaf `__init__.py` files, which requires the
+# namespace levels above to be declared too.
+hiddenimports.extend(collect_submodules("winrt"))
+hiddenimports.extend(
+    [
+        "winrt.windows",
+        "winrt.windows.data",
+        "winrt.windows.data.xml",
+        "winrt.windows.data.xml.dom",
+        "winrt.windows.foundation",
+        "winrt.windows.ui",
+        "winrt.windows.ui.notifications",
+    ],
+)
 
 a = Analysis(  # noqa: F821
     [str(SRC / "__main__.py")],

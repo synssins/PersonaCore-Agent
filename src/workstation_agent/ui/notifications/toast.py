@@ -44,14 +44,29 @@ _wxml: Any = None
 
 if platform.system() == "Windows":
     try:
+        # ``winrt.windows.ui.notifications`` needs ``winrt.windows.foundation``
+        # at call time (not import time) for ``ToastNotification.add_activated``,
+        # whose C#-side signature takes a
+        # ``Windows.Foundation.TypedEventHandler`` — every confirm-flow toast
+        # wires an Allow/Deny handler via ``add_activated``, so without the
+        # ``winrt-Windows.Foundation`` package that call raises
+        # ``ModuleNotFoundError`` at first use even though the two imports
+        # below succeed on their own.  Importing it eagerly here, alongside
+        # the two namespaces ``toast.py`` uses directly, means a missing
+        # install is caught once at import time (falling into the except
+        # below) instead of surfacing later as an unhandled failure deep
+        # inside ``_show_winrt``.
         import winrt.windows.data.xml.dom as _wxml  # type: ignore[import-untyped]
+        import winrt.windows.foundation  # noqa: F401  # type: ignore[import-untyped]
         import winrt.windows.ui.notifications as _wun  # type: ignore[import-untyped]
 
         _WINRT_AVAILABLE = True
     except ModuleNotFoundError:
         log.warning(
             "winrt is not installed — ToastPresenter will be a no-op.  "
-            "Install `winrt-Windows.UI.Notifications` to enable toasts.",
+            "Install `winrt-runtime`, `winrt-Windows.UI.Notifications`, "
+            "`winrt-Windows.Data.Xml.Dom` and `winrt-Windows.Foundation` "
+            "to enable toasts.",
         )
 else:
     log.warning(
@@ -79,11 +94,35 @@ class ToastPresenter:
     def __init__(self, app_id: str = "WorkstationAgent") -> None:
         """Initialise the toast presenter."""
         self._app_id = app_id
+        self._notifier: Any = None
 
         if _WINRT_AVAILABLE and _wun is not None:
-            self._notifier: Any = _wun.ToastNotificationManager.create_toast_notifier(app_id)
-        else:
-            self._notifier = None
+            try:
+                # The Python projection does not overload on argument count —
+                # the no-arg C#-side overload becomes ``create_toast_notifier()``
+                # (which raises "Element not found" for an unpackaged app with
+                # no AppUserModelID of its own) and the ``string appId``
+                # overload becomes the *separate* method
+                # ``create_toast_notifier_with_id``.  Calling
+                # ``create_toast_notifier(app_id)`` — the single-overload C#
+                # spelling — raises ``TypeError: Invalid parameter count``
+                # against this binding.
+                self._notifier = _wun.ToastNotificationManager.create_toast_notifier_with_id(
+                    app_id,
+                )
+            except Exception:
+                # Never let a construction-time WinRT failure (e.g. no shell
+                # notification host reachable in this session) propagate out
+                # of __init__ and take the caller down with it — the confirm
+                # path's fail-closed check (``toast_stack_available``) reads
+                # ``self._notifier is None`` and denies exactly as it would
+                # for "winrt not installed".
+                log.exception(
+                    "ToastPresenter: create_toast_notifier_with_id(%r) failed — "
+                    "toasts will be a no-op for this instance.",
+                    app_id,
+                )
+                self._notifier = None
 
     # ------------------------------------------------------------------
     # Public

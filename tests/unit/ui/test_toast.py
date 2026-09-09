@@ -21,17 +21,35 @@ import logging
 from unittest.mock import MagicMock, patch
 
 
-def _build_winrt_mocks() -> tuple[MagicMock, MagicMock]:
-    """Return (wun_mock, wxml_mock)."""
+def _build_winrt_mocks() -> tuple[MagicMock, MagicMock, MagicMock]:
+    """Return (wun_mock, wxml_mock, wfoundation_mock)."""
     wun = MagicMock(name="winrt.windows.ui.notifications")
     wxml = MagicMock(name="winrt.windows.data.xml.dom")
-    return wun, wxml
+    wfoundation = MagicMock(name="winrt.windows.foundation")
+    return wun, wxml, wfoundation
 
 
-def _patch_winrt(wun_mock: MagicMock, wxml_mock: MagicMock):
+def _patch_winrt(
+    wun_mock: MagicMock,
+    wxml_mock: MagicMock,
+    wfoundation_mock: MagicMock | None = None,
+):
     # Build parent mocks with the correct child attribute set so that Python's
     # import machinery (which resolves subpackage names via parent attributes)
     # returns our exact mock objects, not auto-generated child mocks.
+    #
+    # ``winrt.windows.foundation`` is imported unconditionally alongside the
+    # two namespaces below (see toast.py's module-level import block) because
+    # ``ToastNotification.add_activated`` needs it at call time — every entry
+    # here must be registered in ``sys.modules``, or Python's real import
+    # machinery falls through to the *actual* installed ``winrt`` package for
+    # whichever submodule is missing, which — for a plain ``MagicMock``
+    # standing in as the parent package with an empty ``__path__`` — raises
+    # ``ModuleNotFoundError`` and trips the module's own "winrt not
+    # installed" fallback instead of exercising the mocked WinRT path.
+    if wfoundation_mock is None:
+        wfoundation_mock = MagicMock(name="winrt.windows.foundation")
+
     winrt_windows_ui = MagicMock()
     winrt_windows_ui.notifications = wun_mock
 
@@ -44,6 +62,7 @@ def _patch_winrt(wun_mock: MagicMock, wxml_mock: MagicMock):
     winrt_windows = MagicMock()
     winrt_windows.ui = winrt_windows_ui
     winrt_windows.data = winrt_windows_data
+    winrt_windows.foundation = wfoundation_mock
 
     winrt_root = MagicMock()
     winrt_root.windows = winrt_windows
@@ -56,6 +75,7 @@ def _patch_winrt(wun_mock: MagicMock, wxml_mock: MagicMock):
         "winrt.windows.data": winrt_windows_data,
         "winrt.windows.data.xml": winrt_windows_data_xml,
         "winrt.windows.data.xml.dom": wxml_mock,
+        "winrt.windows.foundation": wfoundation_mock,
     }
     return patch.dict("sys.modules", extra_modules)
 
@@ -135,7 +155,7 @@ class TestToastPresenterWinRT:
     """Exercise the WinRT code path via module reload with mocked sys.modules."""
 
     def test_show_calls_notifier(self) -> None:
-        wun, wxml = _build_winrt_mocks()
+        wun, wxml, _wfoundation = _build_winrt_mocks()
 
         with _patch_winrt(wun, wxml), patch("platform.system", return_value="Windows"):
             import workstation_agent.ui.notifications.toast as toast_mod
@@ -147,8 +167,58 @@ class TestToastPresenterWinRT:
             # _notifier.show is called inside _show_winrt
             presenter._notifier.show.assert_called_once()
 
+    def test_construction_uses_create_toast_notifier_with_id(self) -> None:
+        """Regression test for the real winrt projection's method name.
+
+        The Python/WinRT binding does not overload on argument count: the
+        C#-side ``CreateToastNotifier()`` and ``CreateToastNotifier(string)``
+        overloads become two *separate* Python methods,
+        ``create_toast_notifier`` (no args) and
+        ``create_toast_notifier_with_id`` (one arg). Calling the no-arg name
+        with ``app_id`` raises ``TypeError: Invalid parameter count`` against
+        the real binding — a mock would not have caught that, so this test
+        pins the exact method name ``ToastPresenter.__init__`` must call.
+        """
+        wun, wxml, _wfoundation = _build_winrt_mocks()
+
+        with _patch_winrt(wun, wxml), patch("platform.system", return_value="Windows"):
+            import workstation_agent.ui.notifications.toast as toast_mod
+
+            importlib.reload(toast_mod)
+            toast_mod.ToastPresenter(app_id="TestApp")
+
+            wun.ToastNotificationManager.create_toast_notifier_with_id.assert_called_once_with(
+                "TestApp",
+            )
+            wun.ToastNotificationManager.create_toast_notifier.assert_not_called()
+
+    def test_construction_failure_leaves_notifier_none(self, caplog) -> None:
+        """A construction-time WinRT failure must not raise out of __init__.
+
+        ``confirm.toast_stack_available`` fails closed on ``_notifier is
+        None`` — this proves a broken notifier factory (real winrt present,
+        but e.g. no shell notification host reachable) lands exactly there
+        instead of taking the caller down with an unhandled exception.
+        """
+        wun, wxml, _wfoundation = _build_winrt_mocks()
+        wun.ToastNotificationManager.create_toast_notifier_with_id.side_effect = RuntimeError(
+            "Element not found.",
+        )
+
+        with (
+            _patch_winrt(wun, wxml),
+            patch("platform.system", return_value="Windows"),
+            caplog.at_level(logging.ERROR, logger="workstation_agent.ui.notifications.toast"),
+        ):
+            import workstation_agent.ui.notifications.toast as toast_mod
+
+            importlib.reload(toast_mod)
+            presenter = toast_mod.ToastPresenter(app_id="TestApp")  # must not raise
+
+        assert presenter._notifier is None
+
     def test_action_callback_fires(self) -> None:
-        wun, wxml = _build_winrt_mocks()
+        wun, wxml, _wfoundation = _build_winrt_mocks()
         callback_called: list[str] = []
         activated_handlers: list = []
 
@@ -180,7 +250,7 @@ class TestToastPresenterWinRT:
         assert callback_called == ["update_now"]
 
     def test_show_handles_winrt_exception_gracefully(self) -> None:
-        wun, wxml = _build_winrt_mocks()
+        wun, wxml, _wfoundation = _build_winrt_mocks()
 
         with _patch_winrt(wun, wxml), patch("platform.system", return_value="Windows"):
             import workstation_agent.ui.notifications.toast as toast_mod
@@ -191,7 +261,7 @@ class TestToastPresenterWinRT:
             presenter.show(title="Hi", body="There")  # must not raise
 
     def test_action_callback_with_unknown_id_is_ignored(self) -> None:
-        wun, wxml = _build_winrt_mocks()
+        wun, wxml, _wfoundation = _build_winrt_mocks()
         activated_handlers: list = []
 
         with _patch_winrt(wun, wxml), patch("platform.system", return_value="Windows"):
