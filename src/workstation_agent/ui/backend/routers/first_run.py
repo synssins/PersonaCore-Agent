@@ -26,6 +26,8 @@ router = APIRouter(prefix="/first-run", tags=["first-run"])
 
 _WYOMING_PORT_MAX = 65535
 _HTTP_ERROR_STATUS_MIN = 400
+_HTTP_UNAUTHORIZED = 401
+_HTTP_FORBIDDEN = 403
 
 
 def _split_url(url: str, default_port: int = 8053) -> tuple[str, int]:
@@ -85,9 +87,8 @@ async def detect_models(
         async with httpx.AsyncClient(timeout=4.0) as client:
             resp = await client.get(url, headers=headers)
         if resp.status_code >= _HTTP_ERROR_STATUS_MIN:
-            return JSONResponse({
-                "models": [], "error": f"HTTP {resp.status_code}",
-            })
+            error = _describe_llm_error(resp.status_code, key_supplied=bool(api_key))
+            return JSONResponse({"models": [], "error": error})
         payload = resp.json()
         data = payload.get("data") if isinstance(payload, dict) else None
         if not isinstance(data, list):
@@ -96,6 +97,54 @@ async def detect_models(
         return JSONResponse({"models": ids, "error": ""})
     except (httpx.HTTPError, ValueError) as exc:
         return JSONResponse({"models": [], "error": str(exc)})
+
+
+def _describe_llm_error(status_code: int, *, key_supplied: bool) -> str:
+    """Turn an LLM-server HTTP error into a plain-English wizard message.
+
+    401 is unambiguous: the key was rejected, or none was sent. Worded to
+    match ``workstation_agent.llm.client``'s ``LLMCredentialError`` (see
+    ``_credential_failure_message``) rather than inventing a second
+    sentence for the same condition -- an operator who later hits the same
+    failure from the running agent should not see a different story here.
+
+    403 is *not* unambiguous -- a WAF/IP/geo block, a quota limit, or a
+    valid key lacking permission for the model can all return 403 too --
+    so, matching ``LLMAccessDeniedError`` (see ``_access_denied_message``),
+    this names the key as one possible cause rather than asserting it, and
+    does not tell the reader to replace it outright.
+
+    Anything else keeps the status code visible, since for those the code
+    is genuinely the useful part.
+    """
+    if status_code == _HTTP_UNAUTHORIZED:
+        if key_supplied:
+            return (
+                "The API key for the LLM server was rejected "
+                f"(HTTP {status_code}). Check the API Key field and try again."
+            )
+        return (
+            "This LLM server requires an API key, but the API Key field is "
+            "empty. Enter the API key for the LLM server and try again."
+        )
+    if status_code == _HTTP_FORBIDDEN:
+        if key_supplied:
+            return (
+                f"The LLM server refused the request (HTTP {status_code}). "
+                "This does not necessarily mean the API key is wrong -- 403 "
+                "can also mean the key lacks permission for this model, a "
+                "quota was exceeded, or the server is blocking the "
+                "connection outright. Check those before re-entering the "
+                "API key."
+            )
+        return (
+            f"The LLM server refused the request (HTTP {status_code}), and "
+            "no API key was sent. If this server requires one, enter the "
+            "API key for the LLM server; if it does not, the block is "
+            "something else -- permissions, quota, or the server refusing "
+            "this connection outright."
+        )
+    return f"The LLM server returned HTTP {status_code}."
 
 
 class _LLMStepForm:

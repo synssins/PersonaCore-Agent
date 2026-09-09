@@ -119,6 +119,207 @@ def test_load_secret_missing_raises_key_error(tmp_appdata: Path, patched_store: 
         store.load_secret("nonexistent")
 
 
+def test_load_secret_missing_names_the_credential(
+    tmp_appdata: Path, patched_store: None,
+) -> None:
+    """The KeyError message names the secret's role, not just a bare repr.
+
+    ``str(KeyError("some message"))`` returns the message wrapped in quotes
+    (KeyError's ``__str__`` uses ``repr`` of its argument) -- assert on the
+    args, not on the quoted str(), so this does not depend on that quoting.
+    """
+    _ = tmp_appdata
+    _ = patched_store
+    with pytest.raises(KeyError) as exc_info:
+        store.load_secret("llm_api_key")
+    msg = exc_info.value.args[0]
+    assert "API key for the LLM server" in msg
+
+
+def test_load_secret_missing_llm_key_remedy_is_enter_again(
+    tmp_appdata: Path, patched_store: None,
+) -> None:
+    """The LLM API key has a real field, so the remedy is to re-enter it there."""
+    _ = tmp_appdata
+    _ = patched_store
+    with pytest.raises(KeyError) as exc_info:
+        store.load_secret("llm_api_key")
+    msg = exc_info.value.args[0]
+    assert "enter" in msg.lower()
+    assert "API Key field" in msg
+
+
+def test_load_secret_missing_per_machine_workstation_token_names_the_machine(
+    tmp_appdata: Path, patched_store: None,
+) -> None:
+    """A PersonaCore per-machine token (workstation_<slug>_token) names the machine.
+
+    PersonaCore's enrolment derives one secret name per enrolled machine
+    rather than a single fixed name, so this cannot be a table lookup -- it
+    is a pattern match, and the slug (an operator-chosen machine name) must
+    come through readably rather than as a raw underscored identifier.
+    """
+    _ = tmp_appdata
+    _ = patched_store
+    with pytest.raises(KeyError) as exc_info:
+        store.load_secret("workstation_front_desk_token")
+    msg = exc_info.value.args[0]
+    assert "workstation" in msg.lower()
+    assert "Front Desk" in msg
+
+
+def test_load_secret_missing_workstation_token_remedy_is_reenrol_not_enter(
+    tmp_appdata: Path, patched_store: None,
+) -> None:
+    """A per-machine token is pushed by PersonaCore at enrolment -- never typed.
+
+    There is no field anywhere in this product for a person to type a
+    bearer token into on purpose, so the remedy must not tell the operator
+    to "enter" or "re-enter" it -- that sends them hunting for a control
+    that does not exist. The correct remedy is to re-enrol.
+    """
+    _ = tmp_appdata
+    _ = patched_store
+    with pytest.raises(KeyError) as exc_info:
+        store.load_secret("workstation_front_desk_token")
+    msg = exc_info.value.args[0]
+    assert "join" in msg.lower() or "re-enrol" in msg.lower()
+    assert "enter it again" not in msg.lower()
+    assert "re-enter" not in msg.lower()
+
+
+def test_secret_role_workstation_slug_is_sanitised_and_length_capped() -> None:
+    """The machine-name slug is untrusted text: no structure, no unbounded length.
+
+    A slug an operator typed could contain punctuation or be very long; the
+    role text must never let it inject formatting or blow past a sane size.
+    """
+    noisy_name = "workstation_" + ("kitchen<script>!!__" * 5) + "_token"
+    info = store._secret_role(noisy_name)
+    assert "<" not in info.role
+    assert ">" not in info.role
+    assert "!" not in info.role
+    assert len(info.role) < 120
+
+
+def test_secret_role_workstation_slug_that_sanitises_to_nothing_is_safe() -> None:
+    """A slug made entirely of unsafe characters must not fall through unsanitised.
+
+    The bug this guards: the sanitised branch was only taken when something
+    safe remained, and the *default* it fell through to on failure embedded
+    the raw, unsanitised name. A safe static phrase must be what is
+    returned, not what is skipped past.
+    """
+    noisy_name = "workstation_</>_token"
+    info = store._secret_role(noisy_name)
+    assert "</>" not in info.role
+    assert noisy_name not in info.role
+    assert "workstation" in info.role.lower()
+    # Still an enrolment-pushed credential -- same remedy as the readable case.
+    assert "join" in info.remedy.lower() or "re-enrol" in info.remedy.lower()
+
+
+def test_load_secret_missing_unknown_name_has_readable_fallback(
+    tmp_appdata: Path, patched_store: None,
+) -> None:
+    """A secret name with no role mapping still reads as a sentence, not broken."""
+    _ = tmp_appdata
+    _ = patched_store
+    with pytest.raises(KeyError) as exc_info:
+        store.load_secret("some_future_secret")
+    msg = exc_info.value.args[0]
+    assert "some_future_secret" in msg
+
+
+def test_load_secret_missing_unknown_name_has_no_invented_remedy(
+    tmp_appdata: Path, patched_store: None,
+) -> None:
+    """An unrecognised secret gets no fabricated fix -- a vague truth beats a false specific.
+
+    Neither "enter it again" (may not have a field) nor "re-enrol" (may not
+    be an enrolment credential at all) is verified for a name this product
+    does not define a role for, so neither should appear.
+    """
+    _ = tmp_appdata
+    _ = patched_store
+    with pytest.raises(KeyError) as exc_info:
+        store.load_secret("some_future_secret")
+    msg = exc_info.value.args[0].lower()
+    assert "enter it again" not in msg
+    assert "re-enter" not in msg
+    assert "re-enrol" not in msg
+    assert "join" not in msg
+
+
+def test_secret_role_unknown_name_that_sanitises_to_nothing_is_safe() -> None:
+    """A totally unrecognised name made of unsafe characters must not leak through.
+
+    This is the fallback-of-the-fallback: not the workstation-token pattern
+    at all, just an arbitrary name nobody anticipated. It must still never
+    echo the raw input once sanitising it leaves nothing safe.
+    """
+    noisy_name = "</>!!!"
+    info = store._secret_role(noisy_name)
+    assert noisy_name not in info.role
+    assert info.remedy == ""
+
+
+def test_load_secret_decrypt_failure_names_the_credential(
+    tmp_appdata: Path, patched_store: None, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A DPAPI decrypt failure names the secret's role and says it must be re-entered."""
+    import workstation_agent.security.dpapi as _dpapi_mod
+
+    _ = tmp_appdata
+    _ = patched_store
+
+    store.save_secret("llm_api_key", b"top-secret-value")
+
+    def _broken_unprotect(blob: bytes, *, entropy: bytes | None = None) -> bytes:
+        _ = blob, entropy
+        msg = "CryptUnprotectData failed with code -2146893813"
+        raise _dpapi_mod.DpapiError(msg)
+
+    monkeypatch.setattr(_dpapi_mod, "unprotect", _broken_unprotect)
+
+    with pytest.raises(_dpapi_mod.DpapiError) as exc_info:
+        store.load_secret("llm_api_key")
+    msg = str(exc_info.value)
+    assert "API key for the LLM server" in msg
+    assert "top-secret-value" not in msg
+
+
+def test_load_secret_decrypt_failure_workstation_token_says_reenrol(
+    tmp_appdata: Path, patched_store: None, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A decrypt failure on a per-machine token also gets the re-enrol remedy.
+
+    The remedy must be consistent between the missing-secret and the
+    decrypt-failure paths for the same kind of secret -- both are "this
+    Agent no longer has a usable value," and the fix is the same either way.
+    """
+    import workstation_agent.security.dpapi as _dpapi_mod
+
+    _ = tmp_appdata
+    _ = patched_store
+
+    store.save_secret("workstation_front_desk_token", b"pushed-by-personacore")
+
+    def _broken_unprotect(blob: bytes, *, entropy: bytes | None = None) -> bytes:
+        _ = blob, entropy
+        msg = "CryptUnprotectData failed with code -2146893813"
+        raise _dpapi_mod.DpapiError(msg)
+
+    monkeypatch.setattr(_dpapi_mod, "unprotect", _broken_unprotect)
+
+    with pytest.raises(_dpapi_mod.DpapiError) as exc_info:
+        store.load_secret("workstation_front_desk_token")
+    msg = str(exc_info.value).lower()
+    assert "join" in msg or "re-enrol" in msg
+    assert "enter it again" not in msg
+    assert "pushed-by-personacore" not in msg
+
+
 def test_delete_secret(tmp_appdata: Path, patched_store: None) -> None:
     """delete_secret removes the file; subsequent load_secret raises KeyError."""
     _ = tmp_appdata
