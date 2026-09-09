@@ -536,6 +536,22 @@ class Application:
             log.warning("network MCP endpoint failed to start: %s", exc)
             self._subs.started["network_mcp"] = Health(ok=False, detail=repr(exc))
             return
+        # A *partial* bind returns normally — the endpoint is serving on the
+        # addresses that worked — but it is not healthy: the operator chose
+        # addresses that are not answering, and a green light here is exactly
+        # the silence that would stop them finding out. The detail names each
+        # one, because "degraded" without "which" is not actionable.
+        failures: tuple[Any, ...] = tuple(getattr(info, "bind_failures", ()) or ())
+        if failures:
+            listed = "; ".join(
+                f"{getattr(f, 'host', f)}: {getattr(f, 'reason', '')}" for f in failures
+            )
+            log.warning("network MCP endpoint bound only some addresses: %s", listed)
+            self._subs.started["network_mcp"] = Health(
+                ok=False,
+                detail=f"serving on {', '.join(info.urls)} but not on {listed}",
+            )
+            return
         self._subs.started["network_mcp"] = Health(
             ok=True, detail=f"{info.url} ({len(info.tool_names)} tools)",
         )
@@ -550,9 +566,26 @@ class Application:
         """
         self._subs.network_mcp = server
         detail = "stopped"
+        ok = True
         if server is not None and getattr(server, "running", False):
             detail = "started from the UI"
-        self._subs.started["network_mcp"] = Health(ok=True, detail=detail)
+            # Same rule as `_start_network_mcp`: serving on some of the chosen
+            # addresses is not health, and the router has already told the
+            # operator which. Recording it here is what keeps the Agent's own
+            # health view from disagreeing with the page.
+            try:
+                failures: tuple[Any, ...] = tuple(
+                    getattr(server.info(), "bind_failures", ()) or (),
+                )
+            except Exception:  # a stub endpoint must not break adoption
+                log.debug("network MCP info() failed while adopting", exc_info=True)
+                failures = ()
+            if failures:
+                ok = False
+                detail = "started from the UI, but not on every chosen address: " + "; ".join(
+                    f"{getattr(f, 'host', f)}: {getattr(f, 'reason', '')}" for f in failures
+                )
+        self._subs.started["network_mcp"] = Health(ok=ok, detail=detail)
 
     async def _start_audio_pipeline(self, cfg: Any) -> None:
         from workstation_agent.audio.session import AudioSession, SessionMode

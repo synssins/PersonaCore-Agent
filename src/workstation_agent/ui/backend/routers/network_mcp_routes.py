@@ -11,11 +11,23 @@ Beyond that surface this router owns three things the operator previously had
 to leave the UI for, and the product requirement is that they never have to
 again -- no config file, no command line:
 
-* **Switching the endpoint on, and choosing its interface and port.**
+* **Switching the endpoint on, and choosing its interfaces and port.**
   ``POST /network-mcp/settings`` writes ``[network_mcp]`` through the config
   store and then starts, stops or rebinds the live endpoint on the Agent's own
   event loop, so the change takes effect without a restart. See
-  :func:`_apply_endpoint`.
+  :func:`_apply_endpoint`. The interface control is a **multi-select**: a
+  machine that bridges two networks has to answer on both, and which addresses
+  is the operator's decision, made from a list of the addresses this machine
+  actually has. Selecting three is not selecting "all" — the wildcard the
+  schema refuses is refused just as hard per entry.
+* **Never letting the operator choose an address the certificate cannot
+  cover.** An address outside the SAN is one where PersonaCore's pin succeeds
+  and any hostname-verifying client is rejected. Such an address is rendered
+  unselectable, and — because a disabled attribute is decoration, not a rule —
+  :func:`settings_post` refuses to save a selection containing one. The only
+  way through is the explicit "regenerate the certificate to cover these
+  addresses" action, which states the fingerprint consequence first. See
+  :func:`_gate_uncovered`.
 * **Exporting the registration.** ``POST /network-mcp/export-registration``
   writes ``workstation-registration.zip`` and
   ``GET /network-mcp/registration.zip`` hands it to the browser; the
@@ -46,6 +58,7 @@ import contextlib
 import hashlib
 import inspect
 import logging
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Annotated, Any
 
 from fastapi import APIRouter, Depends, Form, Request
@@ -115,13 +128,18 @@ def export_dir() -> Path:
 # ---------------------------------------------------------------------------
 
 
-def _interface_choices(current: str) -> list[dict[str, Any]]:
+def _interface_choices(
+    selected: Sequence[str],
+    sans: object = None,
+    *,
+    check_coverage: bool = False,
+) -> list[dict[str, Any]]:
     """The addresses this machine actually has, classified for the UI.
 
     ``NetworkMcpConfig`` refuses a wildcard bind outright, so offering a bare
     text box means the operator's first attempt at "listen everywhere" is a
     validation error. Offering the machine's real addresses instead turns the
-    decision the schema is asking for -- *which* interface -- into a choice
+    decision the schema is asking for -- *which* interfaces -- into a choice
     from a list, with loopback visibly marked as the answer that cannot work
     for PersonaCore.
 
@@ -131,10 +149,22 @@ def _interface_choices(current: str) -> list[dict[str, Any]]:
     both is deliberate: an address offered here is, on a freshly generated
     certificate, an address the certificate already covers.
 
+    Args:
+        selected: The addresses currently chosen. Every one of them appears in
+            the list even if this machine no longer has it, marked selected --
+            a control that silently dropped a configured address would look
+            like the operator had deselected it.
+        sans: The live certificate's SAN entries, for the ``covered`` flag.
+        check_coverage: Whether ``sans`` is trustworthy. False when there is no
+            endpoint to ask *or* when what it returned is not a readable list of
+            entries, in which case every choice is reported covered: marking
+            everything unselectable because a certificate could not be read
+            would be a page with no working options on it, and the endpoint's
+            own refusal to bind an uncovered address still stands either way.
+
     Returns:
-        Dicts of ``value``/``label``/``kind``, LAN addresses first, then
-        hostnames, then loopback. *current* is always present even if this
-        machine no longer has that address.
+        Dicts of ``value``/``label``/``kind``/``selected``/``covered``, LAN
+        addresses first, then hostnames, then loopback.
     """
     dns_names: list[str] = []
     ips: list[str] = []
@@ -145,6 +175,7 @@ def _interface_choices(current: str) -> list[dict[str, Any]]:
     except Exception:
         log.warning("network-mcp: could not enumerate this machine's addresses", exc_info=True)
 
+    chosen = {h.strip().lower() for h in selected if h and h.strip()}
     lan: list[dict[str, Any]] = []
     loopback: list[dict[str, Any]] = []
     names: list[dict[str, Any]] = []
@@ -155,9 +186,14 @@ def _interface_choices(current: str) -> list[dict[str, Any]]:
         if not key or key in seen:
             return
         seen.add(key)
-        {"lan": lan, "loopback": loopback, "hostname": names}[kind].append(
-            {"value": value, "label": label, "kind": kind},
-        )
+        covered = san_covers(value, sans) if check_coverage else True
+        {"lan": lan, "loopback": loopback, "hostname": names}[kind].append({
+            "value": value,
+            "label": label if covered else f"{label} — NOT in the certificate",
+            "kind": kind,
+            "selected": key in chosen,
+            "covered": covered,
+        })
 
     for ip in ips:
         if is_loopback_host(ip):
@@ -171,11 +207,82 @@ def _interface_choices(current: str) -> list[dict[str, Any]]:
             _add(name, "hostname", f"{name} — this machine's name (needs working DNS)")
 
     choices = lan + names + loopback
-    if current and current.strip().lower() not in seen:
+    for current in selected:
+        if not current or current.strip().lower() in seen:
+            continue
+        seen.add(current.strip().lower())
         kind = "loopback" if is_loopback_host(current) else "lan"
         suffix = " — loopback, this machine only" if kind == "loopback" else " — currently set"
-        choices.append({"value": current, "label": f"{current}{suffix}", "kind": kind})
+        covered = san_covers(current, sans) if check_coverage else True
+        choices.append({
+            "value": current,
+            "label": f"{current}{suffix}" + ("" if covered else " — NOT in the certificate"),
+            "kind": kind,
+            "selected": True,
+            "covered": covered,
+        })
     return choices
+
+
+def _readable_sans(info: Any) -> Sequence[object] | None:  # noqa: ANN401
+    """The endpoint's SAN entries, or ``None`` if they cannot be read as a list.
+
+    ``info`` is whatever ``ctx.network_mcp`` returned: a stub, a build with a
+    renamed field, an ``info()`` that degraded. :func:`san_covers` answers "not
+    covered" for anything that is not a real sequence, which is the right answer
+    for one address and the wrong one for a *rule* -- it would call every
+    address uncovered.
+    """
+    sans = getattr(info, "certificate_sans", None) if info is not None else None
+    if isinstance(sans, (str, bytes)) or not isinstance(sans, Sequence) or not sans:
+        return None
+    return sans
+
+
+def _uncovered_hosts(hosts: Sequence[str], info: Any) -> tuple[str, ...]:  # noqa: ANN401
+    """Which of *hosts* the endpoint's certificate does not cover, for display.
+
+    Compares literally, including against a SAN that could not be read -- which
+    reports everything uncovered, and is right *here*, because the page's job is
+    to say "we cannot confirm the certificate covers this". Refusing a save on
+    that basis is a different question; see :func:`_gate_uncovered`.
+    """
+    if info is None:
+        return ()
+    sans = getattr(info, "certificate_sans", None)
+    return tuple(h for h in hosts if h and not san_covers(h, sans))
+
+
+def _gate_uncovered(hosts: Sequence[str], info: Any) -> tuple[str, ...]:  # noqa: ANN401
+    """Which of *hosts* to **refuse the save for**.
+
+    **This is the gate, not the disabled attribute in the template.** An
+    ``<option disabled>`` stops a click; it stops nothing else -- not a crafted
+    POST, not a browser with scripting off, not a stale page rendered before
+    the certificate was rotated narrower. The selection is therefore checked
+    here, on the server, on the way to the config store, and the same
+    comparison (:func:`san_covers`) is what the endpoint itself uses to decide
+    whether to bind an address at all. Two gates, one rule, and the second one
+    holds even if this router is bypassed entirely.
+
+    Empty when there is no endpoint to ask, and when its SAN cannot be read:
+    refusing every address on the strength of a value nobody could read would
+    lock the operator out of the one screen that can fix it. That leniency is
+    safe *precisely because this is not the invariant* --
+    :func:`~workstation_agent.network_mcp.listeners.open_listeners` compares
+    against the parsed certificate, which is always a real tuple, and refuses to
+    bind regardless of what this function decided. The page still says it could
+    not confirm coverage, via :func:`_uncovered_hosts`.
+    """
+    if _readable_sans(info) is None:
+        if info is not None:
+            log.warning(
+                "network-mcp: the endpoint's certificate SAN could not be read, so the "
+                "address selection was not refused here; the endpoint itself still "
+                "refuses to bind an address it cannot present a certificate for",
+            )
+        return ()
+    return _uncovered_hosts(hosts, info)
 
 
 # ---------------------------------------------------------------------------
@@ -264,6 +371,7 @@ def _render(  # noqa: PLR0913 — one parameter per independent page outcome
     export_error: str | None = None,
     join_error: str | None = None,
     join_notice: str | None = None,
+    uncovered: tuple[str, ...] = (),
 ) -> HTMLResponse:
     """Render ``network_mcp.html`` for every outcome this router produces.
 
@@ -279,10 +387,11 @@ def _render(  # noqa: PLR0913 — one parameter per independent page outcome
     values = {
         "enabled": nm.enabled,
         "bind_host": nm.bind_host,
+        "bind_hosts": list(nm.bind_hosts),
         "port": nm.port,
         **(form_values or {}),
     }
-    bind_host = str(values["bind_host"])
+    bind_hosts = [str(h) for h in values["bind_hosts"]]
 
     running = bool(getattr(info, "running", False))
     cert_warning: str | None = None
@@ -290,18 +399,29 @@ def _render(  # noqa: PLR0913 — one parameter per independent page outcome
     # returned, and a stub or a future field rename must degrade to "we cannot
     # confirm the certificate covers this" rather than 500 the settings page.
     sans = getattr(info, "certificate_sans", None)
-    if info is not None and not san_covers(bind_host, sans):
+    # Reported for the whole selection, not only the preferred address: with a
+    # set, a SAN gap on the third entry is exactly as fatal to a
+    # hostname-verifying client as one on the first, and naming only the first
+    # would send the operator to regenerate for an address that was already fine.
+    missing = uncovered or _uncovered_hosts(bind_hosts, info)
+    if missing:
         listed = ", ".join(str(s) for s in sans) if isinstance(sans, (tuple, list)) else "empty"
+        subject = ", ".join(missing)
         cert_warning = (
-            f"The stored certificate does not cover {bind_host}. Its SAN is {listed}. "
+            f"The stored certificate does not cover {subject}. Its SAN is {listed}. "
             "PersonaCore pins the fingerprint rather than checking the name, so it "
             "will most likely still connect; any client that does verify hostnames "
-            "will not. Regenerating fixes the SAN but changes the fingerprint, which "
-            "breaks the core's pin until the registration below is re-exported and "
-            "reinstalled on the Plugins page."
+            "will not, and this endpoint will not bind an address it cannot present "
+            "a matching certificate for. Regenerating fixes the SAN but changes the "
+            "fingerprint, which breaks the core's pin until the registration below "
+            "is re-exported and reinstalled on the Plugins page."
         )
 
-    choices = _interface_choices(bind_host)
+    # Same leniency as ``_gate_uncovered``: a SAN we could not read must not
+    # grey out every option on the page. The warning above still says so.
+    choices = _interface_choices(
+        bind_hosts, sans, check_coverage=_readable_sans(info) is not None,
+    )
     last_export = export_dir() / REGISTRATION_ZIP_NAME
     try:
         have_export = last_export.is_file()
@@ -324,15 +444,26 @@ def _render(  # noqa: PLR0913 — one parameter per independent page outcome
             "can_configure": cfg is not None,
             "values": values,
             "host_choices": choices,
-            "bind_is_loopback": is_loopback_host(bind_host),
+            # True only when *every* chosen address is loopback: a set that
+            # includes a LAN address is reachable, and warning about it would be
+            # a red message the operator cannot act on.
+            "bind_is_loopback": bool(bind_hosts) and all(
+                is_loopback_host(h) for h in bind_hosts
+            ),
             "field_errors": field_errors or {},
             "saved": saved,
             "notice": notice,
             "other_sentinel": _OTHER,
-            "host_is_listed": any(
-                c["value"].strip().lower() == bind_host.strip().lower() for c in choices
+            "host_is_listed": all(
+                any(c["value"].strip().lower() == h.strip().lower() for c in choices)
+                for h in bind_hosts
             ),
             "cert_warning": cert_warning,
+            "uncovered": tuple(missing),
+            # A partial bind: serving, but not everywhere the operator chose.
+            # Rendered as a failure, never folded into the "running" light.
+            "bind_failures": tuple(getattr(info, "bind_failures", ()) or ()),
+            "degraded": bool(getattr(info, "degraded", False)),
             # export
             "export_result": export_result,
             "export_problems": export_problems,
@@ -365,6 +496,7 @@ async def network_mcp_page(
 
 def _parse_settings_form(
     enabled: str,
+    bind_hosts: Sequence[str],
     bind_host_choice: str,
     bind_host_other: str,
     port: str,
@@ -375,10 +507,35 @@ def _parse_settings_form(
     hand a typo to FastAPI's own validation, which answers 422 with a JSON
     error body -- a dead end in a webview with no way back to the form. Parsed
     here, a typo comes back as a message next to the field.
+
+    *bind_hosts* is the multi-select. *bind_host_choice* is the single-select
+    that preceded it, still accepted and folded into the same set: the page is
+    not the only thing that posts here (the export flow re-posts the settings,
+    and a bookmarked or scripted POST is a real shape), and silently ignoring a
+    field that used to work would look like a save that did nothing.
+
+    The first selected address is the **preferred** one -- the address the
+    registration names -- so the order of the selection is meaningful and is
+    preserved. De-duplication is by :func:`_host_key`, so choosing both ``::1``
+    and ``[::1]`` is one address rather than a bind failure on the second.
     """
+    from workstation_agent.config.schema import _host_key  # noqa: PLC0415
+
     errors: dict[str, str] = {}
 
-    host = (bind_host_other if bind_host_choice == _OTHER else bind_host_choice).strip()
+    hosts: list[str] = []
+    seen: set[str] = set()
+    for raw in [*bind_hosts, bind_host_choice]:
+        entry = (bind_host_other if raw.strip() == _OTHER else raw).strip()
+        if not entry:
+            continue
+        key = _host_key(entry)
+        if key in seen:
+            continue
+        seen.add(key)
+        hosts.append(entry)
+
+    host = hosts[0] if hosts else ""
     if not host:
         errors["bind_host"] = (
             "Choose the interface to bind, or type one. It must name a single "
@@ -408,7 +565,16 @@ def _parse_settings_form(
                 errors["port"] = f"Port must be between {_PORT_MIN} and {_PORT_MAX}."
 
     return (
-        {"enabled": bool(enabled), "bind_host": host, "port": parsed_port},
+        {
+            "enabled": bool(enabled),
+            "bind_host": host,
+            "additional_bind_hosts": hosts[1:],
+            # Not a schema field -- the resolved set, for re-rendering the
+            # control and for the SAN gate. :func:`_validated_network_config`
+            # drops it rather than handing pydantic something it does not know.
+            "bind_hosts": hosts,
+            "port": parsed_port,
+        },
         errors,
     )
 
@@ -431,7 +597,11 @@ def _validated_network_config(
     of step with what the schema actually refuses.
     """
     data = nm.model_dump()
-    data.update(values)
+    # Only real fields: ``values`` also carries the resolved ``bind_hosts`` set,
+    # which is a *property* of the model. Pydantic ignores unknown keys by
+    # default, so passing it would be silently harmless today and a silently
+    # ignored setting the day someone adds ``extra="forbid"``.
+    data.update({k: v for k, v in values.items() if k in NetworkMcpConfig.model_fields})
     try:
         return NetworkMcpConfig.model_validate(data), None
     except ValidationError as exc:
@@ -480,8 +650,69 @@ def _publish(ctx: BackendContext, server: Any) -> None:  # noqa: ANN401
             log.exception("network-mcp: on_network_mcp_change callback failed")
 
 
-async def _bring_up(ctx: BackendContext, new: NetworkMcpConfig) -> tuple[str, str | None]:
+def _partial_bind_message(server: Any) -> str | None:  # noqa: ANN401
+    """The operator-facing sentence for a partial bind, or ``None`` if there is none.
+
+    Names every address that did not bind **and** its reason, and says what the
+    endpoint *is* answering on, because both halves are needed to act: which one
+    to go and free, and whether the core can reach the machine meanwhile.
+    """
+    info, _ = _read_info(server)
+    failures: tuple[Any, ...] = tuple(getattr(info, "bind_failures", ()) or ())
+    if not failures:
+        return None
+    answering = ", ".join(str(u) for u in getattr(info, "urls", ()) or ()) or "nothing"
+    listed = "; ".join(f"{getattr(f, 'host', f)} — {getattr(f, 'reason', '')}" for f in failures)
+    return (
+        f"Saved, and the endpoint is answering on {answering} — but it is NOT "
+        f"answering on every address you chose. Not bound: {listed}. "
+        "Free that address (or deselect it) and save again."
+    )
+
+
+def _coverage_probe(ctx: BackendContext, new: NetworkMcpConfig) -> tuple[Any, Any]:
+    """Return ``(prepared, info)`` for the SAN gate to compare against.
+
+    The certificate is the endpoint's, so the endpoint is what gets asked. The
+    awkward case is the *common* one: with the endpoint switched off the Agent
+    never built one, so ``ctx.network_mcp`` is ``None`` and there is nothing to
+    ask — which is exactly the first time the operator ever picks an address.
+    A gate that quietly passed there would be a gate that never fired when it
+    mattered.
+
+    So one is built, published (the page then shows a real identity and can
+    grey out what the certificate does not cover) and handed back as
+    *prepared*, so :func:`_bring_up` starts **that** object rather than
+    building a second: the endpoint the coverage was checked against and the
+    endpoint that binds must be the same one, or the check was about a
+    certificate other than the one presented.
+
+    Returns ``(None, None)`` if it cannot be built; :func:`_bring_up` then
+    reports the construction failure with its own message.
+    """
+    server = ctx.network_mcp
+    if server is None:
+        try:
+            server = _build_server(ctx, new)
+        except Exception:
+            log.exception("network-mcp: could not build an endpoint to check the certificate")
+            return None, None
+        _publish(ctx, server)
+        info, _ = _read_info(server)
+        return server, info
+    info, _ = _read_info(server)
+    return None, info
+
+
+async def _bring_up(
+    ctx: BackendContext, new: NetworkMcpConfig, *, prepared: Any = None,  # noqa: ANN401
+) -> tuple[str, str | None]:
     """Build a fresh endpoint for *new* and start it. Returns ``(notice, error)``.
+
+    *prepared* is an endpoint already built from *new* by :func:`_coverage_probe`
+    in this same request. Reusing it rather than building a second is not an
+    optimisation: the certificate whose SAN was checked has to be the
+    certificate the listener presents.
 
     Every failure here is reported rather than raised, and each message says
     what state the operator is actually in. "Saved" is true in all of them --
@@ -489,16 +720,21 @@ async def _bring_up(ctx: BackendContext, new: NetworkMcpConfig) -> tuple[str, st
     distinction that matters is whether the endpoint is up now or only will be
     after a restart, and the messages say which.
     """
-    try:
-        server = _build_server(ctx, new)
-    except Exception as exc:
-        log.exception("network-mcp: could not build the endpoint")
-        return "", (
-            f"Saved, but this build could not create the endpoint from the UI ({exc}). "
-            "Restart the Agent to apply the change."
-        )
+    server = prepared
+    if server is None:
+        try:
+            server = _build_server(ctx, new)
+        except Exception as exc:
+            log.exception("network-mcp: could not build the endpoint")
+            return "", (
+                f"Saved, but this build could not create the endpoint from the UI ({exc}). "
+                "Restart the Agent to apply the change."
+            )
 
-    _publish(ctx, server)
+    # Already published if it came from `_coverage_probe`; publishing twice
+    # would fire the composition root's adoption callback twice for one save.
+    if ctx.network_mcp is not server:
+        _publish(ctx, server)
 
     start = getattr(server, "start", None)
     if not callable(start):
@@ -519,6 +755,14 @@ async def _bring_up(ctx: BackendContext, new: NetworkMcpConfig) -> tuple[str, st
             "again, or restart the Agent."
         )
 
+    # A partial bind is reported as a failure, never as a notice. The operator
+    # chose three addresses and got two: telling them "the endpoint is
+    # listening" would be true and useless, and the missing address is the only
+    # part of it they can act on.
+    partial = _partial_bind_message(server)
+    if partial is not None:
+        return "", partial
+
     if ctx.mcp_host is None:
         # Serving, but every tools/call returns the §5.2 error envelope until a
         # host is attached. Silence here would look like a healthy endpoint.
@@ -534,6 +778,8 @@ async def _apply_endpoint(
     ctx: BackendContext,
     old: NetworkMcpConfig,
     new: NetworkMcpConfig,
+    *,
+    prepared: Any = None,  # noqa: ANN401
 ) -> tuple[str, str | None]:
     """Bring the live endpoint into line with *new*. Returns ``(notice, error)``.
 
@@ -554,7 +800,11 @@ async def _apply_endpoint(
     the operator has to paste into PersonaCore. That is why ``ctx.network_mcp``
     is not a proxy for "enabled".
     """
-    rebind = (old.bind_host, old.port) != (new.bind_host, new.port)
+    # The whole set, not just the preferred address: adding a second address to
+    # a running endpoint is a change that has to be applied, and comparing only
+    # ``bind_host`` would report "already running with these settings" while one
+    # of the chosen addresses had nothing listening on it.
+    rebind = (old.bind_hosts, old.port) != (new.bind_hosts, new.port)
     current = ctx.network_mcp
     running = bool(getattr(current, "running", False))
 
@@ -567,25 +817,67 @@ async def _apply_endpoint(
         return ("The endpoint is switched off and no longer listening.", None)
 
     if current is not None and not rebind and running:
+        # Still not a green light if it never bound everything it was asked to.
+        partial = _partial_bind_message(current)
+        if partial is not None:
+            return "", partial
         return "The endpoint is already running with these settings.", None
 
-    if current is not None:
+    # ``current is not prepared``: the endpoint built moments ago for the
+    # certificate check is the one about to be started, and stopping it first
+    # would report a stop the operator never asked for.
+    if current is not None and current is not prepared:
         await _stop_quietly(current)
-    return await _bring_up(ctx, new)
+    return await _bring_up(ctx, new, prepared=prepared)
+
+
+def _regenerate_for(server: Any, hosts: Sequence[str]) -> None:  # noqa: ANN401
+    """Rotate the certificate so it covers *hosts*, tolerating an older shape.
+
+    ``for_hosts`` is checked by introspection rather than assumed: the injected
+    endpoint is whatever ``ctx.network_mcp`` holds, and a build whose
+    ``regenerate_certificate`` predates the pending-selection argument must
+    still rotate rather than raise a ``TypeError`` into the settings page.
+    """
+    fn = getattr(server, "regenerate_certificate", None)
+    if not callable(fn):
+        return
+    try:
+        accepts = "for_hosts" in inspect.signature(fn).parameters
+    except (TypeError, ValueError):  # pragma: no cover — a C-level callable
+        accepts = False
+    if accepts:
+        fn(for_hosts=tuple(hosts))
+    else:
+        fn()
 
 
 @router.post("/settings", response_class=HTMLResponse, response_model=None)
-async def settings_post(  # noqa: PLR0913, PLR0917 — one parameter per form field
+async def settings_post(  # noqa: PLR0913, PLR0917 — one per form field/outcome
     request: Request,
     ctx: Annotated[BackendContext, Depends(get_context)],
     enabled: Annotated[str, Form(alias="enabled")] = "",
+    bind_hosts: Annotated[list[str], Form(alias="bind_hosts")] = [],  # noqa: B006
     bind_host_choice: Annotated[str, Form(alias="bind_host_choice")] = "",
     bind_host_other: Annotated[str, Form(alias="bind_host_other")] = "",
     port: Annotated[str, Form(alias="port")] = "",
+    regenerate: Annotated[str, Form(alias="regenerate")] = "",
 ) -> HTMLResponse:
-    """Save ``[network_mcp]`` and start/stop/rebind the live endpoint."""
+    """Save ``[network_mcp]`` and start/stop/rebind the live endpoint.
+
+    ``regenerate`` is the operator's explicit second click on the offer made
+    when their selection includes an address the certificate does not cover. It
+    rotates the fingerprint -- which breaks PersonaCore's pin until the
+    registration is re-exported -- so it is never inferred, only obeyed.
+
+    The mutable default on *bind_hosts* is FastAPI's own convention for a
+    repeated form field and is never mutated here; ruff's B006 is about
+    functions that mutate theirs.
+    """
     cfg, _cfg_error = _load_config(ctx)
-    values, errors = _parse_settings_form(enabled, bind_host_choice, bind_host_other, port)
+    values, errors = _parse_settings_form(
+        enabled, bind_hosts, bind_host_choice, bind_host_other, port,
+    )
 
     # ``cfg is None`` means the store is unavailable or unreadable; ``_render``
     # already surfaces that message. Either way the operator's typing is echoed
@@ -600,6 +892,45 @@ async def settings_post(  # noqa: PLR0913, PLR0917 — one parameter per form fi
             request, ctx, field_errors={"bind_host": message or ""}, form_values=values,
         )
 
+    # The SAN gate, before anything is written or bound. Only when the endpoint
+    # is meant to be up: a selection saved with the endpoint switched off binds
+    # nothing, and the endpoint's own refusal still stands at start time.
+    prepared: Any = None
+    chosen: list[str] = list(values["bind_hosts"])
+    if new.enabled:
+        prepared, info = _coverage_probe(ctx, new)
+        missing = _gate_uncovered(chosen, info)
+        if missing and not regenerate:
+            return _render(
+                request, ctx, form_values=values, uncovered=missing,
+                field_errors={"bind_host": (
+                    "The endpoint's certificate does not cover "
+                    + ", ".join(missing)
+                    + ", so the endpoint will not bind that address and nothing has "
+                    "been saved. Regenerate the certificate below to cover it, or "
+                    "choose a different address."
+                )},
+            )
+        if missing:
+            _regenerate_for(ctx.network_mcp, chosen)
+            info, _ = _read_info(ctx.network_mcp)
+            still = _gate_uncovered(chosen, info)
+            if still:
+                # Reached when the address is not one this machine has, so
+                # ``local_identities`` cannot put it in a SAN. Refused rather
+                # than bound: a fingerprint was rotated for nothing already,
+                # and binding anyway is the state this gate exists to prevent.
+                return _render(
+                    request, ctx, form_values=values, uncovered=still,
+                    field_errors={"bind_host": (
+                        "The certificate was regenerated and still does not cover "
+                        + ", ".join(still)
+                        + ". That address is not one this machine has, so nothing "
+                        "can present a certificate for it. Choose an address from "
+                        "the list."
+                    )},
+                )
+
     cfg.network_mcp = new
     try:
         ctx.config_store.save(cfg)
@@ -612,7 +943,7 @@ async def settings_post(  # noqa: PLR0913, PLR0917 — one parameter per form fi
             form_values=values,
         )
 
-    notice, apply_error = await _apply_endpoint(ctx, old, new)
+    notice, apply_error = await _apply_endpoint(ctx, old, new, prepared=prepared)
     # No ``form_values``: the save succeeded, so the config store is now the
     # truth and the form redraws from it. Echoing the submitted values back
     # would hide a store that silently normalised something.
@@ -734,6 +1065,46 @@ async def join_cancel(
 # ---------------------------------------------------------------------------
 
 
+def _multi_address_problems(info: Any) -> tuple[str, ...]:  # noqa: ANN401
+    """Pre-flight items that only exist once the endpoint binds a *set*.
+
+    Added here rather than in
+    :func:`~workstation_agent.registration_export.registration_problems`
+    because the manifest's own shape is the thing in question and that module
+    is held pending a core-side decision: today ``manifest.toml`` carries a
+    single ``url`` and ``[permissions] network = ["<one address>"]``, so a
+    registration exported from a multi-address endpoint is *correct but
+    partial* -- it describes the preferred address and says nothing about the
+    rest. That is a fact the operator should read before installing it on the
+    core, not a defect to be silently papered over here.
+    """
+    problems: list[str] = []
+
+    failures: tuple[Any, ...] = tuple(getattr(info, "bind_failures", ()) or ())
+    if failures:
+        listed = "; ".join(
+            f"{getattr(f, 'host', f)} — {getattr(f, 'reason', '')}" for f in failures
+        )
+        problems.append(
+            "The endpoint is not answering on every address you chose. Not bound: "
+            f"{listed}. If the registration names one of those, PersonaCore will "
+            "install the plugin and then fail to connect.",
+        )
+
+    urls = tuple(str(u) for u in (getattr(info, "urls", ()) or ()))
+    if len(urls) > 1:
+        others = ", ".join(u for u in urls if u != getattr(info, "url", None))
+        problems.append(
+            f"This endpoint is bound to {len(urls)} addresses, and a registration "
+            f"carries one URL. It will name {getattr(info, 'url', '')} and its "
+            f"[permissions] network entry will list only that address; the others "
+            f"({others}) stay reachable but undescribed. That is fine if "
+            "PersonaCore reaches this workstation on the address named.",
+        )
+
+    return tuple(problems)
+
+
 @router.post("/export-registration", response_class=HTMLResponse, response_model=None)
 async def export_registration_post(
     request: Request,
@@ -773,7 +1144,7 @@ async def export_registration_post(
             export_error=info_error or "Could not read the endpoint's current state.",
         )
 
-    problems = registration_problems(info)
+    problems = registration_problems(info) + _multi_address_problems(info)
     if problems and not confirm:
         return _render(request, ctx, export_problems=problems)
 
