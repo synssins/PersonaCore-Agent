@@ -53,6 +53,8 @@ def _runtime(plugin_id: str, client: Any) -> Any:
             f"tool:{plugin_id}.read",
             f"tool:{plugin_id}.write",
             "path:/roots/documents",
+            f"args:{plugin_id}.read:read:!path=ws_path",
+            f"args:{plugin_id}.write:action:!path=ws_path,content=opaque",
         ],
         confirmable_conditions=["outside_declared_paths"],
     )

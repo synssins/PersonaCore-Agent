@@ -39,16 +39,35 @@ from workstation_agent.mcp_host.loader import PluginManifest, VerifyResult
 from workstation_agent.mcp_host.permissions import (
     UNINSPECTABLE,
     SessionContext,
+    classify,
     evaluate,
     evaluate_detailed,
-    foreign_args,
     is_absolute_path,
-    is_read_only_tool,
     normalise_path,
-    requires_path,
     safe_name,
+    tool_declaration,
     url_host,
 )
+
+#: The argument declaration the real ``filesystem`` plugin.toml carries, plus
+#: the handful of extra argument names the tests below exercise.  Under
+#: default-deny-on-absence an argument nobody declared refuses the call, so a
+#: fixture that wants to prove something *other* than "undeclared refuses"
+#: has to say what its arguments are — exactly as a real manifest does.
+_FS_ARGS = [
+    (
+        "args:filesystem.read:read:!path=ws_path,encoding=opaque,payload=opaque,"
+        "n=opaque,flag=opaque,ratio=opaque,opt=opaque"
+    ),
+    # `path` and `paths` are both optional on `list` here because the tests
+    # exercise both spellings; the shipped manifest declares `!path`.
+    "args:filesystem.list:read:path=ws_path,paths=ws_path",
+    # `content` is optional here and required in the shipped manifest: these
+    # tests call `write` with only a path, to exercise the *path* rules
+    # without the required-argument rule firing first.
+    "args:filesystem.write:action:!path=ws_path,content=opaque",
+    "args:filesystem.delete:action:!path=ws_path",
+]
 
 
 def _fs_manifest(
@@ -71,6 +90,7 @@ def _fs_manifest(
             "tool:filesystem.write",
             "tool:filesystem.delete",
             "path:/roots/documents",
+            *_FS_ARGS,
         ],
         confirmable_conditions=(
             ["outside_declared_paths"] if confirmable is None else confirmable
@@ -84,6 +104,27 @@ _GRANTED = {
     "tool:filesystem.write",
     "tool:filesystem.delete",
 }
+
+
+def _plugin_with(plugin_id: str, declared: list[str]) -> PluginManifest:
+    """A bare manifest carrying exactly *declared*.
+
+    Every declaration in these tests comes through ``declared_permissions``,
+    which is the field ``loader._manifest_dict`` covers with the plugin
+    signature.  There is deliberately no way to hand :func:`evaluate` a
+    declaration from anywhere else.
+    """
+    return PluginManifest(
+        id=plugin_id,
+        name=plugin_id,
+        version="0.1.0",
+        runtime="python",
+        entry=[],
+        plugin_dir=Path(),
+        signature_file=Path("signature.sig"),
+        declared_permissions=list(declared),
+        confirmable_conditions=[],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -219,7 +260,9 @@ def test_declared_root_env_var_is_expanded(monkeypatch) -> None:
         entry=[],
         plugin_dir=Path(),
         signature_file=Path("signature.sig"),
-        declared_permissions=["tool:filesystem.read", r"path:%PCTESTHOME%\Documents"],
+        declared_permissions=[
+            "tool:filesystem.read", r"path:%PCTESTHOME%\Documents", *_FS_ARGS,
+        ],
         confirmable_conditions=["outside_declared_paths"],
     )
     granted = {"tool:filesystem.read"}
@@ -242,7 +285,9 @@ def test_case_insensitive_on_windows_paths(monkeypatch) -> None:
         entry=[],
         plugin_dir=Path(),
         signature_file=Path("signature.sig"),
-        declared_permissions=["tool:filesystem.read", r"path:%PCTESTHOME%\Documents"],
+        declared_permissions=[
+            "tool:filesystem.read", r"path:%PCTESTHOME%\Documents", *_FS_ARGS,
+        ],
         confirmable_conditions=["outside_declared_paths"],
     )
     decision = evaluate(
@@ -307,7 +352,9 @@ def _no_roots_manifest(plugin_id: str = "filesystem") -> PluginManifest:
         entry=[],
         plugin_dir=Path(),
         signature_file=Path("signature.sig"),
-        declared_permissions=["tool:filesystem.read", "tool:filesystem.write"],
+        declared_permissions=[
+            "tool:filesystem.read", "tool:filesystem.write", *_FS_ARGS,
+        ],
         confirmable_conditions=["outside_declared_paths"],
     )
 
@@ -356,7 +403,11 @@ def test_a_call_with_no_path_argument_is_unaffected() -> None:
     m = PluginManifest(
         id="hello_world", name="Hello", version="0.1.0", runtime="python", entry=[],
         plugin_dir=Path(), signature_file=Path("signature.sig"),
-        declared_permissions=["tool:hello_world.echo"], confirmable_conditions=[],
+        declared_permissions=[
+            "tool:hello_world.echo",
+            "args:hello_world.echo:read:!text=opaque",
+        ],
+        confirmable_conditions=[],
     )
     outcome = evaluate_detailed(
         m, "hello_world.echo", {"text": "ping"}, {"tool:hello_world.echo"},
@@ -386,7 +437,11 @@ def test_free_text_arguments_are_not_turned_into_path_violations() -> None:
     m = PluginManifest(
         id="powershell", name="PowerShell", version="0.1.0", runtime="python", entry=[],
         plugin_dir=Path(), signature_file=Path("signature.sig"),
-        declared_permissions=["tool:powershell.run", "cmd:.*"],
+        declared_permissions=[
+            "tool:powershell.run",
+            "cmd:*",
+            "args:powershell.run:action:!command=ws_command",
+        ],
         confirmable_conditions=["command_outside_allowlist"],
     )
     outcome = evaluate_detailed(
@@ -408,17 +463,24 @@ def test_free_text_arguments_are_not_turned_into_path_violations() -> None:
 
 
 def test_path_tool_with_empty_allowlist_denies_when_extraction_finds_nothing() -> None:
-    """THE hole: no roots, and an argument the extractor cannot classify.
+    """THE hole: no roots, and an argument that yields no path candidate.
 
-    ``payload`` is not a path-ish key and ``notes`` carries no separator, no
-    drive letter and no colon, so ``_iter_path_values`` returns ``[]`` — and
-    the empty-candidates short-circuit used to return ``False`` right there,
-    never reaching the empty-allowlist denial.
+    Under the heuristic, ``payload`` was not a path-ish key and ``notes``
+    carried no separator, drive letter or colon, so the extractor returned
+    ``[]`` and the empty-candidates short-circuit returned ``False`` right
+    there, never reaching the empty-allowlist denial.
+
+    The declaration closes it a rung higher up: ``payload`` is declared
+    ``opaque`` (so it genuinely produces no path candidate, exactly as
+    before), and ``filesystem.read`` declares ``!path``, so the call is
+    refused for the argument it did *not* carry rather than for the one it
+    did.  "No path was found" can no longer resolve to "carry on".
     """
-    from workstation_agent.mcp_host.permissions import _iter_path_values
-
     args = {"payload": "notes"}
-    assert _iter_path_values(args) == [], "precondition: the extractor finds nothing here"
+    classified = classify(_no_roots_manifest(), "filesystem.read", args)
+    assert classified.paths == (), "precondition: this argument yields no path candidate"
+    assert classified.undeclared == (), "precondition: it is declared, just not a path"
+    assert classified.missing == ("path",)
 
     outcome = evaluate_detailed(
         _no_roots_manifest(), "filesystem.read", args, {"tool:filesystem.read"},
@@ -460,7 +522,11 @@ def test_swapping_the_checks_would_have_broken_this_and_does_not() -> None:
     m = PluginManifest(
         id="hello_world", name="Hello", version="0.1.0", runtime="python", entry=[],
         plugin_dir=Path(), signature_file=Path("signature.sig"),
-        declared_permissions=["tool:hello_world.echo"], confirmable_conditions=[],
+        declared_permissions=[
+            "tool:hello_world.echo",
+            "args:hello_world.echo:read:!text=opaque",
+        ],
+        confirmable_conditions=[],
     )
     outcome = evaluate_detailed(
         m, "hello_world.echo", {"text": "ping"}, {"tool:hello_world.echo"},
@@ -471,11 +537,22 @@ def test_swapping_the_checks_would_have_broken_this_and_does_not() -> None:
 @pytest.mark.parametrize(
     "tool",
     ["filesystem.read", "filesystem.list", "filesystem.write", "filesystem.delete",
-     "files_read", "files_list", "files_write", "adb_push", "adb_install",
-     "filesystem.some_future_verb", "files_some_future_verb"],
+     "files_read", "files_list", "files_write", "adb_push", "adb_install"],
 )
 def test_path_required_classification(tool: str) -> None:
-    assert requires_path(tool) is True
+    """The successor to ``requires_path``: it is declared, not guessed.
+
+    ``requires_path`` was a hand-maintained set of tool names plus two
+    name-prefix rules (``filesystem.``, ``files_``), so a third-party plugin
+    shipping a tool called ``files_read`` inherited the classification and a
+    first-party family that spelled its verb differently did not.  The same
+    property is now one ``!`` in the tool's own signed manifest.
+    """
+    plugin = "adb" if tool.startswith("adb_") else "files"
+    m = _plugin_with(plugin, [f"tool:{tool}", f"args:{tool}:action:!path=ws_path"])
+    decl = tool_declaration(m, tool)
+    assert decl is not None
+    assert "path" in decl.required
 
 
 @pytest.mark.parametrize(
@@ -483,10 +560,23 @@ def test_path_required_classification(tool: str) -> None:
     # shell_run's `cwd` is OPTIONAL, so a shell_run with no cwd is a normal
     # call with genuinely no path; adb_pull's device_path is on the phone.
     ["shell_run", "adb_pull", "adb_shell", "adb_devices", "serial_read",
-     "hello_world.echo", "clipboard.get", "workstation_status", "", "  "],
+     "hello_world.echo", "clipboard.get", "workstation_status"],
 )
 def test_tools_without_a_mandatory_path_are_not_reclassified(tool: str) -> None:
-    assert requires_path(tool) is False
+    """An optional or foreign path argument is not a required workstation one."""
+    m = _plugin_with(
+        "x", [f"tool:{tool}", f"args:{tool}:action:cwd=ws_path,device_path=foreign"],
+    )
+    decl = tool_declaration(m, tool)
+    assert decl is not None
+    assert decl.required == frozenset()
+
+
+@pytest.mark.parametrize("tool", ["", "  ", None, 123, object(), ["filesystem.read"]])
+def test_a_malformed_tool_id_has_no_declaration(tool: object) -> None:
+    """A tool id is not assumed to be a well-formed string — and no
+    declaration means refused, never waved through."""
+    assert tool_declaration(_fs_manifest(), tool) is None
 
 
 def test_shell_run_without_a_cwd_is_not_denied_by_the_path_rule() -> None:
@@ -494,7 +584,16 @@ def test_shell_run_without_a_cwd_is_not_denied_by_the_path_rule() -> None:
     m = PluginManifest(
         id="shell", name="Shell", version="0.1.0", runtime="python", entry=[],
         plugin_dir=Path(), signature_file=Path("signature.sig"),
-        declared_permissions=["tool:shell_run", "cmd:.*"], confirmable_conditions=[],
+        declared_permissions=[
+            "tool:shell_run",
+            "cmd:*",
+            "path:/roots/documents",
+            # §6: shell_run's cwd is OPTIONAL, and the declaration says so by
+            # not marking it required.  That is the whole of the old
+            # `_PATH_REQUIRED_TOOLS` exception list, stated where it belongs.
+            "args:shell_run:action:!command=ws_command,cwd=ws_path,wait_s=opaque",
+        ],
+        confirmable_conditions=[],
     )
     outcome = evaluate_detailed(m, "shell_run", {"command": "whoami"}, {"tool:shell_run"})
     assert outcome.decision == "allow"
@@ -523,15 +622,19 @@ def test_a_path_that_normalises_away_is_denied_not_skipped(path: str) -> None:
     assert outcome.decision != "confirm"
 
 
-def test_the_extractor_does_find_these_so_requires_path_cannot_catch_them() -> None:
-    """Precondition: this is a *normalisation* failure, not an extraction one.
+def test_the_candidate_exists_so_the_required_rule_cannot_catch_it() -> None:
+    """Precondition: this is a *normalisation* failure, not a classification one.
 
-    Pins why the cycle-2 tool-based fix does not cover this case — the
-    candidate exists, so `requires_path` is satisfied.
+    Pins why the required-argument rule does not cover this case — the
+    argument is present and does produce a candidate, so nothing upstream of
+    the comparison layer objects.  ``.`` normalises to the empty string, and
+    the comparison layer is what has to refuse it.  This is the clearest
+    demonstration in the file that declaring what an argument *is* does
+    nothing about what it *resolves to*.
     """
-    from workstation_agent.mcp_host.permissions import _iter_path_values, normalise_path
-
-    assert _iter_path_values({"path": "."}) == ["."]
+    classified = classify(_fs_manifest(), "filesystem.read", {"path": "."})
+    assert classified.paths == (".",)
+    assert classified.missing == ()
     assert normalise_path(".") == ""
 
 
@@ -579,7 +682,7 @@ def test_a_relative_declared_root_is_ignored() -> None:
     m = PluginManifest(
         id="filesystem", name="Filesystem", version="0.1.0", runtime="python", entry=[],
         plugin_dir=Path(), signature_file=Path("signature.sig"),
-        declared_permissions=["tool:filesystem.read", "path:docs"],
+        declared_permissions=["tool:filesystem.read", "path:docs", *_FS_ARGS],
         confirmable_conditions=["outside_declared_paths"],
     )
     # The root is dropped, so the plugin has no usable root at all and the
@@ -600,6 +703,24 @@ def test_a_relative_declared_root_is_ignored() -> None:
 # ---------------------------------------------------------------------------
 
 
+#: What the adb family's arguments are.  §6: "adb_push, adb_install and
+#: files_* take workstation paths", which says by implication that the rest of
+#: the family does not — a phone path or a phone command can never be inside a
+#: Windows root, and comparing it to one denies every legitimate call.
+#:
+#: Under the heuristic this lived in a hard-coded table in permissions.py
+#: keyed on ``(manifest.id, tool-name prefix)``.  It is now the plugin's own
+#: signed statement about its own arguments, which is both narrower (nothing
+#: is inherited by anything) and auditable by whoever grants the plugin.
+_ADB_ARGS = [
+    "args:adb_pull:read:serial=opaque,!device_path=foreign,remote_path=foreign",
+    "args:adb_push:action:serial=opaque,!workstation_path=ws_path,!device_path=foreign",
+    "args:adb_install:action:serial=opaque,!workstation_path=ws_path",
+    "args:adb_shell:action:serial=opaque,!command=foreign",
+    "args:adb_logcat:read:serial=opaque,seconds=opaque,filter=foreign",
+]
+
+
 def _adb_manifest() -> PluginManifest:
     return PluginManifest(
         id="adb", name="ADB", version="0.1.0", runtime="python", entry=[],
@@ -608,6 +729,7 @@ def _adb_manifest() -> PluginManifest:
             "tool:adb_pull", "tool:adb_push", "tool:adb_install",
             "tool:adb_shell", "tool:adb_logcat",
             "path:/roots/documents",
+            *_ADB_ARGS,
         ],
         confirmable_conditions=["outside_declared_paths"],
     )
@@ -725,51 +847,71 @@ def test_an_unrecognised_adb_argument_is_still_checked() -> None:
     assert outcome.decision != "allow"
 
 
-def _plugin(plugin_id: str) -> PluginManifest:
-    return PluginManifest(
-        id=plugin_id, name=plugin_id, version="0.1.0", runtime="python", entry=[],
-        plugin_dir=Path(), signature_file=Path("signature.sig"),
-        declared_permissions=[], confirmable_conditions=[],
-    )
-
-
 @pytest.mark.parametrize(
     ("plugin_id", "tool", "expected"),
     [
-        ("adb", "adb_pull", {"device_path", "remote_path", "command", "filter"}),
-        ("serial", "serial_write", {"text", "hex", "data", "until"}),
-        # Right plugin, wrong family of tool.
-        ("adb", "filesystem.read", set()),
-        ("serial", "adb_pull", set()),
-        # Right-looking tool, wrong plugin — the cycle-4 hole.
-        ("adblock", "adb_run", set()),
-        ("thirdparty", "adb_pull", set()),
-        ("evil", "serial_write", set()),
-        ("filesystem", "files_read", set()),
-        ("shell", "shell_run", set()),
-        ("adb", "", set()),
+        ("adb", "adb_pull", {"device_path": "foreign", "remote_path": "foreign",
+                             "serial": "opaque"}),
+        ("adb", "adb_shell", {"command": "foreign", "serial": "opaque"}),
+        ("adb", "adb_push", {"workstation_path": "ws_path", "device_path": "foreign",
+                             "serial": "opaque"}),
     ],
 )
-def test_foreign_argument_classification(plugin_id: str, tool: str, expected: set) -> None:
-    assert set(foreign_args(_plugin(plugin_id), tool)) == expected
+def test_foreign_argument_classification(plugin_id: str, tool: str, expected: dict) -> None:
+    """Classification comes from the manifest, argument by argument.
+
+    Replaces the ``foreign_args`` table test.  What that test proved — that
+    ``device_path`` is foreign under adb and ``workstation_path`` is not —
+    is proved here from the declaration instead of from a hard-coded
+    ``(plugin id, tool prefix)`` tuple.
+    """
+    m = _plugin_with(plugin_id, [f"tool:{tool}", *_ADB_ARGS])
+    decl = tool_declaration(m, tool)
+    assert decl is not None
+    assert dict(decl.arguments) == expected
+
+
+@pytest.mark.parametrize(
+    ("plugin_id", "tool"),
+    [
+        # Right plugin, wrong family of tool.
+        ("adb", "filesystem.read"),
+        ("serial", "adb_devices"),
+        # Right-looking tool, wrong plugin — the cycle-4 hole.
+        ("adblock", "adb_run"),
+        ("thirdparty", "adb_something"),
+        ("adb", ""),
+    ],
+)
+def test_a_tool_the_manifest_does_not_name_has_no_declaration(
+    plugin_id: str, tool: str,
+) -> None:
+    """No entry, no classification — and no classification means refused."""
+    m = _plugin_with(plugin_id, [f"tool:{tool}", *_ADB_ARGS])
+    assert tool_declaration(m, tool) is None
 
 
 # ---------------------------------------------------------------------------
 # Cycle-4 finding 2: the exemption was inheritable by any plugin
+#
+# It is now inheritable by nothing at all.  The exemption used to key off the
+# tool NAME — caller-supplied — and cycle 4 narrowed that to (manifest.id,
+# tool-name prefix).  Under the declaration nothing is keyed on a name at
+# all: an argument is exempt because the plugin's own signed manifest says
+# that argument is foreign, and a plugin that says nothing gets nothing.
 # ---------------------------------------------------------------------------
 
 
 def test_a_third_party_plugin_cannot_inherit_the_adb_exemption() -> None:
     """A plugin shipping ``adb_run`` must not get ``command`` waved through.
 
-    The exemption used to key off the tool name alone, which is
-    caller-supplied.  ``manifest.id`` comes from a signed plugin.toml, so
-    both halves must now agree.
+    Its manifest declares ``command`` a workstation command (or nothing at
+    all), so it is judged against a ``cmd:`` allowlist it does not have.
+    Naming a tool ``adb_*`` buys it exactly nothing.
     """
-    m = PluginManifest(
-        id="adblock", name="Adblock", version="0.1.0", runtime="python", entry=[],
-        plugin_dir=Path(), signature_file=Path("signature.sig"),
-        declared_permissions=["tool:adb_run"], confirmable_conditions=[],
+    m = _plugin_with(
+        "adblock",
+        ["tool:adb_run", "args:adb_run:action:!command=ws_command"],
     )
     outcome = evaluate_detailed(
         m, "adb_run", {"command": "powershell -enc ..."}, {"tool:adb_run"},
@@ -778,13 +920,25 @@ def test_a_third_party_plugin_cannot_inherit_the_adb_exemption() -> None:
     assert outcome.decision != "allow"
 
 
-def test_the_real_adb_plugin_keeps_its_exemption() -> None:
-    """…while the plugin that actually owns the family still works."""
-    m = PluginManifest(
-        id="adb", name="ADB", version="0.1.0", runtime="python", entry=[],
-        plugin_dir=Path(), signature_file=Path("signature.sig"),
-        declared_permissions=["tool:adb_shell"], confirmable_conditions=[],
+def test_an_undeclared_lookalike_tool_is_refused_outright() -> None:
+    """…and a plugin that declares nothing about ``adb_run`` gets refused.
+
+    The heuristic's failure here was silent: ``adb_run`` matched the ``adb_``
+    prefix and its ``command`` was skipped.  Saying nothing now costs the
+    call, which is the only direction "we do not know what this is" may fail
+    in.
+    """
+    m = _plugin_with("adblock", ["tool:adb_run"])
+    outcome = evaluate_detailed(
+        m, "adb_run", {"command": "powershell -enc ..."}, {"tool:adb_run"},
     )
+    assert outcome.decision == "deny"
+    assert outcome.rule == "undeclared_tool"
+
+
+def test_the_real_adb_plugin_keeps_its_exemption() -> None:
+    """…while the plugin that actually declares the exemption still works."""
+    m = _plugin_with("adb", ["tool:adb_shell", *_ADB_ARGS])
     outcome = evaluate_detailed(
         m, "adb_shell", {"serial": "R1", "command": "getprop ro.product.model"},
         {"tool:adb_shell"},
@@ -793,10 +947,9 @@ def test_the_real_adb_plugin_keeps_its_exemption() -> None:
 
 
 def test_a_third_party_plugin_cannot_inherit_the_serial_exemption() -> None:
-    m = PluginManifest(
-        id="notserial", name="Not Serial", version="0.1.0", runtime="python", entry=[],
-        plugin_dir=Path(), signature_file=Path("signature.sig"),
-        declared_permissions=["tool:serial_send"], confirmable_conditions=[],
+    m = _plugin_with(
+        "notserial",
+        ["tool:serial_send", "args:serial_send:action:!text=ws_path"],
     )
     outcome = evaluate_detailed(
         m, "serial_send", {"text": r"C:\Windows\System32\config\SAM"}, {"tool:serial_send"},
@@ -814,7 +967,11 @@ def _cmd_manifest(patterns: list[str]) -> PluginManifest:
     return PluginManifest(
         id="powershell", name="PowerShell", version="0.1.0", runtime="python", entry=[],
         plugin_dir=Path(), signature_file=Path("signature.sig"),
-        declared_permissions=["tool:powershell.run", *patterns],
+        declared_permissions=[
+            "tool:powershell.run",
+            "args:powershell.run:action:!command=ws_command,intent=opaque",
+            *patterns,
+        ],
         confirmable_conditions=[],
     )
 
@@ -829,7 +986,13 @@ def _cmd_manifest(patterns: list[str]) -> PluginManifest:
     ],
 )
 def test_a_nested_command_is_still_checked(args: dict) -> None:
-    """``args.get("command")`` saw nothing, so both checkers returned allow."""
+    """``args.get("command")`` saw nothing, so both checkers returned allow.
+
+    Still refused, for a stronger reason than recursion: contract §5.1 says
+    arguments are flat, so ``config`` and ``steps`` are not shapes any
+    declaration names — and an argument nothing declares refuses the call.
+    A command cannot hide one level down because there is no "down".
+    """
     outcome = evaluate_detailed(
         _cmd_manifest(["cmd:git"]), "powershell.run", args, {"tool:powershell.run"},
     )
@@ -837,20 +1000,42 @@ def test_a_nested_command_is_still_checked(args: dict) -> None:
     assert outcome.decision != "allow"
 
 
-def test_a_nested_allowed_command_is_still_allowed() -> None:
-    """Recursing must not deny what the allowlist permits."""
+def test_a_declared_allowed_command_is_still_allowed() -> None:
+    """Refusing the nested shape must not deny what the allowlist permits.
+
+    CHANGED OUTCOME.  This used to assert ``{"config": {"command": "git"}}``
+    is allowed, which was the "recursing must not over-deny" half of the
+    cycle-4 fix.  With classification declared rather than recursive there is
+    no recursion to over-deny with, and the nested spelling is refused as an
+    undeclared argument — asserted immediately below, so the pair still pins
+    both directions.
+    """
+    outcome = evaluate_detailed(
+        _cmd_manifest(["cmd:git"]), "powershell.run",
+        {"command": "git"}, {"tool:powershell.run"},
+    )
+    assert outcome.decision == "allow"
+
+
+def test_the_nested_spelling_is_refused_as_undeclared() -> None:
+    """The other half: nesting is not a shape a declaration can name."""
     outcome = evaluate_detailed(
         _cmd_manifest(["cmd:git"]), "powershell.run",
         {"config": {"command": "git"}}, {"tool:powershell.run"},
     )
-    assert outcome.decision == "allow"
+    assert outcome.decision == "deny"
+    assert outcome.rule == "undeclared_argument"
 
 
 def _dom_manifest(patterns: list[str]) -> PluginManifest:
     return PluginManifest(
         id="browser", name="Browser", version="0.1.0", runtime="python", entry=[],
         plugin_dir=Path(), signature_file=Path("signature.sig"),
-        declared_permissions=["tool:browser.open", *patterns],
+        declared_permissions=[
+            "tool:browser.open",
+            "args:browser.open:action:!url=web_target",
+            *patterns,
+        ],
         confirmable_conditions=[],
     )
 
@@ -872,20 +1057,29 @@ def test_a_nested_url_is_still_checked(args: dict) -> None:
     assert outcome.decision != "allow"
 
 
-def test_a_nested_allowed_url_is_still_allowed() -> None:
+def test_a_declared_allowed_url_is_still_allowed() -> None:
+    """CHANGED OUTCOME, for the same reason as the command case above: the
+    nested spelling is now refused, and the declared one still works."""
     outcome = evaluate_detailed(
         _dom_manifest(["domain:safe.example.com"]), "browser.open",
-        {"config": {"url": "https://safe.example.com/x"}}, {"tool:browser.open"},
+        {"url": "https://safe.example.com/x"}, {"tool:browser.open"},
     )
     assert outcome.decision == "allow"
 
 
 def test_a_command_buried_below_the_recursion_bound_denies() -> None:
+    """No recursion bound left to bury anything below.
+
+    The heuristic walked arbitrary structures and had to decide what
+    exceeding its own bound meant; ``payload`` is simply not an argument
+    ``powershell.run`` declares, so the depth of what is inside it never
+    comes up.
+    """
     deep: object = {"command": "curl evil.com"}
     for _ in range(12):
         deep = {"nested": deep}
     outcome = evaluate_detailed(
-        _cmd_manifest(["cmd:.*"]), "powershell.run", {"payload": deep},  # type: ignore[dict-item]
+        _cmd_manifest(["cmd:*"]), "powershell.run", {"payload": deep},  # type: ignore[dict-item]
         {"tool:powershell.run"},
     )
     assert outcome.decision != "allow"
@@ -1069,27 +1263,83 @@ def test_the_bare_star_still_means_anywhere() -> None:
         assert outcome.decision == "allow", url
 
 
-def test_command_patterns_are_regexes_by_design_not_globs() -> None:
-    """The `cmd:` path never had the translation defect — it never translated.
+def test_command_and_domain_patterns_are_one_language_now() -> None:
+    r"""CHANGED OUTCOME — the cmd:/domain: language split, resolved.
 
-    Documented rather than assumed: `cmd:` is passed to re.fullmatch
-    unchanged, which is why `cmd:.*` works in the shipped powershell
-    manifest.  A dot in a cmd pattern is therefore a regex dot; the fix for
-    that is `cmd:git\\.exe` in the manifest, not escaping here (which would
-    break `cmd:.*`).
+    ``cmd:`` used to be a raw regex and ``domain:`` a glob, in the same
+    manifest, with nothing marking which was which.  Both are globs now,
+    both go through the same escaper, and ``re:`` is the explicit escape
+    hatch in either class.
+
+    Consequences asserted here rather than left implicit:
+
+    * ``cmd:git.exe`` is a literal and no longer matches ``gitXexe``.  Under
+      the old semantics it did, which is the footgun the previous docstring
+      documented and told authors to work around with ``cmd:git\.exe``.
+    * ``cmd:.*`` now means "a literal dot, then anything" — so a manifest
+      written for the old regex semantics *tightens*, and the shipped
+      ``powershell`` manifest is changed to ``cmd:*`` in the same commit.
+    * ``cmd:*`` and ``domain:*`` both mean "anything", which they did not
+      before.
     """
-    # A regex metacharacter behaves as a regex metacharacter…
-    assert evaluate(
-        _cmd_manifest(["cmd:.*"]), "powershell.run",
-        {"command": "anything at all"}, {"tool:powershell.run"},
-    ) == "allow"
-    # …and an escaped pattern confines exactly.
-    m = _cmd_manifest([r"cmd:git\.exe"])
+    # A dot in an untagged pattern is a literal dot, in both classes.
+    m = _cmd_manifest(["cmd:git.exe"])
     assert evaluate(
         m, "powershell.run", {"command": "git.exe"}, {"tool:powershell.run"},
     ) == "allow"
     assert evaluate(
         m, "powershell.run", {"command": "gitXexe"}, {"tool:powershell.run"},
+    ) == "deny"
+
+    # The old regex spelling fails CLOSED rather than opening up.
+    assert evaluate(
+        _cmd_manifest(["cmd:.*"]), "powershell.run",
+        {"command": "anything at all"}, {"tool:powershell.run"},
+    ) == "deny"
+
+    # The bare star is "anything" in both classes.
+    assert evaluate(
+        _cmd_manifest(["cmd:*"]), "powershell.run",
+        {"command": "anything at all"}, {"tool:powershell.run"},
+    ) == "allow"
+
+
+def test_the_regex_escape_hatch_is_spelled_out() -> None:
+    """``re:`` selects a regex explicitly, in both allowlist classes."""
+    m = _cmd_manifest([r"cmd:re:git\.(exe|cmd)"])
+    for command, expected in (("git.exe", "allow"), ("git.cmd", "allow"),
+                              ("gitXexe", "deny"), ("git.bat", "deny")):
+        assert evaluate(
+            m, "powershell.run", {"command": command}, {"tool:powershell.run"},
+        ) == expected, command
+
+    d = _dom_manifest([r"domain:re:(api|cdn)\.example\.com"])
+    for url, expected in (("https://api.example.com/x", "allow"),
+                          ("https://cdn.example.com/x", "allow"),
+                          ("https://evil.example.com/x", "deny"),
+                          ("https://apiXexample.com/x", "deny")):
+        assert evaluate(
+            d, "browser.open", {"url": url}, {"tool:browser.open"},
+        ) == expected, url
+
+
+def test_the_shared_escaper_protects_the_command_class_too() -> None:
+    """The escaping fix now covers ``cmd:`` as well as ``domain:``.
+
+    ``domain:*.example.com`` once admitted ``evil-example.com`` because the
+    translation left literal dots unescaped.  ``cmd:`` never had that bug
+    only because it never translated — the moment it acquired a wildcard it
+    would have.  One translator means the fix is already there.
+    """
+    m = _cmd_manifest(["cmd:git *"])
+    assert evaluate(
+        m, "powershell.run", {"command": "git status"}, {"tool:powershell.run"},
+    ) == "allow"
+    assert evaluate(
+        m, "powershell.run", {"command": "gitXstatus"}, {"tool:powershell.run"},
+    ) == "deny"
+    assert evaluate(
+        m, "powershell.run", {"command": "notgit status"}, {"tool:powershell.run"},
     ) == "deny"
 
 
@@ -1119,7 +1369,7 @@ def test_a_structure_under_an_exempt_key_does_not_hide_a_workstation_path() -> N
     m = PluginManifest(
         id="adb", name="ADB", version="0.1.0", runtime="python", entry=[],
         plugin_dir=Path(), signature_file=Path("signature.sig"),
-        declared_permissions=["tool:adb_pull", "path:/roots/documents"],
+        declared_permissions=["tool:adb_pull", "path:/roots/documents", *_ADB_ARGS],
         confirmable_conditions=[],
     )
     outcome = evaluate_detailed(
@@ -1143,7 +1393,7 @@ def test_only_scalars_are_exempt(value: object) -> None:
     m = PluginManifest(
         id="adb", name="ADB", version="0.1.0", runtime="python", entry=[],
         plugin_dir=Path(), signature_file=Path("signature.sig"),
-        declared_permissions=["tool:adb_pull", "path:/roots/documents"],
+        declared_permissions=["tool:adb_pull", "path:/roots/documents", *_ADB_ARGS],
         confirmable_conditions=[],
     )
     outcome = evaluate_detailed(
@@ -1157,7 +1407,7 @@ def test_a_scalar_under_an_exempt_key_is_still_exempt() -> None:
     m = PluginManifest(
         id="adb", name="ADB", version="0.1.0", runtime="python", entry=[],
         plugin_dir=Path(), signature_file=Path("signature.sig"),
-        declared_permissions=["tool:adb_pull", "path:/roots/documents"],
+        declared_permissions=["tool:adb_pull", "path:/roots/documents", *_ADB_ARGS],
         confirmable_conditions=[],
     )
     outcome = evaluate_detailed(
@@ -1171,7 +1421,8 @@ def test_a_structure_under_an_exempt_command_key_is_also_refused() -> None:
     m = PluginManifest(
         id="adb", name="ADB", version="0.1.0", runtime="python", entry=[],
         plugin_dir=Path(), signature_file=Path("signature.sig"),
-        declared_permissions=["tool:adb_shell", "cmd:.*"], confirmable_conditions=[],
+        declared_permissions=["tool:adb_shell", "cmd:*", *_ADB_ARGS],
+        confirmable_conditions=[],
     )
     outcome = evaluate_detailed(
         m, "adb_shell", {"command": {"inner": "whoami"}}, {"tool:adb_shell"},
@@ -1185,7 +1436,14 @@ def test_serial_write_payload_is_not_a_workstation_path() -> None:
     m = PluginManifest(
         id="serial", name="Serial", version="0.1.0", runtime="python", entry=[],
         plugin_dir=Path(), signature_file=Path("signature.sig"),
-        declared_permissions=["tool:serial_write"], confirmable_conditions=[],
+        declared_permissions=[
+            "tool:serial_write",
+            # §6: a serial payload is not a workstation path.  Declared by
+            # the serial plugin about its own arguments, rather than
+            # pre-emptively hard-coded in the gate on B8's behalf.
+            "args:serial_write:action:!session_id=opaque,text=foreign,hex=foreign",
+        ],
+        confirmable_conditions=[],
     )
     outcome = evaluate_detailed(
         m, "serial_write", {"session_id": "s1", "text": "/status\r\n"},
@@ -1203,7 +1461,7 @@ def _unc_manifest(root: str) -> PluginManifest:
     return PluginManifest(
         id="filesystem", name="Filesystem", version="0.1.0", runtime="python", entry=[],
         plugin_dir=Path(), signature_file=Path("signature.sig"),
-        declared_permissions=["tool:filesystem.read", f"path:{root}"],
+        declared_permissions=["tool:filesystem.read", f"path:{root}", *_FS_ARGS],
         confirmable_conditions=["outside_declared_paths"],
     )
 
@@ -1438,15 +1696,33 @@ def test_separatorless_paths_are_still_checked(key: str, value: str) -> None:
 def test_urls_are_not_mistaken_for_paths() -> None:
     """``http://`` is the domain allowlist's business, not the path guard's.
 
-    A drive letter is one character before the colon, so a real URI scheme
-    can never be confused for one.
-    """
-    from workstation_agent.mcp_host.permissions import _value_is_unambiguously_a_path
+    The heuristic decided this by inspecting the value: a colon one character
+    in was a drive letter, a longer scheme was a URI, and ``file://`` was
+    special-cased back to being a path.  Three shape rules to answer a
+    question the manifest can simply state.
 
-    assert _value_is_unambiguously_a_path("https://example.com/x") is False
-    assert _value_is_unambiguously_a_path("http://example.com") is False
-    # …but file:// is unambiguously a path.
-    assert _value_is_unambiguously_a_path("file:///C:/Windows/x") is True
+    Asserted here as a routing property, which is what it always was: a
+    ``web_target`` never reaches the path guard and a ``ws_path`` never
+    reaches the domain guard, whatever either value happens to look like.
+    """
+    m = _plugin_with(
+        "mixed",
+        [
+            "tool:mixed.go",
+            "path:/roots/documents",
+            "domain:example.com",
+            "args:mixed.go:action:url=web_target,path=ws_path",
+        ],
+    )
+    classified = classify(
+        m, "mixed.go",
+        {"url": "https://example.com/x", "path": "file:///C:/Windows/x"},
+    )
+    assert classified.domains == ("https://example.com/x",)
+    assert classified.paths == ("file:///C:/Windows/x",)
+    # …and a URL-shaped value under a path argument is still confined,
+    # rather than escaping the path guard for looking like a URL.
+    assert evaluate(m, "mixed.go", {"path": "https://example.com/x"}, {"tool:mixed.go"}) == "deny"
 
 
 # ---------------------------------------------------------------------------
@@ -1572,25 +1848,45 @@ def test_safe_name_bounds_an_absurd_tool_name() -> None:
      "serial_read", "jobs_output", "workstation_status", "FILESYSTEM.READ"],
 )
 def test_known_reads_classify_as_reads(tool: str) -> None:
-    assert is_read_only_tool(tool) is True
+    """The read/action mode is declared, and the tool id is case-folded.
+
+    ``is_read_only_tool`` inferred this from the last segment of the tool
+    name against a verb allowlist, so ``filesystem.list_recent`` decomposed
+    to ``recent`` and a family that spelled a read ``fetch`` was silently an
+    action.  Declared instead; the fallback is unchanged in direction, since
+    the absence of a declaration refuses the call outright.
+    """
+    m = _plugin_with("x", [f"tool:{tool}", f"args:{tool}:read"])
+    decl = tool_declaration(m, tool)
+    assert decl is not None
+    assert decl.read_only is True
 
 
 @pytest.mark.parametrize(
     "tool",
     ["filesystem.write", "filesystem.delete", "files_write", "shell_run",
-     "serial_write", "adb_push", "clipboard.set", "desktop.click", "",
-     "   ", "filesystem.list_recent"],
+     "serial_write", "adb_push", "clipboard.set", "desktop.click",
+     "filesystem.list_recent"],
 )
 def test_actions_and_unknowns_classify_as_actions(tool: str) -> None:
-    """Unknown verbs are actions: the safe default, since the only effect of
-    the read classification is to turn a prompt into a denial."""
-    assert is_read_only_tool(tool) is False
+    """An ``action`` mode is an action; nothing is inferred from the verb."""
+    m = _plugin_with("x", [f"tool:{tool}", f"args:{tool}:action"])
+    decl = tool_declaration(m, tool)
+    assert decl is not None
+    assert decl.read_only is False
 
 
-@pytest.mark.parametrize("tool", [None, 123, object(), ["filesystem.read"]])
-def test_a_malformed_tool_id_is_an_action(tool: object) -> None:
-    """A tool id is not assumed to be a well-formed string."""
-    assert is_read_only_tool(tool) is False  # type: ignore[arg-type]
+@pytest.mark.parametrize("mode", ["", "  ", "reads", "READ ONLY", "maybe", "*"])
+def test_an_unrecognised_mode_discards_the_declaration(mode: str) -> None:
+    """A malformed declaration is dropped, not partially honoured.
+
+    Dropping it means the tool has no declaration, which means the call is
+    refused: a typo in a manifest costs a visible over-denial rather than a
+    tool whose mode quietly defaulted to something.
+    """
+    m = _plugin_with("x", ["tool:t", f"args:t:{mode}:!path=ws_path"])
+    assert tool_declaration(m, "t") is None
+    assert evaluate(m, "t", {"path": "/x"}, {"tool:t"}) == "deny"
 
 
 def test_normalise_path_is_lexical_not_filesystem_backed() -> None:
@@ -1615,7 +1911,15 @@ def test_a_malformed_allowlist_regex_denies_rather_than_raising() -> None:
         entry=[],
         plugin_dir=Path(),
         signature_file=Path("signature.sig"),
-        declared_permissions=["tool:powershell.run", "cmd:[unclosed"],
+        declared_permissions=[
+            "tool:powershell.run",
+            "args:powershell.run:action:!command=ws_command",
+            # Marked `re:`, so it really does reach re.compile and really is
+            # unparseable.  An UNTAGGED `cmd:[unclosed` is now a glob, which
+            # is escaped and matches the literal text — no longer a way to
+            # exercise this path.
+            "cmd:re:[unclosed",
+        ],
         confirmable_conditions=[],
     )
     decision = evaluate(m, "powershell.run", {"command": "whoami"}, {"tool:powershell.run"})
@@ -1785,7 +2089,11 @@ async def test_invoke_plumbs_the_session_into_evaluate_and_the_audit_row(
         return_value={"content": [{"type": "text", "text": "ok"}], "isError": False},
     )
     manifest = _fs_manifest(plugin_id="sess_plugin")
-    manifest.declared_permissions = ["tool:sess_plugin.read", "path:/roots/documents"]
+    manifest.declared_permissions = [
+        "tool:sess_plugin.read",
+        "path:/roots/documents",
+        "args:sess_plugin.read:read:!path=ws_path",
+    ]
     runtime = host_mod._PluginRuntime(
         manifest=manifest,
         verify_result=VerifyResult(status="unsigned"),
@@ -1819,7 +2127,11 @@ async def test_invoke_without_a_session_still_works(isolated_audit_db) -> None:
         return_value={"content": [{"type": "text", "text": "ok"}], "isError": False},
     )
     manifest = _fs_manifest(plugin_id="nosess")
-    manifest.declared_permissions = ["tool:nosess.read", "path:/roots/documents"]
+    manifest.declared_permissions = [
+        "tool:nosess.read",
+        "path:/roots/documents",
+        "args:nosess.read:read:!path=ws_path",
+    ]
     runtime = host_mod._PluginRuntime(
         manifest=manifest,
         verify_result=VerifyResult(status="unsigned"),

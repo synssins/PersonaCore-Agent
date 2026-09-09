@@ -9,6 +9,9 @@ declared_permissions = [
   "tool:clipboard.clear",
   "clipboard.read",
   "clipboard.write",
+  "args:clipboard.get:read",
+  "args:clipboard.set:action:!text=opaque",
+  "args:clipboard.clear:action",
 ]
 confirmable_conditions = []
 

@@ -5,7 +5,12 @@ runtime = "python"
 entry = ["-m", "workstation_agent.plugins.powershell"]
 declared_permissions = [
   "tool:powershell.run",
-  "cmd:.*",
+  # "cmd:*" is the glob "anything", and replaces the regex "cmd:.*" this
+  # manifest used to declare.  Allowlist patterns are globs in both the cmd:
+  # and domain: classes now, with "re:" as the explicit regex escape hatch;
+  # an untagged "cmd:.*" would today mean "a literal dot, then anything".
+  "cmd:*",
+  "args:powershell.run:action:!intent=opaque,!command=ws_command,timeout_s=opaque",
 ]
 confirmable_conditions = ["command_outside_allowlist"]
 

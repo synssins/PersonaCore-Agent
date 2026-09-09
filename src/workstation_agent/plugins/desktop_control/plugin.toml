@@ -10,6 +10,11 @@ declared_permissions = [
   "tool:desktop.list_windows",
   "tool:desktop.focus_window",
   "desktop.control",
+  "args:desktop.click:action:!x=opaque,!y=opaque",
+  "args:desktop.type:action:!text=opaque",
+  "args:desktop.key:action:!combo=opaque",
+  "args:desktop.list_windows:read",
+  "args:desktop.focus_window:action:!title_pattern=opaque",
 ]
 confirmable_conditions = []
 

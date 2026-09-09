@@ -25,6 +25,17 @@ from workstation_agent.mcp_host.loader import PluginManifest, VerifyResult
 from workstation_agent.mcp_host.supervisor import ResourceLimits, SubprocessHandle
 
 
+def _write_args(plugin_id: str) -> str:
+    """The argument declaration a ``<plugin>.write`` fixture needs.
+
+    Under default-deny-on-absence a manifest has to say what its tool's
+    arguments are before anything downstream (the path guard, the confirm
+    branch) can be reached at all.  These fixtures are testing the *confirm*
+    machinery, so they declare the minimum that gets them there.
+    """
+    return f"args:{plugin_id}.write:action:!path=ws_path"
+
+
 def _make_manifest(plugin_id: str = "fake", declared_permissions=None) -> PluginManifest:
     return PluginManifest(
         id=plugin_id,
@@ -224,7 +235,9 @@ async def test_invoke_confirm_rejected(isolated_audit_db):
     """invoke() returns `unconfirmed` when the user rejects the confirm prompt."""
     manifest = _make_manifest("confirm_plugin")
     manifest.confirmable_conditions = ["outside_declared_paths"]
-    manifest.declared_permissions = ["tool:confirm_plugin.write", "path:/safe/"]
+    manifest.declared_permissions = [
+        "tool:confirm_plugin.write", "path:/safe/", _write_args("confirm_plugin"),
+    ]
 
     vresult = VerifyResult(status="unsigned")
     fake_runtime = host_mod._PluginRuntime(
@@ -255,7 +268,9 @@ async def test_invoke_confirm_accepted(isolated_audit_db):
     """invoke() proceeds when confirm_cb returns True."""
     manifest = _make_manifest("confirm_plugin2")
     manifest.confirmable_conditions = ["outside_declared_paths"]
-    manifest.declared_permissions = ["tool:confirm_plugin2.write", "path:/safe/"]
+    manifest.declared_permissions = [
+        "tool:confirm_plugin2.write", "path:/safe/", _write_args("confirm_plugin2"),
+    ]
 
     vresult = VerifyResult(status="unsigned")
     fake_client = AsyncMock()
@@ -432,7 +447,9 @@ async def test_do_confirm_denies_when_no_callback(isolated_audit_db):
     """No confirm callback wired => deny.  The 'silently denied' bug, asserted."""
     manifest = _make_manifest("nocb")
     manifest.confirmable_conditions = ["outside_declared_paths"]
-    manifest.declared_permissions = ["tool:nocb.write", "path:/safe/"]
+    manifest.declared_permissions = [
+        "tool:nocb.write", "path:/safe/", _write_args("nocb"),
+    ]
 
     fake_client = AsyncMock()
     fake_runtime = host_mod._PluginRuntime(
@@ -458,7 +475,9 @@ async def test_do_confirm_denies_when_callback_raises(isolated_audit_db):
     """An exception inside the confirm callback denies; it never allows."""
     manifest = _make_manifest("boomcb")
     manifest.confirmable_conditions = ["outside_declared_paths"]
-    manifest.declared_permissions = ["tool:boomcb.write", "path:/safe/"]
+    manifest.declared_permissions = [
+        "tool:boomcb.write", "path:/safe/", _write_args("boomcb"),
+    ]
 
     fake_client = AsyncMock()
     fake_runtime = host_mod._PluginRuntime(
@@ -490,7 +509,9 @@ async def test_do_confirm_requires_literal_true(isolated_audit_db, answer):
     """Only ``True`` allows — a truthy or odd return value still denies."""
     manifest = _make_manifest("truthy")
     manifest.confirmable_conditions = ["outside_declared_paths"]
-    manifest.declared_permissions = ["tool:truthy.write", "path:/safe/"]
+    manifest.declared_permissions = [
+        "tool:truthy.write", "path:/safe/", _write_args("truthy"),
+    ]
 
     fake_client = AsyncMock()
     fake_runtime = host_mod._PluginRuntime(
@@ -520,7 +541,9 @@ async def test_do_confirm_passes_correlation_id(isolated_audit_db):
     """Every prompt carries a correlation id, and it reaches the audit row."""
     manifest = _make_manifest("corr")
     manifest.confirmable_conditions = ["outside_declared_paths"]
-    manifest.declared_permissions = ["tool:corr.write", "path:/safe/"]
+    manifest.declared_permissions = [
+        "tool:corr.write", "path:/safe/", _write_args("corr"),
+    ]
 
     fake_client = AsyncMock()
     fake_client.tools_call = AsyncMock(return_value={
@@ -655,7 +678,8 @@ async def test_stop_skips_already_closed(isolated_audit_db):
 async def test_invoke_tool_error_logged(isolated_audit_db):
     """When tools_call raises, a tool_error audit event is written."""
     manifest = _make_manifest(
-        "err_plugin", declared_permissions=["tool:err_plugin.fail"],
+        "err_plugin",
+        declared_permissions=["tool:err_plugin.fail", "args:err_plugin.fail:action"],
     )
     vresult = VerifyResult(status="unsigned")
     fake_client = AsyncMock()

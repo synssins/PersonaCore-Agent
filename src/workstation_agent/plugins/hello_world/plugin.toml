@@ -3,7 +3,10 @@ name = "Hello World"
 version = "0.1.0"
 runtime = "python"
 entry = ["-m", "workstation_agent.plugins.hello_world"]
-declared_permissions = ["tool:hello_world.echo"]
+declared_permissions = [
+  "tool:hello_world.echo",
+  "args:hello_world.echo:read:!text=opaque",
+]
 confirmable_conditions = []
 
 [compat]

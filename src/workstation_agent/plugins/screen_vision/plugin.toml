@@ -8,6 +8,14 @@ declared_permissions = [
   "tool:screen.capture_ocr",
   "tool:screen.list_monitors",
   "screen.capture",
+  # "region" is declared opaque, and an exempt class is scalar-only: a
+  # structured region object is refused until the argument is flattened.
+  # A visible over-denial, and the correct direction -- an exempt key that
+  # swallowed a structure is how a workstation path once hid from root
+  # comparison.
+  "args:screen.capture:read:monitor=opaque,region=opaque",
+  "args:screen.capture_ocr:read:monitor=opaque,region=opaque",
+  "args:screen.list_monitors:read",
 ]
 confirmable_conditions = []
 

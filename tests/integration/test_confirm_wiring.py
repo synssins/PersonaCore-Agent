@@ -174,7 +174,13 @@ def _confirm_runtime(plugin_id: str, client):
         entry=[],
         plugin_dir=__import__("pathlib").Path(),
         signature_file=__import__("pathlib").Path("signature.sig"),
-        declared_permissions=[f"tool:{plugin_id}.write", "path:/safe/"],
+        declared_permissions=[
+            f"tool:{plugin_id}.write",
+            "path:/safe/",
+            # Default-deny on absence: the manifest has to say what the
+            # tool's arguments are before the confirm branch is reachable.
+            f"args:{plugin_id}.write:action:!path=ws_path",
+        ],
         confirmable_conditions=["outside_declared_paths"],
     )
     return host_mod._PluginRuntime(

@@ -6,14 +6,66 @@ The decision is one of:
 * ``"allow"``   — the call is within all declared permissions and no
                   confirmable condition is triggered.
 * ``"deny"``    — the call violates a hard constraint (tool not in granted
-                  permissions, path outside declared scope, unknown condition,
-                  or a *read* whose path lies outside the declared roots).
+                  permissions, tool or argument not declared, a missing
+                  required argument, a path outside declared scope, an unknown
+                  condition, or a *read* whose path lies outside the declared
+                  roots).
 * ``"confirm"`` — the call is allowed in principle but a confirmable condition
                   is triggered; the host must present a user prompt.
 
 Built-in condition checkers are registered in :data:`CONDITION_CHECKERS`.  Each
 checker receives ``(manifest, tool, args)`` and returns ``True`` when the
 condition is met (i.e. the call *would* violate the guard).
+
+Two layers, and only one of them changed
+----------------------------------------
+This module does two separable jobs, and it is worth naming them because the
+first was rewritten and the second was carried across untouched.
+
+**Classification** — "what IS this argument?"  Until B2b this was inferred
+from the *shape* of the value and the *spelling* of the key: does the string
+start with a drive letter, does the key contain the substring ``file``, does
+the tool name start with ``adb_``.  Six verification rounds each found the
+same bug in a new costume — the classifier met an argument shape nobody had
+anticipated.  Some shapes permitted, some denied, and which was not
+predictable in advance.  A control whose failure direction is unpredictable
+cannot be reasoned about, only patched.
+
+Classification is now **declared**, per tool, per argument, in the signed
+``plugin.toml`` — see :func:`parse_declarations`.  There is no sniffing left:
+an argument is a workstation path because its plugin's signed manifest says
+so, and for no other reason.
+
+**Comparison** — "is this path inside that root?"  Unchanged, deliberately.
+``normalise_path``, ``_is_within``, ``url_host``, ``_classify_segment``,
+``is_absolute_path``, ``declared_roots``, the UNC rules, the device-namespace
+rules, the trailing-padding rules, the :data:`UNINSPECTABLE` semantics and the
+glob escaping are each a closed, mutation-proven finding.  They were moved
+across verbatim.  Declaring what an argument *is* does nothing whatever about
+``..``, UNC, trailing dots or userinfo — those live entirely after
+classification, and weakening them on the theory that the declaration makes
+them unnecessary would reopen every one of them.
+
+Default-deny on absence
+-----------------------
+A tool with no ``args:`` declaration is **refused**, and so is a call carrying
+an argument its tool's declaration does not name.  This is the property that
+makes the declaration a control rather than an opt-in bypass: if absence meant
+"allow", any plugin could escape the gate by declaring nothing at all, which
+is strictly worse than the heuristic this replaces.  Both refusals are
+explicit ``deny`` returns in :func:`evaluate_detailed`, ahead of both loops —
+see the trap below for why "ahead of both loops" is load-bearing.
+
+The declaration is anchored in the manifest, never self-reported
+----------------------------------------------------------------
+The only source of a declaration is ``manifest.declared_permissions``, which
+comes from ``plugin.toml`` and is covered by the plugin signature
+(``loader._manifest_dict``).  A tool's own MCP ``inputSchema`` — which the
+plugin sends over its own stdio pipe at ``tools/list`` time — is **never**
+consulted here, and must never be: a hostile plugin would simply announce
+that its ``path`` argument is none of the gate's business and walk out of
+confinement.  Changing a declaration means changing a signed file, which is
+the same bar as changing ``path:`` or ``cmd:``.
 
 The read/action split (contract §11 item 6)
 -------------------------------------------
@@ -28,7 +80,7 @@ That rule is implemented as an **explicit short-circuit** in :func:`evaluate`
 ``False`` there would skip the confirmable-condition branch **and** the
 hard-guard loop — the loop skips any guard the plugin declares as a
 confirmable condition, and ``filesystem`` declares ``outside_declared_paths``
-— so the call would fall through to the trailing ``return "allow"``.  That
+— so the call would fall through to the trailing ``return _ALLOW``.  That
 turns "a read outside the roots prompts" into "a read outside the roots
 silently succeeds", which is strictly worse than the behaviour being fixed.
 The short-circuit returns ``"deny"`` before either branch can be reached.
@@ -37,6 +89,15 @@ The short-circuit returns ``"deny"`` before either branch can be reached.
 path inside the declared roots" is a property of the path, not of the verb.
 The verb-dependence lives in one place, in :func:`evaluate`, where it can be
 read and tested as a single rule.
+
+Which tools are reads is now declared (``:read`` in the ``args:`` entry)
+rather than guessed from the verb.  That is a manifest-controlled input to the
+split, and worth stating plainly: a manifest that declares a read as an
+``action`` gets a prompt where a denial was due.  It grants no authority that
+was not already there — a plugin reaches the prompt only by *also* declaring
+``outside_declared_paths`` confirmable, which has always been a manifest
+choice — and the opposite direction (declaring an action a read) only ever
+tightens, turning a prompt into a refusal.
 """
 
 from __future__ import annotations
@@ -45,7 +106,7 @@ import contextlib
 import logging
 import os
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import urlsplit
@@ -99,237 +160,515 @@ class SessionContext:
 
 
 # ---------------------------------------------------------------------------
-# Read / action classification
+# The sentinel, and the scalar types the comparison layer understands
+#
+# Moved across from the heuristic implementation unchanged.  UNINSPECTABLE is
+# a *value*, not a flag, so it flows through the same comparison as a real
+# path — and it can never be inside any declared root, so "I could not look at
+# this" resolves to a violation rather than to silence.
 # ---------------------------------------------------------------------------
 
-#: Tools that only observe.  Matched on the fully-qualified name.
-_READ_ONLY_TOOLS: frozenset[str] = frozenset({
-    # this repo's first-party plugins
-    "filesystem.read",
-    "filesystem.list",
-    # contract §6 family names (built by B6/B7/B8)
-    "files_read",
-    "files_list",
-    "workstation_status",
-    "devices_list",
-    "serial_ports",
-    "serial_read",
-    "adb_devices",
-    "adb_logcat",
-    "jobs_list",
-    "jobs_output",
-    "jobs_wait",
-})
-
-#: Verbs that only observe.  Matched on the last segment of the tool name.
-_READ_ONLY_VERBS: frozenset[str] = frozenset({
-    "read",
-    "list",
-    "get",
-    "stat",
-    "info",
-    "status",
-    "exists",
-    "ports",
-    "devices",
-    "output",
-    "search",
-    "find",
-    "head",
-    "tail",
-    "logcat",
-})
-
-#: Machine-readable rule name for the read/action short-circuit.
-_READ_OUTSIDE_ROOTS = "read_outside_declared_paths"
-
-#: Tools whose contract §6 signature has a **mandatory** path parameter.
-#:
-#: This is the classification the empty-allowlist denial keys on, and it is
-#: keyed on the *tool*, deliberately, rather than on whether path extraction
-#: happened to find something.  For these tools "no path argument was
-#: detected" is a scanner failure, not a call without paths: every legitimate
-#: call has one, so the absence of a detected path means the extractor missed
-#: it and the call must not be waved through.
-#:
-#: ``shell_run`` is **not** here even though §6 gives it a ``cwd``: that
-#: parameter is optional, so a ``shell_run`` with no ``cwd`` is a normal call
-#: with genuinely no path, and denying it would be wrong.  Same for
-#: ``adb_pull``, whose ``device_path`` is on the phone, not the workstation
-#: (§6: "adb_push, adb_install and files_* take workstation paths").
-_PATH_REQUIRED_TOOLS: frozenset[str] = frozenset({
-    # this repo's first-party plugin
-    "filesystem.read",
-    "filesystem.list",
-    "filesystem.write",
-    "filesystem.delete",
-    # contract §6 families (built by B6/B7)
-    "files_list",
-    "files_read",
-    "files_write",
-    "adb_push",
-    "adb_install",
-})
-
-#: Whole families where every verb takes a workstation path, so a verb added
-#: later is covered without editing the set above.
-_PATH_REQUIRED_PREFIXES: tuple[str, ...] = ("filesystem.", "files_")
-
-
-#: Argument names that name something in a **foreign** namespace — somewhere
-#: that is not this workstation — keyed by tool-family prefix.  Covers paths
-#: and commands alike: ``adb_shell(serial, command)`` runs its command on the
-#: phone, so judging it against the workstation's ``cmd:`` allowlist denies
-#: every legitimate call in exactly the way judging ``device_path`` against
-#: the workstation's ``path:`` roots does.  (§7 puts ``adb_shell`` on the
-#: always-prompt list; that is B3's gate, and the right one for it.)
-#:
-#: Contract §6: "adb_push, adb_install and files_* take workstation paths",
-#: which says by implication that the rest of the adb family does not.
-#: ``adb_pull(serial, device_path)`` names a file on the phone;
-#: ``/sdcard/DCIM/x.jpg`` can never be inside a Windows root and comparing it
-#: to one denies every legitimate call.
-#:
-#: This is an **allowlist of exempt argument names, not of checked ones**,
-#: and that direction is deliberate.  Exempting "everything in adb_ except
-#: ``workstation_path``" would mean a family that spelled its workstation
-#: argument differently — ``src``, ``local``, anything — silently escaped
-#: root confinement.  Naming the device-side arguments instead means an
-#: unrecognised argument stays checked: the failure mode is an over-denial
-#: that shows up immediately, not a bypass that does not.
-#:
-#: ``serial_`` is included pre-emptively on the same §6 reasoning: a serial
-#: payload (``text``/``hex``) is not a workstation path either, and B8 would
-#: otherwise hit this identical bug the first time it wrote ``/status\r\n``
-#: to a device.  Flagged as pre-emptive; drop it if you would rather B8
-#: found it.
-#: ``(owning plugin id, tool-name prefix, exempt argument names)``.
-#:
-#: **Both** halves must match.  Keying the exemption on the tool name alone
-#: made it inheritable by anyone: a third-party plugin shipping a tool called
-#: ``adb_run`` or ``serial_send`` picked up the exemptions and had its
-#: ``command`` argument skipped by the workstation command allowlist —
-#: precisely the bypass the exemption was scoped to avoid.  The tool name is
-#: caller-supplied; ``manifest.id`` comes from a signed ``plugin.toml``, so
-#: the plugin genuinely providing the family is the thing worth anchoring to.
-_FOREIGN_ARGS: tuple[tuple[str, str, frozenset[str]], ...] = (
-    ("adb", "adb_", frozenset({"device_path", "remote_path", "command", "filter"})),
-    ("serial", "serial_", frozenset({"text", "hex", "data", "until"})),
-)
-
-
-def foreign_args(manifest: PluginManifest, tool: str) -> frozenset[str]:
-    """Argument names of *tool* that name something not on this workstation.
-
-    Empty unless *manifest* is the plugin that owns the family **and** *tool*
-    is named within it.  A plugin that is not the family owner gets no
-    exemption whatever it calls its tools.
-    """
-    if not isinstance(tool, str):
-        return frozenset()
-    name = tool.strip().lower()
-    plugin_id = str(getattr(manifest, "id", "")).strip().lower()
-    for owner, prefix, keys in _FOREIGN_ARGS:
-        if plugin_id == owner and name.startswith(prefix):
-            return keys
-    return frozenset()
-
-
-def requires_path(tool: str) -> bool:
-    """Return True when *tool*'s signature always includes a workstation path.
-
-    Used by :func:`_outside_declared_paths` to decide the empty-allowlist
-    case on the tool rather than on the extractor's output — see
-    :data:`_PATH_REQUIRED_TOOLS` for why that distinction is the point.
-    """
-    if not isinstance(tool, str):
-        return False
-    name = tool.strip().lower()
-    if not name:
-        return False
-    if name in _PATH_REQUIRED_TOOLS:
-        return True
-    return name.startswith(_PATH_REQUIRED_PREFIXES)
-
-
-def is_read_only_tool(tool: str) -> bool:
-    """Return True when *tool* only observes and never changes the machine.
-
-    Classification is a strict **allowlist**.  Anything unrecognised is
-    treated as an action, which is the safe default here: the only thing this
-    classification does is turn an out-of-roots *path* from ``confirm`` into
-    ``deny``.  Mistaking an action for a read therefore denies (safe);
-    mistaking a read for an action prompts (the pre-existing behaviour, and
-    never more permissive than before).  There is no direction in which a
-    misclassification here can produce ``allow``.
-
-    The argument is not assumed to be a well-formed tool id: anything that is
-    not a non-empty string is an action.
-    """
-    if not isinstance(tool, str):
-        return False
-    name = tool.strip().lower()
-    if not name:
-        return False
-    if name in _READ_ONLY_TOOLS:
-        return True
-    # ``family.verb`` (this repo) or ``family_verb`` (contract §6).  Only fall
-    # back to the underscore split when there is no dot, so
-    # ``filesystem.list_recent`` does not decompose to ``recent``.
-    verb = name.rsplit(".", 1)[-1] if "." in name else name.rsplit("_", 1)[-1]
-    return verb in _READ_ONLY_VERBS
-
-
-# ---------------------------------------------------------------------------
-# Path normalisation
-# ---------------------------------------------------------------------------
-
-#: Argument names that are paths even when the value carries no separator
-#: (``{"path": "notes.txt"}`` must still be checked against the roots).
-_PATH_ARG_KEYS: frozenset[str] = frozenset({
-    "path",
-    "paths",
-    "file",
-    "files",
-    "filename",
-    "filepath",
-    "file_path",
-    "dir",
-    "directory",
-    "folder",
-    "cwd",
-    "src",
-    "source",
-    "dst",
-    "dest",
-    "destination",
-    "target",
-    "workstation_path",
-    "device_path",
-    "local_path",
-    "remote_path",
-    "input_path",
-    "output_path",
-})
-
-#: Substrings that make an argument *name* path-ish even when it is not in
-#: the exact list above — ``file_to_read``, ``target_directory``,
-#: ``dest_folder``.  Deliberately over-inclusive: the exact-name list will
-#: always lag whatever a future family calls its arguments, and a false
-#: positive here costs a denial while a false negative costs the machine.
-_PATHISH_KEY_FRAGMENTS: tuple[str, ...] = (
-    "path", "file", "dir", "folder", "cwd", "root", "location", "name",
-)
-
-_MAX_PATH_RECURSION = 8
-_MAX_PATH_CANDIDATES = 512
-
-#: A candidate that could not be fully inspected (recursion or count bound
-#: hit, or an argument of a type this module does not understand).  It is a
-#: *value*, not a flag, so it flows through the same comparison as a real
-#: path — and it can never be inside any declared root, so "I could not look
-#: at all of this" resolves to a violation rather than to silence.
+#: A candidate that could not be inspected (a structure where a scalar was
+#: declared, a type this module does not understand, a list longer than the
+#: bound).  Never inside any root, never matched by any allowlist pattern.
 UNINSPECTABLE = "\x00uninspectable"
+
+#: Scalars that are not text.  Under a *declared* path/command/domain argument
+#: these are uninspectable rather than absent: the manifest said this argument
+#: is a path, so a value that cannot be compared to a root has not been shown
+#: to be inside one.  ``None`` is handled separately — it means "not supplied".
+_NON_TEXT_SCALARS = (bool, int, float)
+
+#: The most elements a declared list-valued argument may carry before the
+#: whole argument resolves to :data:`UNINSPECTABLE`.
+_MAX_ARG_CANDIDATES = 512
+
+
+# ---------------------------------------------------------------------------
+# The declaration — what each argument of each tool IS
+# ---------------------------------------------------------------------------
+
+#: The five things an argument can be, as far as this gate is concerned.
+#:
+#: * ``ws_path``     — a path on **this workstation**; compared against the
+#:                     plugin's ``path:`` roots.
+#: * ``ws_command``  — a command executed on **this workstation**; compared
+#:                     against the plugin's ``cmd:`` allowlist.
+#: * ``web_target``  — a URL or host **this workstation** will connect to;
+#:                     compared against the plugin's ``domain:`` allowlist.
+#: * ``foreign``     — names something in another namespace entirely: a path
+#:                     on a phone, a command that runs on a phone, a payload
+#:                     written down a serial line.  Comparing it to a Windows
+#:                     root or to the workstation's command allowlist denies
+#:                     every legitimate call, so it is compared to neither.
+#: * ``opaque``      — none of the gate's business: free text, a flag, a
+#:                     count, a CSS selector, a job id.
+#:
+#: ``foreign`` and ``opaque`` differ in intent, not in mechanism, and both are
+#: kept because the audit reader needs to see *why* an argument is exempt.  An
+#: argument that is exempt because it names a phone path is a different claim
+#: from one that is exempt because it is a line of prose.
+ARG_CLASSES: frozenset[str] = frozenset({
+    "ws_path",
+    "ws_command",
+    "web_target",
+    "foreign",
+    "opaque",
+})
+
+#: Classes whose values are handed to a workstation allowlist.
+_CHECKED_CLASSES: frozenset[str] = frozenset({"ws_path", "ws_command", "web_target"})
+
+#: Classes that are exempt from every workstation allowlist.  Exempt for
+#: **scalars only**: a mapping or a nested list under an exempt argument is
+#: not a foreign path and not a line of prose, it is something that cannot be
+#: classified at all — and skipping it once pruned a whole subtree, hiding
+#: ``remote_path={"local_target": "C:/Windows/System32/config/SAM"}`` from
+#: root comparison.  Anything that is not a flat scalar (or a flat list of
+#: them) resolves to :data:`UNINSPECTABLE` instead.
+_EXEMPT_CLASSES: frozenset[str] = frozenset({"foreign", "opaque"})
+
+#: The two modes a tool can be in.  ``read`` drives the read/action split.
+_MODES: frozenset[str] = frozenset({"read", "action"})
+
+#: The permission-string prefix that carries a declaration.
+_ARGS_PREFIX = "args:"
+
+#: Marks an argument as **required**: absent (or ``None``) is a refusal.
+#:
+#: This is the declared replacement for the old ``requires_path`` table, and
+#: generalises it.  The rule it preserves: for a tool whose signature always
+#: carries a workstation path, "no path was found in the arguments" is a
+#: scanner failure, not a call without paths — every legitimate call has one,
+#: so its absence must not be waved through.  Stating it per argument rather
+#: than per tool means ``shell_run``'s *optional* ``cwd`` is correctly not
+#: required while ``files_read``'s ``path`` is, without a second table
+#: explaining the exceptions.
+_REQUIRED_MARKER = "!"
+
+
+@dataclass(frozen=True)
+class ToolDeclaration:
+    """What one tool's arguments are, as declared in its signed manifest.
+
+    Attributes:
+        tool: The tool id this declaration covers, case-folded.
+        read_only: ``True`` when the manifest declares the tool a ``read``.
+            Drives the read/action split (contract §11 item 6).
+        arguments: Case-folded argument name → one of :data:`ARG_CLASSES`.
+            An argument absent from this mapping is **not** unclassified, it
+            is undeclared, and an undeclared argument refuses the call.
+        required: Case-folded names that must be present and non-``None``.
+    """
+
+    tool: str
+    read_only: bool
+    arguments: Mapping[str, str]
+    required: frozenset[str]
+
+
+def _parse_one_declaration(  # noqa: C901, PLR0911
+    perm: str,
+) -> tuple[str | None, ToolDeclaration | None]:
+    """Parse one ``args:`` string into ``(claimed tool, declaration or None)``.
+
+    Grammar::
+
+        args:<tool>:<mode>[:<argspec>[,<argspec>]*]
+        <argspec> = [!]<name>=<class>
+
+    ``<mode>`` is ``read`` or ``action``; ``<class>`` is one of
+    :data:`ARG_CLASSES`; a leading ``!`` marks the argument required.  The
+    argument list may be omitted entirely for a tool that takes no arguments
+    (``args:clipboard.get:read``), which is a real declaration — it says "this
+    tool has no arguments", and any argument supplied to it is therefore
+    undeclared and refuses the call.
+
+    A malformed entry yields ``declaration=None``, and the **claimed tool name
+    is still returned** whenever it can be extracted.  Both halves matter, and
+    the second is the fix for a real hole: returning only ``None`` let
+    :func:`parse_declarations` skip a malformed entry silently, so a manifest
+    carrying both ``args:files.read:NOTAMODE:!path=ws_path`` and
+    ``args:files.read:read:!path=opaque`` produced a working ``files.read``
+    declaration built from the second.  A malformed entry is still a *claim*
+    about that tool; discarding it is how you pick the other one, which is
+    exactly the guessing this layer exists to remove.
+
+    ``tool`` is ``None`` only when the entry names no tool at all (``args:``,
+    ``args::action:...``).  Such an entry cannot be attributed, so it cannot
+    be made to poison one tool — see :func:`parse_declarations`.
+    """
+    body = perm[len(_ARGS_PREFIX):]
+    parts = body.split(":", 2)
+    tool = parts[0].strip().lower() or None
+
+    min_fields = 2
+    if len(parts) < min_fields:
+        log.warning("malformed args: declaration %r (needs a tool and a mode)", perm)
+        return tool, None
+    if tool is None:
+        log.warning("malformed args: declaration %r (empty tool name)", perm)
+        return None, None
+
+    mode = parts[1].strip().lower()
+    if mode not in _MODES:
+        log.warning("args: declaration %r has unknown mode %r", perm, mode)
+        return tool, None
+
+    arguments: dict[str, str] = {}
+    required: set[str] = set()
+    spec_text = parts[2].strip() if len(parts) > min_fields else ""
+    for raw_spec in spec_text.split(","):
+        spec = raw_spec.strip()
+        if not spec:
+            continue
+        name, sep, klass = spec.partition("=")
+        if not sep:
+            log.warning("args: declaration %r has an argument with no class: %r", perm, spec)
+            return tool, None
+        name = name.strip().lower()
+        is_required = name.startswith(_REQUIRED_MARKER)
+        if is_required:
+            name = name[len(_REQUIRED_MARKER):].strip()
+        klass = klass.strip().lower()
+        if not name:
+            log.warning("args: declaration %r has an unnamed argument", perm)
+            return tool, None
+        if klass not in ARG_CLASSES:
+            log.warning("args: declaration %r gives %r the unknown class %r", perm, name, klass)
+            return tool, None
+        if name in arguments:
+            # Two claims about one argument is not a declaration.
+            log.warning("args: declaration %r names %r twice", perm, name)
+            return tool, None
+        arguments[name] = klass
+        if is_required:
+            required.add(name)
+
+    return tool, ToolDeclaration(
+        tool=tool,
+        read_only=mode == "read",
+        arguments=arguments,
+        required=frozenset(required),
+    )
+
+
+def parse_declarations(manifest: PluginManifest) -> dict[str, ToolDeclaration]:
+    """Return every usable tool declaration in *manifest*, keyed by tool id.
+
+    Read exclusively from ``manifest.declared_permissions`` — the signed
+    ``plugin.toml``.  Nothing a plugin says about itself at runtime reaches
+    this function; see the module docstring for why that is the single most
+    important property of the declaration.
+
+    Three ways a tool loses its declaration, all with the same reasoning:
+    **two claims about one tool is not a declaration, it is a contradiction,
+    and resolving it means guessing which the author meant.**
+
+    * Declared **twice**.
+    * Declared once **malformed** — a malformed entry is still a claim, and
+      silently dropping it would resolve the contradiction in favour of
+      whichever entry happened to parse.
+    * Declared malformed and validly, in either order.  The set below is
+      order-independent for exactly this reason.
+
+    An entry that names **no tool at all** (``args:``, ``args::action:...``)
+    cannot be attributed to one tool, so it poisons **every** declaration in
+    the manifest.  That is deliberately blunt, and it is the honest reading:
+    the alternative is to discard a security claim the gate could not parse,
+    which is the same failure as above with the scope unknown instead of
+    known.  The blast radius is bounded and loud — every tool in that one
+    plugin refuses at its first call with rule ``undeclared_tool`` — and it
+    can never be a bypass.  The manifest is signed, so reaching this state
+    means someone signed a broken file, and a broken security manifest should
+    not run.
+    """
+    found: dict[str, ToolDeclaration] = {}
+    poisoned: set[str] = set()
+    unattributable = False
+
+    for perm in manifest.declared_permissions:
+        if not isinstance(perm, str) or not perm.lower().startswith(_ARGS_PREFIX):
+            continue
+        tool, decl = _parse_one_declaration(perm)
+        if decl is None:
+            if tool is None:
+                unattributable = True
+            else:
+                log.warning(
+                    "plugin=%s has a malformed declaration for tool=%s; refusing the tool",
+                    manifest.id,
+                    tool,
+                )
+                poisoned.add(tool)
+            continue
+        if decl.tool in found or decl.tool in poisoned:
+            log.warning(
+                "plugin=%s declares tool=%s twice; refusing the tool",
+                manifest.id,
+                decl.tool,
+            )
+            poisoned.add(decl.tool)
+            continue
+        found[decl.tool] = decl
+
+    if unattributable:
+        log.warning(
+            "plugin=%s has an args: declaration naming no tool; refusing every "
+            "declaration in the manifest",
+            manifest.id,
+        )
+        return {}
+    for tool in poisoned:
+        found.pop(tool, None)
+    return found
+
+
+def tool_declaration(manifest: PluginManifest, tool: object) -> ToolDeclaration | None:
+    """Return *tool*'s declaration from *manifest*, or None if it has none.
+
+    ``None`` is the default-deny case.  The caller must refuse; it must never
+    read as "nothing declared, so nothing to check".
+    """
+    if not isinstance(tool, str):
+        return None
+    name = tool.strip().lower()
+    if not name:
+        return None
+    return parse_declarations(manifest).get(name)
+
+
+# ---------------------------------------------------------------------------
+# Classification — routing declared arguments to the right allowlist
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ClassifiedArgs:
+    """The arguments of one call, sorted by what the manifest says they are.
+
+    Attributes:
+        paths: Values to compare against the plugin's ``path:`` roots.
+        commands: Values to compare against the ``cmd:`` allowlist.
+        domains: Values to compare against the ``domain:`` allowlist.
+        undeclared: Argument names the tool's declaration does not mention.
+            Non-empty means the call must be refused outright.
+        missing: Required argument names that were absent or ``None``.
+        malformed: True when ``args`` was not a mapping at all.
+        declared: True when the tool had a declaration.  False is the
+            default-deny case and every checker treats it as a violation.
+    """
+
+    paths: tuple[object, ...] = ()
+    commands: tuple[object, ...] = ()
+    domains: tuple[object, ...] = ()
+    undeclared: tuple[str, ...] = ()
+    missing: tuple[str, ...] = ()
+    malformed: bool = False
+    declared: bool = True
+
+
+#: What a call whose tool has no declaration classifies to.  Every checker
+#: reads ``declared=False`` as a violation, so a direct caller of a checker
+#: fails closed exactly as :func:`evaluate_detailed` does.
+_UNDECLARED = ClassifiedArgs(declared=False)
+
+
+def _decode_bytes(value: bytes | bytearray) -> str:
+    """Decode a bytes argument without ever raising.
+
+    ``surrogateescape`` keeps undecodable bytes round-trippable instead of
+    dropping them, so a path that is not valid UTF-8 still produces a
+    candidate to compare rather than an empty list.
+    """
+    try:
+        return bytes(value).decode("utf-8", errors="surrogateescape")
+    except (UnicodeDecodeError, ValueError):  # pragma: no cover — defensive
+        return UNINSPECTABLE
+
+
+def _text_candidate(value: object) -> str:
+    """Reduce one scalar to text for comparison, or to the sentinel.
+
+    Only the shapes a real path/command/URL can arrive as are accepted.
+    ``bytes`` and ``os.PathLike`` are handled properly rather than falling off
+    the end: JSON transport cannot produce either, but ``invoke`` is called
+    in-process too, and "the path arrived as a ``Path`` object" must not mean
+    "there were no paths".
+
+    Everything else — an int, a bool, a class nobody anticipated — becomes
+    :data:`UNINSPECTABLE`.  The manifest declared this argument a path; a
+    value that cannot be compared to a root has not been shown to be inside
+    one, and an unrecognised argument must not evaporate into a silent allow.
+    """
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (bytes, bytearray)):
+        return _decode_bytes(value)
+    if isinstance(value, os.PathLike):
+        try:
+            raw = os.fspath(value)
+        except (TypeError, ValueError):  # pragma: no cover — defensive
+            return UNINSPECTABLE
+        return _decode_bytes(raw) if isinstance(raw, bytes) else raw
+    if isinstance(value, _NON_TEXT_SCALARS):
+        return UNINSPECTABLE
+    log.warning(
+        "argument of unrecognised type %s under a checked class; refusing to guess",
+        type(value).__name__,
+    )
+    return UNINSPECTABLE
+
+
+def _is_container(value: object) -> bool:
+    """True for the shapes that hold other values."""
+    return isinstance(value, (Mapping, list, tuple, set, frozenset))
+
+
+def _is_exemptible_scalar(value: object) -> bool:
+    """True when an exempt argument's value is simple enough to skip.
+
+    The exemption says "this *string* names something in a foreign namespace"
+    or "this *string* is prose".  A dict or a list under an exempt argument is
+    not a foreign path — it is something that cannot be classified at all, and
+    skipping it pruned a whole subtree: ``remote_path={"local_target":
+    "C:/Windows/System32/config/SAM"}`` removed a genuine workstation path
+    from root comparison.  Only scalars are skipped; anything else resolves to
+    :data:`UNINSPECTABLE`, keeping the failure mode a visible over-denial
+    rather than a silent bypass.
+
+    Moved across from the heuristic implementation unchanged, including the
+    deliberate omission of ``os.PathLike``: a ``Path`` under an exempt
+    argument is not a phone path either.
+    """
+    return isinstance(value, (str, bytes, bytearray, type(None), *_NON_TEXT_SCALARS))
+
+
+def _checked_candidates(value: object) -> list[object]:
+    """Candidates from one argument declared ``ws_path``/``ws_command``/``web_target``.
+
+    A scalar yields one candidate — including ``bytes`` and ``os.PathLike``,
+    which :func:`_text_candidate` reduces properly rather than dropping.  A
+    **flat** list, tuple or set yields one per element:
+    ``filesystem.list {"paths": [...]}`` is a real shape and must be checked
+    element-wise rather than skipped for not being a string.
+
+    Anything deeper is :data:`UNINSPECTABLE`.  Contract §5.1 is explicit that
+    arguments are flat, so a mapping or a nested list under a declared path is
+    not a shape the gate has to model — and the one thing it must not do is
+    model it by guessing, which is how the recursive extractor acquired both a
+    recursion bound and a bug below it.
+
+    **An EMPTY container is also** :data:`UNINSPECTABLE`, and that is the
+    whole of a real bypass.  Every guard below asks "was each candidate shown
+    to be inside the allowlist?", which is an ``all()`` over the candidates —
+    and ``all()`` over nothing is vacuously true.  ``{"path": []}`` therefore
+    produced zero candidates, ran no comparison, found no violation, and
+    escaped root confinement entirely.  Note the required-argument marker does
+    not catch it: ``[]`` is *present*, so ``!path`` is satisfied.
+
+    Converting "zero values" into "one value that is inside nothing" is the
+    same move cycle 3 made for a path that normalised away, and it lands on
+    the same guard with the same consequences — a hard deny, or a prompt for a
+    plugin that declares the condition confirmable.  The sentinel is used
+    rather than a fourth refusal in :func:`_declaration_outcome` because its
+    refusal semantics are already closed and mutation-proven everywhere that
+    matters: ``_is_within`` refuses it against every root *including*
+    ``path:/``, and both the command and domain checkers refuse it explicitly
+    before their type check, so a permissive ``cmd:*`` cannot match it.
+    """
+    if isinstance(value, (list, tuple, set, frozenset)):
+        if not value or len(value) > _MAX_ARG_CANDIDATES:
+            return [UNINSPECTABLE]
+        return [
+            UNINSPECTABLE if _is_container(item) else _text_candidate(item)
+            for item in value
+        ]
+    if _is_container(value):
+        return [UNINSPECTABLE]
+    return [_text_candidate(value)]
+
+
+def _exempt_candidates(value: object) -> list[object]:
+    """Candidates from an argument declared ``foreign`` or ``opaque``.
+
+    Empty for a scalar — that is what the exemption means.  Anything else,
+    a list included, resolves to :data:`UNINSPECTABLE` *in the path list*, so
+    it is refused rather than silently skipped.  See
+    :func:`_is_exemptible_scalar`.
+    """
+    return [] if _is_exemptible_scalar(value) else [UNINSPECTABLE]
+
+
+def _absent(value: object) -> bool:
+    """True when a supplied argument counts as "not supplied".
+
+    Only ``None``.  A JSON client sending ``"cwd": null`` for an omitted
+    optional is the ordinary shape, and treating it as a path would deny a
+    legitimate call.  Note this is *not* a hole for a required argument:
+    ``!path`` with a ``None`` value lands on ``missing`` and refuses.
+    """
+    return value is None
+
+
+def classify(
+    manifest: PluginManifest,
+    tool: str,
+    args: dict[str, Any],
+) -> ClassifiedArgs:
+    """Sort *args* according to what *manifest* declares them to be.
+
+    This function is the whole classification layer.  It looks at no value
+    shapes and guesses at no key spellings: every routing decision below comes
+    from the signed declaration, and an argument the declaration does not name
+    is recorded as undeclared rather than examined.
+    """
+    decl = tool_declaration(manifest, tool)
+    if decl is None:
+        return _UNDECLARED
+
+    if not isinstance(args, Mapping):
+        # Not a shape a tool call can have.  Refused rather than coerced.
+        return ClassifiedArgs(malformed=True)
+
+    paths: list[object] = []
+    commands: list[object] = []
+    domains: list[object] = []
+    undeclared: list[str] = []
+    seen: set[str] = set()
+
+    for raw_key, value in args.items():
+        name = str(raw_key).strip().lower()
+        klass = decl.arguments.get(name)
+        if klass is None:
+            undeclared.append(name)
+            continue
+        if not _absent(value):
+            seen.add(name)
+        if _absent(value):
+            continue
+        if klass in _EXEMPT_CLASSES:
+            paths.extend(_exempt_candidates(value))
+        elif klass == "ws_path":
+            paths.extend(_checked_candidates(value))
+        elif klass == "ws_command":
+            commands.extend(_checked_candidates(value))
+        else:  # web_target — the only class left
+            domains.extend(_checked_candidates(value))
+
+    return ClassifiedArgs(
+        paths=tuple(paths),
+        commands=tuple(commands),
+        domains=tuple(domains),
+        undeclared=tuple(undeclared),
+        missing=tuple(sorted(decl.required - seen)),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Path normalisation — moved across from the heuristic implementation
+# unchanged.  Every function below is a closed, mutation-proven finding.
+# ---------------------------------------------------------------------------
 
 #: ``\\?\`` (extended-length) and ``\\.\`` (device namespace).  Win32 does
 #: **not** normalise these — ``..`` is passed through literally and trailing
@@ -338,70 +677,6 @@ UNINSPECTABLE = "\x00uninspectable"
 #: path is treated as outside every root: ``\\.\PhysicalDrive0`` and
 #: ``\\?\GLOBALROOT\...`` are never a legitimate declared root anyway.
 _DEVICE_NAMESPACE = re.compile(r"^[\\/]{2}[?.][\\/]")
-
-#: ``C:`` — including the drive-*relative* ``C:secret.txt`` form, which has
-#: no separator at all and resolves against that drive's current directory.
-_DRIVE_PREFIX = re.compile(r"^[A-Za-z]:")
-
-#: A real URI scheme (two or more characters, so it can never be a drive
-#: letter).  ``http://`` is the domain allowlist's business, not the path
-#: allowlist's; ``file://`` is unambiguously a path.
-_URI_SCHEME = re.compile(r"^([A-Za-z][A-Za-z0-9+.\-]+)://")
-
-
-def _key_is_pathish(key: str) -> bool:
-    """Return True when an argument *name* says its value is a path."""
-    lowered = key.lower()
-    if lowered in _PATH_ARG_KEYS:
-        return True
-    return any(fragment in lowered for fragment in _PATHISH_KEY_FRAGMENTS)
-
-
-def _value_is_unambiguously_a_path(text: str) -> bool:
-    """Return True for shapes that are a filesystem path whatever the key.
-
-    Only the unmistakable forms are matched here — a drive-letter prefix, a
-    leading separator (which covers UNC and the device namespace), and
-    ``file://``.
-
-    The weaker signals (a separator *somewhere* inside the string, a colon
-    somewhere inside the string) are deliberately **not** in this function;
-    they are applied only under a path-ish key, by
-    :func:`_value_is_pathish_under_key`.  Applying them unconditionally
-    would make every ``powershell.run`` command containing a backslash and
-    every ``clipboard.set`` text containing a colon into a path argument,
-    and — once a plugin with no declared roots refuses all path arguments —
-    that is not an over-inclusion anyone can whitelist per argument, it is
-    those tools ceasing to work.  A plugin that genuinely must accept
-    arbitrary path-shaped values declares ``path:/`` and says so in its
-    manifest, where it can be audited.
-    """
-    stripped = text.strip()
-    if not stripped:
-        return False
-    if _DRIVE_PREFIX.match(stripped):
-        return True
-    if stripped[0] in "/\\":
-        return True
-    scheme = _URI_SCHEME.match(stripped)
-    if scheme is not None:
-        return scheme.group(1).lower() == "file"
-    return False
-
-
-def _value_is_pathish_under_key(text: str) -> bool:
-    """Weaker path signals, trusted only when the argument name agrees.
-
-    A colon that is not part of a URI scheme covers the NTFS alternate data
-    stream form (``secret.txt:Zone.Identifier``), which carries no separator
-    and would otherwise be invisible.
-    """
-    stripped = text.strip()
-    if not stripped:
-        return False
-    if "/" in stripped or "\\" in stripped:
-        return True
-    return ":" in stripped and _URI_SCHEME.match(stripped) is None
 
 
 def _strip_windows_padding(segment: str) -> str:
@@ -454,9 +729,6 @@ def normalise_path(value: str) -> str:
     # invite a later .resolve(), which is exactly what must not happen.
     if value == UNINSPECTABLE:
         return UNINSPECTABLE
-    # os.path, not pathlib: this is deliberately pure string work.  Building a
-    # Path here would normalise separators per the *running* platform and
-    # invite a later .resolve(), which is exactly what must not happen.
     text = os.path.expanduser(os.path.expandvars(value)).replace("\\", "/")  # noqa: PTH111
     if _DEVICE_NAMESPACE.match(value) or _DEVICE_NAMESPACE.match(text):
         # Win32 does not normalise these, so nothing below models them
@@ -559,197 +831,6 @@ def _is_within(candidate: str, root: str) -> bool:
     return candidate == root or candidate.startswith(root + "/")
 
 
-#: Scalars that can never be a path.  Everything *else* that is not a string,
-#: bytes, a PathLike or a container is treated as a path we could not read —
-#: an unrecognised type must not vanish silently.
-_NON_PATH_SCALARS = (bool, int, float, type(None))
-
-
-def _decode_bytes(value: bytes | bytearray) -> str:
-    """Decode a bytes path argument without ever raising.
-
-    ``surrogateescape`` keeps undecodable bytes round-trippable instead of
-    dropping them, so a path that is not valid UTF-8 still produces a
-    candidate to compare rather than an empty list.
-    """
-    try:
-        return bytes(value).decode("utf-8", errors="surrogateescape")
-    except (UnicodeDecodeError, ValueError):  # pragma: no cover — defensive
-        return UNINSPECTABLE
-
-
-def _scalar_path_candidates(value: object, key: str) -> list[str]:  # noqa: PLR0911
-    """Path candidates from a single non-container argument value.
-
-    One ``return`` per argument type, deliberately: each is a distinct
-    fail-open the collapsed version used to have, and reading them as a
-    list is the point.
-
-    ``bytes`` and ``os.PathLike`` are handled properly rather than falling
-    off the end: JSON transport cannot produce either, but ``invoke`` is
-    called in-process too, and "the path arrived as a ``Path`` object" must
-    not mean "there were no paths".  A type this module has never seen
-    yields :data:`UNINSPECTABLE` — an unrecognised argument must not
-    evaporate into a silent allow.
-    """
-    if isinstance(value, str):
-        if _value_is_unambiguously_a_path(value):
-            return [value]
-        if _key_is_pathish(key) and (value.strip() or _value_is_pathish_under_key(value)):
-            return [value]
-        return []
-
-    if isinstance(value, (bytes, bytearray)):
-        return _scalar_path_candidates(_decode_bytes(value), key)
-
-    if isinstance(value, os.PathLike):
-        # A PathLike is a path by construction; the key is irrelevant.
-        try:
-            raw = os.fspath(value)
-        except (TypeError, ValueError):  # pragma: no cover — defensive
-            return [UNINSPECTABLE]
-        return [_decode_bytes(raw) if isinstance(raw, bytes) else raw]
-
-    if isinstance(value, _NON_PATH_SCALARS):
-        return []
-
-    log.warning(
-        "path check: unrecognised argument type %s; treating as a path",
-        type(value).__name__,
-    )
-    return [UNINSPECTABLE]
-
-
-def _is_exemptible_scalar(value: object) -> bool:
-    """True when an exempt argument's value is simple enough to skip.
-
-    The exemption says "this *string* names something in a foreign
-    namespace".  A dict or a list under an exempt key is not a foreign path
-    — it is something that cannot be classified at all, and skipping it
-    pruned a whole subtree: ``remote_path={"local_target":
-    "C:/Windows/System32/config/SAM"}`` removed a genuine workstation path
-    from root comparison.  Only scalars are skipped; anything else resolves
-    to :data:`UNINSPECTABLE`, keeping the failure mode a visible
-    over-denial rather than a silent bypass.
-    """
-    return isinstance(value, (str, bytes, bytearray, *_NON_PATH_SCALARS))
-
-
-def _iter_keyed_values(  # noqa: C901
-    args: object,
-    keys: frozenset[str],
-    *,
-    depth: int = 0,
-    exempt_keys: frozenset[str] = frozenset(),
-) -> list[object]:
-    """Collect values stored under any of *keys*, **at any depth**.
-
-    The command and domain checkers used ``args.get(key)``, which sees only
-    top-level keys: a command or URL nested one level down
-    (``{"config": {"cmd": "..."}}``) was not present, so both checkers
-    returned "no violation" and the call was allowed.  The path extractor
-    always recursed; that inconsistency was the bug, and no shipped tool
-    nests today, which is exactly how it would have been introduced without
-    anyone noticing.
-
-    Bounds and the :data:`UNINSPECTABLE` sentinel match the path extractor,
-    so "I could not finish looking" is a violation here too.
-    """
-    if depth > _MAX_PATH_RECURSION:
-        return [UNINSPECTABLE]
-
-    if isinstance(args, dict):
-        found: list[object] = []
-        for k, v in args.items():
-            if len(found) >= _MAX_PATH_CANDIDATES:
-                return [*found, UNINSPECTABLE]
-            name = str(k).strip().lower()
-            if name in exempt_keys:
-                if not _is_exemptible_scalar(v):
-                    found.append(UNINSPECTABLE)
-                continue
-            if name in keys:
-                found.append(v)
-                continue
-            found.extend(
-                _iter_keyed_values(v, keys, depth=depth + 1, exempt_keys=exempt_keys),
-            )
-        return found
-
-    if isinstance(args, (list, tuple, set, frozenset)):
-        found = []
-        for item in args:
-            if len(found) >= _MAX_PATH_CANDIDATES:
-                return [*found, UNINSPECTABLE]
-            found.extend(
-                _iter_keyed_values(item, keys, depth=depth + 1, exempt_keys=exempt_keys),
-            )
-        return found
-
-    return []
-
-
-def _iter_path_values(
-    args: object,
-    *,
-    key: str = "",
-    depth: int = 0,
-    exempt_keys: frozenset[str] = frozenset(),
-) -> list[str]:
-    """Collect every argument value that should be treated as a workstation path.
-
-    Fail-closed where the first cut was not: exceeding the recursion or
-    candidate bound yields :data:`UNINSPECTABLE` rather than truncating
-    silently, so burying a path nine levels deep denies instead of passing.
-    Detection is also widened — see :func:`_value_is_unambiguously_a_path`
-    and :func:`_key_is_pathish`.
-
-    ``exempt_keys`` names arguments that are paths in a *foreign* namespace
-    (:func:`foreign_args`) and so cannot meaningfully be compared to a
-    workstation root.  It defaults to empty, so no caller gets an exemption
-    it did not ask for by naming a tool.
-
-    The exemption is narrow on purpose.  It removes an argument from **root
-    comparison only** — it does not make the call unexamined:
-    :func:`requires_path` still demands that a tool whose signature carries a
-    mandatory workstation path produce one, so exempting an argument can
-    never turn "this tool must show me a path" into "no paths here, carry
-    on".  ``adb_push`` with only a ``device_path`` therefore denies rather
-    than sailing through.
-    """
-    if depth > _MAX_PATH_RECURSION:
-        return [UNINSPECTABLE]
-
-    if isinstance(args, dict):
-        found: list[str] = []
-        for k, v in args.items():
-            if len(found) >= _MAX_PATH_CANDIDATES:
-                return [*found, UNINSPECTABLE]
-            if str(k).strip().lower() in exempt_keys:
-                # Scalars only: a structure under an exempt key is not a
-                # foreign path, it is unclassifiable.  See
-                # `_is_exemptible_scalar`.
-                if not _is_exemptible_scalar(v):
-                    found.append(UNINSPECTABLE)
-                continue
-            found.extend(
-                _iter_path_values(v, key=str(k), depth=depth + 1, exempt_keys=exempt_keys),
-            )
-        return found
-
-    if isinstance(args, (list, tuple, set, frozenset)):
-        found = []
-        for item in args:
-            if len(found) >= _MAX_PATH_CANDIDATES:
-                return [*found, UNINSPECTABLE]
-            found.extend(
-                _iter_path_values(item, key=key, depth=depth + 1, exempt_keys=exempt_keys),
-            )
-        return found
-
-    return _scalar_path_candidates(args, key)
-
-
 def declared_roots(manifest: PluginManifest) -> list[str]:
     """Return the plugin's declared path roots, normalised.
 
@@ -792,16 +873,19 @@ def declared_roots(manifest: PluginManifest) -> list[str]:
     return roots
 
 
-def _outside_declared_paths(  # noqa: PLR0911
+# ---------------------------------------------------------------------------
+# The three guards.  Comparison bodies moved across unchanged; only where
+# their candidates come from has changed — from a sniffing extractor to the
+# declaration.
+# ---------------------------------------------------------------------------
+
+
+def _outside_declared_paths(
     manifest: PluginManifest,
     tool: str,
     args: dict[str, Any],
 ) -> bool:
-    """Return True if any path argument is outside the declared allowed paths.
-
-    Each ``return`` below is a distinct rule, and several of them are holes
-    that were found in verification.  Collapsing them would hide which is
-    which.
+    """Return True if any declared path argument is outside the declared roots.
 
     **A plugin that declares no ``path:`` root has no path access.**  An
     early version returned ``False`` when the manifest listed no roots, which
@@ -809,59 +893,35 @@ def _outside_declared_paths(  # noqa: PLR0911
     ``tool:filesystem.read`` while declaring no roots could read anywhere on
     the machine.  ``path:/`` is how a plugin says "everywhere" on purpose.
 
-    That denial used to sit *behind* the empty-candidates short-circuit,
-    which made it evadable by reshaping the call: a bare filename under an
-    argument name the extractor does not consider path-ish produced no
-    candidates, returned ``False`` on the line above, and never reached the
-    denial at all.  The empty-allowlist case is therefore decided on the
-    **tool** (:func:`requires_path`) and not on whether extraction happened
-    to succeed — for a tool whose signature always carries a path, "no path
-    detected" means the scanner missed it.
+    Calls that genuinely carry no path, to tools that genuinely declare no
+    ``ws_path`` argument, stay allowed — ``hello_world.echo`` has no business
+    with the filesystem and is not denied for saying so.
 
-    Deliberately *not* fixed by swapping the two checks: that would deny
-    every call to every plugin with no ``path:`` declaration, including
-    ``hello_world.echo``, which has no business with the filesystem at all.
-    Calls that genuinely carry no path, to tools that genuinely take no
-    path, stay allowed.
+    The scanner-failure rule the heuristic version needed ("this tool always
+    takes a path, so no path found means the extractor missed it") is gone
+    from here, because there is no extractor left to fail.  Its job is done
+    upstream and better: ``!path=ws_path`` in the manifest makes an absent
+    path a refusal in :func:`evaluate_detailed`, per argument rather than per
+    tool, so ``shell_run``'s optional ``cwd`` is not caught by it.
     """
+    classified = classify(manifest, tool, args)
+    if not classified.declared or classified.malformed:
+        # No declaration, or arguments that are not arguments.  Not shown to
+        # be inside the roots, therefore outside them.
+        return True
+
     roots = declared_roots(manifest)
-    candidates = _iter_path_values(args, exempt_keys=foreign_args(manifest, tool))
-    path_required = requires_path(tool)
-
-    if not roots:
-        if candidates:
-            log.warning(
-                "path argument supplied to plugin=%s, which declares no path: root",
-                manifest.id,
-            )
-            return True
-        if path_required:
-            log.warning(
-                "plugin=%s tool=%s takes a path but declares no path: root",
-                manifest.id,
-                tool,
-            )
-            return True
-        # No path argument, and none in this tool's signature: nothing to
-        # confine, nothing to violate.
+    if not classified.paths:
         return False
-
-    # Roots exist.  The same scanner-failure reasoning applies here: a tool
-    # that always takes a path, called with no path this module can find,
-    # has not been shown to be inside the roots — and "not shown to be
-    # inside" must not resolve to "allowed".  (This goes one step beyond the
-    # empty-allowlist case the finding described; it is the same hole with
-    # roots present, and no legitimate call to these tools omits its path.)
-    if path_required and not candidates:
+    if not roots:
         log.warning(
-            "plugin=%s tool=%s takes a path but no path argument could be identified",
+            "path argument supplied to plugin=%s, which declares no path: root",
             manifest.id,
-            tool,
         )
         return True
 
-    for raw in candidates:
-        candidate = normalise_path(raw)
+    for raw in classified.paths:
+        candidate = normalise_path(raw) if isinstance(raw, str) else UNINSPECTABLE
         # A path that normalises away — ".", "./.", "foo/.." all resolve to
         # their own base and used to come back as "" — hit `continue` here,
         # so the loop ended having found nothing and the call was allowed.
@@ -886,45 +946,34 @@ def _outside_declared_paths(  # noqa: PLR0911
     return False
 
 
-def _command_outside_allowlist(
+def _command_outside_allowlist(  # noqa: PLR0911
     manifest: PluginManifest,
     tool: str,
     args: dict[str, Any],
 ) -> bool:
-    """Return True if a command argument is not in the declared command allowlist.
+    """Return True if a declared command argument is not in the ``cmd:`` allowlist.
 
     An empty ``cmd:`` allowlist denies every command rather than permitting
     every command — see :func:`_outside_declared_paths` for the same
-    inversion and the same reasoning.  ``cmd:.*`` is how a plugin declares
+    inversion and the same reasoning.  ``cmd:*`` is how a plugin declares
     "anything" on purpose.
 
-    **``cmd:`` patterns are regexes, not globs**, and deliberately so —
-    unlike ``domain:``, which is a glob and had a broken glob-to-regex
-    translation (see :func:`_domain_pattern_to_regex`).  This path never had
-    that defect because it never translated: it has always passed the
-    pattern to :func:`re.fullmatch` unchanged.  The shipped ``powershell``
-    manifest depends on that, declaring ``cmd:.*``.
-
-    The consequence, stated plainly rather than left implicit: a dot in a
-    ``cmd:`` pattern is a regex dot.  ``cmd:git.exe`` matches ``gitXexe``.
-    That is the documented semantics of a regex allowlist rather than a
-    translation bug, and the fix is in the manifest — write ``cmd:git\\.exe``
-    — not here.  Escaping the pattern would silently break ``cmd:.*``.
+    A command that runs somewhere else is not this workstation's to
+    allowlist, and is simply never in ``classified.commands``:
+    ``adb_shell(serial, command)`` executes on the phone, so its manifest
+    declares that ``command`` is ``foreign`` and it is compared to nothing
+    here.  (§7 puts ``adb_shell`` on the always-prompt list; that is B3's
+    gate, and the right one for it.)  Under the heuristic this was a
+    hard-coded family table keyed on ``manifest.id`` and a tool-name prefix;
+    it is now the plugin's own signed statement about its own argument.
     """
-    cmd_patterns = [p[4:] for p in manifest.declared_permissions if p.startswith("cmd:")]
-
-    # A command that runs somewhere else is not this workstation's to
-    # allowlist.  `adb_shell(serial, command)` executes on the phone, so
-    # matching it against `cmd:` denied every legitimate call — the same
-    # mistake as judging `device_path` against the workstation's roots.
-    exempt = foreign_args(manifest, tool)
-    present = [
-        v for v in _iter_keyed_values(args, _COMMAND_KEYS, exempt_keys=exempt)
-        if v is not None
-    ]
-    if not present:
+    classified = classify(manifest, tool, args)
+    if not classified.declared or classified.malformed:
+        return True
+    if not classified.commands:
         return False
 
+    cmd_patterns = [p[4:] for p in manifest.declared_permissions if p.startswith("cmd:")]
     if not cmd_patterns:
         log.warning(
             "command argument supplied to plugin=%s, which declares no cmd: allowlist",
@@ -932,30 +981,28 @@ def _command_outside_allowlist(
         )
         return True
 
-    for val in present:
+    for val in classified.commands:
         # Checked before the isinstance below: the sentinel IS a str, so a
-        # permissive pattern like `cmd:.*` would otherwise match it and turn
+        # permissive pattern like `cmd:*` would otherwise match it and turn
         # "I could not inspect this" into "allowed".
         if val == UNINSPECTABLE:
             log.warning("uninspectable command argument for plugin=%s", manifest.id)
             return True
-        if not isinstance(val, str):
-            # A command that is not a string cannot be matched against the
-            # allowlist, so it cannot be shown to be inside it.
+        if not isinstance(val, str):  # pragma: no cover — classify() guarantees str
             log.warning("non-string command argument for plugin=%s", manifest.id)
             return True
-        if not any(_fullmatch(pat, val) for pat in cmd_patterns):
+        if not any(_command_matches(pat, val) for pat in cmd_patterns):
             log.debug("command %r not in allowlist %s", val, cmd_patterns)
             return True
     return False
 
 
-def _domain_outside_allowlist(
+def _domain_outside_allowlist(  # noqa: PLR0911
     manifest: PluginManifest,
     tool: str,
     args: dict[str, Any],
 ) -> bool:
-    """Return True if a URL/domain argument is not in the declared domain allowlist.
+    """Return True if a declared URL argument is not in the ``domain:`` allowlist.
 
     An empty ``domain:`` allowlist denies every domain rather than
     permitting every domain — the same inversion fixed in
@@ -967,16 +1014,13 @@ def _domain_outside_allowlist(
     ``domain:`` permission at all, prompt for every navigation instead of
     silently allowing it.  That is what its manifest actually says.
     """
-    domain_patterns = [p[7:] for p in manifest.declared_permissions if p.startswith("domain:")]
-
-    exempt = foreign_args(manifest, tool)
-    present = [
-        v for v in _iter_keyed_values(args, _DOMAIN_KEYS, exempt_keys=exempt)
-        if v is not None
-    ]
-    if not present:
+    classified = classify(manifest, tool, args)
+    if not classified.declared or classified.malformed:
+        return True
+    if not classified.domains:
         return False
 
+    domain_patterns = [p[7:] for p in manifest.declared_permissions if p.startswith("domain:")]
     if not domain_patterns:
         log.warning(
             "domain argument supplied to plugin=%s, which declares no domain: allowlist",
@@ -984,7 +1028,7 @@ def _domain_outside_allowlist(
         )
         return True
 
-    for val in present:
+    for val in classified.domains:
         if val == UNINSPECTABLE or not isinstance(val, str):
             log.warning("uninspectable domain argument for plugin=%s", manifest.id)
             return True
@@ -999,11 +1043,11 @@ def _domain_outside_allowlist(
     return False
 
 
-_TRAILING_DOTS = re.compile(r"\.+$")
+# ---------------------------------------------------------------------------
+# URL host extraction — moved across unchanged
+# ---------------------------------------------------------------------------
 
-#: Argument names whose value is a command, and whose value is a URL/host.
-_COMMAND_KEYS: frozenset[str] = frozenset({"command", "cmd", "shell", "executable"})
-_DOMAIN_KEYS: frozenset[str] = frozenset({"url", "domain", "host", "endpoint"})
+_TRAILING_DOTS = re.compile(r"\.+$")
 
 
 def url_host(value: str) -> str:
@@ -1064,6 +1108,37 @@ def url_host(value: str) -> str:
     return host
 
 
+# ---------------------------------------------------------------------------
+# Allowlist pattern matching — one language, one escaper, one escape hatch
+#
+# THE cmd:/domain: SPLIT, RESOLVED.  Before B2b these were two different
+# pattern languages in the same manifest with nothing marking which was
+# which: `cmd:` was passed to re.fullmatch raw (so `cmd:git.exe` matched
+# `gitXexe`, a regex dot silently) while `domain:` was a glob (so
+# `domain:.*.example.com` matched nothing, failing closed but confusingly).
+# Nothing in the manifest told an author which they were writing.
+#
+# Resolution, in three parts:
+#
+#   1. **Untagged patterns are globs in both classes.**  One default
+#      language, and the literal text is escaped before any wildcard is
+#      substituted — so a dot can only ever mean a dot, in either class.
+#   2. **`re:` is the explicit, spelled-out escape hatch**, in both classes.
+#      `cmd:re:.*` is a regex; `cmd:.*` is now a glob meaning "a literal dot
+#      then anything".  Third-party manifests written for the old semantics
+#      therefore *tighten* rather than loosen — a visible over-denial, never
+#      a bypass — and the one shipped manifest that relied on regex `.*`
+#      (`powershell`) is changed to `cmd:*` in the same commit.
+#   3. **One translator**, `_glob_to_regex`, shared by both classes.  The
+#      unescaped `.replace("*", ".*")` that let `domain:*.example.com` admit
+#      `evil-example.com` can now exist in exactly one place, and that place
+#      is already fixed and mutation-proven.
+#
+# What deliberately still differs is the SCOPE of `*`, and only that:
+# hostnames have a label structure and command lines do not.  It is one
+# constant per class, named below, rather than two implementations.
+# ---------------------------------------------------------------------------
+
 #: What ``*`` means inside a ``domain:`` pattern: **one label**, matching the
 #: convention everyone already knows from TLS wildcard certificates.
 #: ``*.example.com`` covers ``api.example.com`` and not ``a.b.example.com``,
@@ -1074,9 +1149,20 @@ def url_host(value: str) -> str:
 #: or with a bare ``domain:*``.
 _DOMAIN_WILDCARD = "[^.]*"
 
+#: What ``*`` means inside a ``cmd:`` pattern: **any run of characters**.  A
+#: command line has no label structure to stop at, and ``cmd:git *`` meaning
+#: "git followed by anything" is the only reading an author could intend.
+_COMMAND_WILDCARD = ".*"
 
-def _domain_pattern_to_regex(pattern: str) -> str | None:
-    """Translate a ``domain:`` glob to an anchored regex, or None for "any".
+#: The explicit "this pattern is a regex" marker, in either class.  A DNS
+#: label cannot contain a colon and no shell command begins ``re:``, so the
+#: marker cannot collide with a literal; a pattern that genuinely must match
+#: the text ``re:foo`` writes ``re:re:foo``.
+_REGEX_MARKER = "re:"
+
+
+def _glob_to_regex(pattern: str, wildcard: str) -> str:
+    """Translate a glob to an anchored regex body.
 
     ``pattern.replace("*", ".*")`` was not a translation, it was a
     corruption: it left every **literal** dot as a regex ``.``, so
@@ -1086,23 +1172,34 @@ def _domain_pattern_to_regex(pattern: str) -> str | None:
     was bypassable by registering a lookalike domain.
 
     The literal text is escaped first and only the wildcard is translated
-    afterwards, so a dot in a pattern can only ever mean a dot.
+    afterwards, so a character in a pattern can only ever mean itself.
     """
-    text = pattern.strip().lower()
+    return re.escape(pattern).replace(re.escape("*"), wildcard)
+
+
+def _matches_pattern(pattern: str, value: str, *, wildcard: str, fold_case: bool) -> bool:
+    """True when *value* satisfies one declared allowlist *pattern*."""
+    text = pattern.strip()
+    if text[: len(_REGEX_MARKER)].lower() == _REGEX_MARKER:
+        return _fullmatch(text[len(_REGEX_MARKER):], value)
+    if fold_case:
+        text = text.lower()
     if text == "*":
-        # The explicit "anywhere" declaration.  Kept as a special case: with
-        # single-label semantics a bare "*" would otherwise fail to match any
-        # host containing a dot, i.e. every real host.
-        return None
-    return re.escape(text).replace(re.escape("*"), _DOMAIN_WILDCARD)
+        # The explicit "anything" declaration.  Kept as a special case: with
+        # single-label domain semantics a bare "*" would otherwise fail to
+        # match any host containing a dot, i.e. every real host.
+        return True
+    return _fullmatch(_glob_to_regex(text, wildcard), value)
 
 
 def _domain_matches(pattern: str, domain: str) -> bool:
     """True when *domain* satisfies one declared ``domain:`` pattern."""
-    regex = _domain_pattern_to_regex(pattern)
-    if regex is None:
-        return True
-    return _fullmatch(regex, domain)
+    return _matches_pattern(pattern, domain, wildcard=_DOMAIN_WILDCARD, fold_case=True)
+
+
+def _command_matches(pattern: str, command: str) -> bool:
+    """True when *command* satisfies one declared ``cmd:`` pattern."""
+    return _matches_pattern(pattern, command, wildcard=_COMMAND_WILDCARD, fold_case=False)
 
 
 def _fullmatch(pattern: str, value: str) -> bool:
@@ -1132,6 +1229,8 @@ CONDITION_CHECKERS: dict[str, _ConditionChecker] = {
 # Outcome
 # ---------------------------------------------------------------------------
 
+#: Machine-readable rule name for the read/action short-circuit.
+_READ_OUTSIDE_ROOTS = "read_outside_declared_paths"
 
 #: Everything a legitimate tool id may contain, end to end.
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
@@ -1188,7 +1287,82 @@ class PermissionOutcome:
 _ALLOW = PermissionOutcome(decision="allow", rule="allowed", reason="")
 
 
-def evaluate_detailed(
+def _declaration_outcome(
+    plugin: PluginManifest,
+    tool: str,
+    args: dict[str, Any],
+    shown_tool: str,
+    shown_plugin: str,
+) -> PermissionOutcome | None:
+    """Enforce default-deny on absence.  Returns a denial, or None to continue.
+
+    Three refusals, each of which must be a ``deny`` and must be reached
+    before either loop in :func:`evaluate_detailed`.  If any of them resolved
+    to "carry on", the declaration would become an opt-in bypass: a plugin
+    could escape the gate by declaring nothing, or by omitting one argument
+    from an otherwise complete declaration — strictly worse than the
+    heuristic this layer replaces, because the heuristic at least looked.
+    """
+    decl = tool_declaration(plugin, tool)
+    if decl is None:
+        log.warning(
+            "deny (no argument declaration): plugin=%s tool=%s", plugin.id, tool,
+        )
+        return PermissionOutcome(
+            decision="deny",
+            rule="undeclared_tool",
+            reason=(
+                f"The {shown_plugin!r} plugin does not declare what {shown_tool}'s "
+                f"arguments are, so this workstation cannot check the call and "
+                f"refused it."
+            ),
+        )
+
+    classified = classify(plugin, tool, args)
+    if classified.malformed:
+        return PermissionOutcome(
+            decision="deny",
+            rule="malformed_arguments",
+            reason=(
+                f"{shown_tool} was called with something that is not a set of named "
+                f"arguments, so the call was refused."
+            ),
+        )
+    if classified.undeclared:
+        log.warning(
+            "deny (undeclared argument): plugin=%s tool=%s args=%s",
+            plugin.id,
+            tool,
+            sorted(classified.undeclared),
+        )
+        return PermissionOutcome(
+            decision="deny",
+            rule="undeclared_argument",
+            reason=(
+                f"{shown_tool} was called with an argument the {shown_plugin!r} plugin "
+                f"does not declare, so this workstation could not tell what it was "
+                f"and refused the call."
+            ),
+        )
+    if classified.missing:
+        log.warning(
+            "deny (missing required argument): plugin=%s tool=%s missing=%s",
+            plugin.id,
+            tool,
+            list(classified.missing),
+        )
+        return PermissionOutcome(
+            decision="deny",
+            rule="missing_required_argument",
+            reason=(
+                f"{shown_tool} was called without an argument it always requires, "
+                f"so the call was refused."
+            ),
+        )
+    return None
+
+
+def evaluate_detailed(  # noqa: PLR0911
     plugin: PluginManifest,
     tool: str,
     args: dict[str, Any],
@@ -1202,6 +1376,17 @@ def evaluate_detailed(
     plumbs it so B3 can key §7's "remember for this session" on it; nothing
     here reads it for a decision yet, and a call with no session is evaluated
     exactly as before.
+
+    Order matters and is asserted by tests:
+
+    1. tool identity (declared **and** granted) — an ungranted tool never
+       reaches the argument layer, so a caller cannot probe a plugin's
+       declaration by calling tools it was never granted;
+    2. the declaration gate (default-deny on absence);
+    3. the read/action split — ``deny``, ahead of both loops;
+    4. confirmable conditions;
+    5. hard guards;
+    6. allow.
     """
     # Scrubbed once, here, and used for every reason built below.  The raw
     # `tool` is still what the gate *decides* on — only what is echoed back
@@ -1220,11 +1405,20 @@ def evaluate_detailed(
             ),
         )
 
+    # ---- Default-deny on absence --------------------------------------
+    # Must precede both loops below, and every branch inside must be a
+    # `deny`.  See _declaration_outcome.
+    refusal = _declaration_outcome(plugin, tool, args, shown_tool, shown_plugin)
+    if refusal is not None:
+        return refusal
+
     # ---- The read/action split (contract §11 item 6) -------------------
     # This MUST come before both loops below and MUST return "deny"
     # explicitly.  See the module docstring for why weakening
     # _outside_declared_paths instead would fall through to "allow".
-    if is_read_only_tool(tool) and _outside_declared_paths(plugin, tool, args):
+    declaration = tool_declaration(plugin, tool)
+    is_read = declaration is not None and declaration.read_only
+    if is_read and _outside_declared_paths(plugin, tool, args):
         log.warning(
             "deny (read outside declared roots): plugin=%s tool=%s session=%s",
             plugin.id,
@@ -1344,6 +1538,12 @@ def _check_tool_permission(
     * declared AND NOT granted       → deny (user hasn't authorised)
     * NOT declared AND granted       → deny (plugin never declared it)
     * NOT declared AND NOT granted   → deny (security default)
+
+    ``"*"`` here grants tool **identity** only.  It is emphatically not a
+    wildcard argument declaration: a plugin that declares ``*`` still needs an
+    ``args:`` entry per tool, or every call to it is refused.  Letting ``*``
+    stand in for the argument declaration would be exactly the opt-in bypass
+    default-deny exists to prevent.
     """
     if not plugin.declared_permissions:
         log.warning(

@@ -11,6 +11,14 @@ declared_permissions = [
   "tool:browser.eval",
   "browser.navigate",
   "browser.script",
+  "args:browser.open:action:!url=web_target",
+  "args:browser.screenshot:read",
+  "args:browser.click:action:!selector=opaque",
+  "args:browser.type:action:!selector=opaque,!text=opaque",
+  # "js" runs inside the browser, not in this workstation's shell, so it is
+  # not the cmd: allowlist's business -- declared foreign rather than opaque
+  # so an audit reader can see which claim is being made.
+  "args:browser.eval:action:!js=foreign",
 ]
 confirmable_conditions = ["domain_outside_allowlist"]
 

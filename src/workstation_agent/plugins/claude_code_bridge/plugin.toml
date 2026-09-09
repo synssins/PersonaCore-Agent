@@ -7,6 +7,12 @@ declared_permissions = [
     "tool:claude_code.invoke",
     "tool:claude_code.presence",
     "tool:claude_code.list_recent_sessions",
+    # "cwd" is a workstation path and this manifest declares no path: root,
+    # so any cwd is refused.  That is what the manifest says; grant it a root
+    # when the bridge is implemented rather than reclassifying the argument.
+    "args:claude_code.invoke:action:!prompt=opaque,cwd=ws_path,voice_approval=opaque",
+    "args:claude_code.presence:read",
+    "args:claude_code.list_recent_sessions:read:limit=opaque",
 ]
 confirmable_conditions = []
 

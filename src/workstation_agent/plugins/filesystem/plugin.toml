@@ -10,6 +10,14 @@ declared_permissions = [
   "tool:filesystem.delete",
   "path:%USERPROFILE%\\Documents",
   "path:%USERPROFILE%\\Downloads",
+  # What each argument IS.  args:<tool>:<mode>[:[!]<name>=<class>,...]
+  # mode is read|action; class is ws_path|ws_command|web_target|foreign|opaque;
+  # "!" marks the argument required.  A tool with no entry here is refused,
+  # and so is a call carrying an argument no entry names.
+  "args:filesystem.list:read:!path=ws_path",
+  "args:filesystem.read:read:!path=ws_path",
+  "args:filesystem.write:action:!path=ws_path,!content=opaque",
+  "args:filesystem.delete:action:!path=ws_path",
 ]
 confirmable_conditions = ["outside_declared_paths"]
 
