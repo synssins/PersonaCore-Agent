@@ -5,7 +5,9 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+import re
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 import tomlkit
@@ -221,6 +223,128 @@ def _merge_into_toml(doc: object, data: dict[str, object]) -> None:
 # Secrets
 # ---------------------------------------------------------------------------
 
+@dataclass(frozen=True)
+class _SecretInfo:
+    """A secret's human role, plus the one true way to fix it (if known).
+
+    The remedy travels with the role rather than being a single sentence
+    bolted onto every message, because the fix genuinely differs per
+    secret: re-entering a value only makes sense for a secret with a field
+    somewhere to type it into. ``remedy == ""`` means "no verified fix" --
+    the message names the role and states the failure, and stops there,
+    rather than inventing an instruction that might send the operator
+    looking for a control that does not exist.
+    """
+
+    role: str
+    remedy: str
+
+
+#: The re-enrolment remedy for a per-machine workstation token: unlike the
+#: LLM API key, there is no field anywhere in this product for a person to
+#: type this value into. PersonaCore mints it and pushes it to this Agent
+#: over TLS during enrolment (contract: the operator never handles it by
+#: hand), so the only real fix is to get a fresh pairing code and re-join.
+_REENROL_REMEDY = (
+    "Get a fresh pairing code from PersonaCore's Plugins screen and press "
+    "Join on this machine to re-enrol."
+)
+
+#: Logical secret names this product defines, mapped to their role and
+#: remedy. Keep this proportionate: it is a lookup table and a fallback,
+#: not a subsystem. A secret added later that is not listed here still
+#: gets a readable message via :func:`_secret_role`'s fallback -- it must
+#: never look broken just because it is unmapped.
+_SECRET_ROLES: dict[str, _SecretInfo] = {
+    "llm_api_key": _SecretInfo(
+        role="the API key for the LLM server",
+        remedy="Enter it again in the API Key field.",
+    ),
+    "workstation_token": _SecretInfo(
+        role="the network MCP bearer token PersonaCore uses to authenticate "
+        "to this workstation",
+        # Not currently reachable through load_secret -- network_mcp's own
+        # token lives in a separate plain file (network_mcp/credentials.py),
+        # not this DPAPI store -- so no remedy is verified for this fixed
+        # name. Left blank rather than guessing; see _SecretInfo's docstring.
+        remedy="",
+    ),
+}
+
+
+#: PersonaCore's enrolment derives one bearer-token secret per enrolled
+#: machine rather than a single fixed name: ``auth_secret_name()`` returns
+#: ``workstation_<slug>_token``, where ``<slug>`` is the machine name the
+#: operator chose (see PersonaCore's ``enrolment/workstation.py``). A static
+#: table can never enumerate those, so this pattern is matched instead of
+#: listed -- and it is worth getting right, since a DPAPI blob tied to the
+#: Windows account is exactly what breaks on a profile change, a machine
+#: move, or a restore from backup.
+_WORKSTATION_TOKEN_RE = re.compile(r"^workstation_(.+)_token$")
+
+#: Text whose origin we do not fully control -- a machine-name slug, or an
+#: entirely unrecognised secret name -- is capped to this length before it
+#: is ever folded into operator-facing text or the audit log.
+_DISPLAY_MAX_LEN = 40
+
+
+def _sanitize_for_display(text: str, *, max_len: int = _DISPLAY_MAX_LEN) -> str:
+    """Strip *text* to a small safe character set and cap its length.
+
+    Used on any string whose origin is not fully trusted before it reaches
+    a sentence: it must never be able to carry formatting or structure, and
+    must never be unbounded. Returns ``""`` if nothing safe is left.
+    """
+    return re.sub(r"[^A-Za-z0-9_-]", "", text)[:max_len]
+
+
+def _humanize_slug(slug: str) -> str:
+    """Render an untrusted machine-name *slug* as plain title-case words.
+
+    Sanitises first (see :func:`_sanitize_for_display`), so the result can
+    never carry formatting or structure into an operator-facing message --
+    it only ever reads as one or two plain words. Returns ``""`` if nothing
+    safe is left to show.
+    """
+    safe = _sanitize_for_display(slug)
+    words = [w for w in re.split(r"[_-]+", safe) if w]
+    return " ".join(words).title()
+
+
+def _secret_role(name: str) -> _SecretInfo:
+    """Return the human role and remedy for the secret *name*.
+
+    Checks the fixed role table first, then the per-machine
+    ``workstation_<slug>_token`` pattern, then falls back to naming the
+    secret plainly (its logical name, not its value) when *name* is not one
+    this product defines a role for yet.
+
+    Both fallback paths sanitise before they ever embed *name* (or a piece
+    of it) in operator-facing text: *name* comes from any caller, and a
+    fallback exists precisely for names nobody anticipated. When nothing
+    safe is left after sanitising, this returns a safe static phrase
+    instead of echoing the (possibly unsafe) input -- never the reverse,
+    since a sanitised path that is merely *skipped* on failure, falling
+    through to an unsanitised default, sanitises nothing at all.
+    """
+    if name in _SECRET_ROLES:
+        return _SECRET_ROLES[name]
+    match = _WORKSTATION_TOKEN_RE.match(name)
+    if match:
+        slug_words = _humanize_slug(match.group(1))
+        role = (
+            f"the connection credential for the workstation {slug_words}"
+            if slug_words
+            else "the connection credential for an enrolled workstation (name unavailable)"
+        )
+        return _SecretInfo(role=role, remedy=_REENROL_REMEDY)
+    safe_name = _sanitize_for_display(name)
+    role = f"the '{safe_name}' credential" if safe_name else "an unrecognised credential"
+    # No verified remedy for a name this product does not define a role
+    # for -- a vague true sentence beats a specific false one.
+    return _SecretInfo(role=role, remedy="")
+
+
 def save_secret(name: str, plaintext: bytes) -> None:
     """Encrypt *plaintext* with DPAPI and write to ``secrets/<name>.dpapi``.
 
@@ -261,16 +385,42 @@ def load_secret(name: str) -> bytes:
         Decrypted plaintext bytes.
 
     Raises:
-        KeyError: If the secret file does not exist (no info leak).
+        KeyError: If the secret file does not exist. The message names the
+            secret's role (a role is not a value — naming it is not a new
+            info leak, since the logical name is already the ``KeyError``'s
+            argument) and, only when one is verified for this secret (see
+            :class:`_SecretInfo`), states the remedy — never a generic
+            "enter it again" that would be wrong for a secret with no field
+            to enter it into.
+        DpapiError: If the stored blob exists but cannot be decrypted (e.g.
+            after a Windows profile change, a machine move, or a restore
+            from backup — the blob is tied to the Windows user account, so
+            this is an expected failure mode, not an exotic one). The
+            message names the secret's role and, when verified, its remedy;
+            it never includes decrypted or encrypted content.
     """
-    from workstation_agent.security.dpapi import unprotect  # noqa: PLC0415
+    from workstation_agent.security.dpapi import DpapiError, unprotect  # noqa: PLC0415
 
     p = paths()
     dest = p["secrets_dir"] / f"{name}.dpapi"
+    info = _secret_role(name)
     if not dest.exists():
-        raise KeyError(name)
+        msg = f"No value is stored for {info.role}."
+        if info.remedy:
+            msg += f" {info.remedy}"
+        raise KeyError(msg)
     blob = dest.read_bytes()
-    return unprotect(blob)
+    try:
+        return unprotect(blob)
+    except DpapiError as exc:
+        msg = (
+            f"{info.role} could not be decrypted on this machine/account "
+            "(this happens after a Windows profile change, a machine move, "
+            "or a restore from backup)."
+        )
+        if info.remedy:
+            msg += f" {info.remedy}"
+        raise DpapiError(msg) from exc
 
 
 def delete_secret(name: str) -> None:
