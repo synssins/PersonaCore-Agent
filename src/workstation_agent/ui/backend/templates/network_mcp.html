@@ -321,7 +321,15 @@
           <form method="post" action="/network-mcp/enrolled/remove"
                 onsubmit="return confirm('Removing a core rotates the bearer token for this endpoint, so EVERY core enrolled here is locked out, not just this one. Each remaining core has to join again. Continue?');">
             <input type="hidden" name="slug" value="{{ core.slug }}">
-            <button type="submit">Remove</button>
+            {# The label carries the blast radius, not just the dialog. A button
+               that says only "Remove" sits in a row and reads as row-scoped;
+               muscle memory then dismisses the confirmation without reading it.
+               Someone who reads the button and nothing else should not be
+               surprised by what happens, so the button says what happens.
+               This is a symptom of one bearer token for the whole endpoint —
+               token-per-core is the fix and is logged as future work in
+               join.py's module docstring. #}
+            <button type="submit">Remove — locks out every enrolled core</button>
           </form>
         </td>
       </tr>

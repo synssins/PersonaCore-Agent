@@ -27,12 +27,14 @@ from __future__ import annotations
 import datetime as dt
 import json
 import logging
+import pathlib
 
 import httpx
 import pytest
 
 from tests.unit.ui.conftest import make_client
 from workstation_agent.network_mcp import join as join_module
+from workstation_agent.network_mcp.credentials import ensure_token
 from workstation_agent.network_mcp.enrolment import EnrolmentError, JoinStatus
 from workstation_agent.network_mcp.join import CoreRefusedError
 
@@ -537,6 +539,122 @@ def test_the_empty_state_uses_begin_joins_own_words(tmp_path):
     ) in text
 
 
+def test_a_listen_address_the_endpoint_is_not_serving_is_refused(tmp_path):
+    """The dropdown constrains a browser and constrains nothing else."""
+    endpoint = FakeEndpoint(tmp_path, bind_hosts=(LAN,))
+    client = make_client(tmp_path=tmp_path, network_mcp=endpoint)
+
+    response = client.post(
+        "/network-mcp/join",
+        data={"code": CODE, "core_address": CORE, "listen_address": "203.0.113.9"},
+    )
+
+    assert response.status_code == 200
+    assert "not answering on the address that was submitted" in response.text
+    assert LAN in response.text, "the refusal names what it IS answering on"
+    assert endpoint.codes == [], "refused before the window opens"
+
+
+def test_a_hand_made_post_cannot_advertise_loopback(tmp_path):
+    """The loopback-only state the template handles so carefully is enforced
+    nowhere if a direct POST can walk past it.
+
+    ``begin_join`` does not catch this: what it asks is whether the endpoint is
+    loopback-*bound*, which on a LAN-bound endpoint is false, and is a different
+    question from what address the core is being told to dial.
+    """
+    endpoint = FakeEndpoint(tmp_path, bind_hosts=(LAN,))
+    client = make_client(tmp_path=tmp_path, network_mcp=endpoint)
+
+    response = client.post(
+        "/network-mcp/join",
+        data={"code": CODE, "core_address": CORE, "listen_address": "127.0.0.1"},
+    )
+
+    assert response.status_code == 200
+    assert "not an address another machine can be reached at" in response.text
+    assert endpoint.codes == [], "refused before the window opens"
+
+
+def test_an_address_the_picker_did_offer_is_not_refused(tmp_path, monkeypatch):
+    """The other half of the gate: it must refuse only what it should."""
+    core_answers(monkeypatch, accepting())
+    endpoint = FakeEndpoint(tmp_path, bind_hosts=(LAN, "10.0.0.7"))
+    client = make_client(tmp_path=tmp_path, network_mcp=endpoint)
+
+    response = client.post(
+        "/network-mcp/join",
+        data={"code": CODE, "core_address": CORE, "listen_address": "10.0.0.7"},
+    )
+
+    assert "joined as workstation-front-desk" in response.text
+
+
+def test_an_empty_listen_address_is_left_to_join_pys_own_sentence(tmp_path):
+    """Answering the same condition twice is two wordings of one problem."""
+    client = make_client(tmp_path=tmp_path, network_mcp=FakeEndpoint(tmp_path))
+
+    response = client.post(
+        "/network-mcp/join",
+        data={"code": CODE, "core_address": CORE, "listen_address": ""},
+    )
+
+    assert "Choose the address PersonaCore should reach this workstation at" in response.text
+
+
+def test_the_core_address_is_left_to_join_pys_validation(tmp_path):
+    """``core_enrol_url`` runs ahead of the window and already refuses an empty
+    address, an unparseable authority, a scheme that is not http(s), an address
+    naming no host, and one carrying userinfo. A second set of rules out in the
+    route could only agree with those or contradict them."""
+    endpoint = FakeEndpoint(tmp_path)
+    client = make_client(tmp_path=tmp_path, network_mcp=endpoint)
+
+    refused = client.post(
+        "/network-mcp/join",
+        data={"code": CODE, "core_address": "ftp://box", "listen_address": LAN},
+    )
+    assert "reached over http, not ftp" in refused.text
+
+    sneaky = client.post(
+        "/network-mcp/join",
+        data={"code": CODE, "core_address": "http://u:p@box", "listen_address": LAN},
+    )
+    assert "carries a username or a password" in sneaky.text
+    assert endpoint.codes == [], "both refused before the window opens"
+
+
+def test_an_enormous_refusal_from_the_core_cannot_stretch_the_page(
+    tmp_path, monkeypatch,
+):
+    """The verbatim pass-through is right and stays; the length is not the
+    core's to choose. ``_refusal_of`` reads a detail out of a 64 KiB body and
+    does not bound the sentence."""
+    flood = "A" * 20000
+    core_answers(monkeypatch, lambda _r: httpx.Response(400, json={"detail": flood}))
+    client = make_client(tmp_path=tmp_path, network_mcp=FakeEndpoint(tmp_path))
+
+    response = client.post(
+        "/network-mcp/join",
+        data={"code": CODE, "core_address": CORE, "listen_address": LAN},
+    )
+
+    assert flood not in response.text
+    assert "message truncated" in response.text, "a cut message must admit it"
+    assert "A" * 100 in response.text, "and the readable part still gets through"
+
+
+def test_a_bounded_message_still_wraps_rather_than_stretching():
+    """The other half of the defence: 400 characters with nowhere to break is
+    still one unbroken run, so the class it lands in has to wrap it."""
+    css = (
+        pathlib.Path("src/workstation_agent/ui/backend/static/skeleton.css")
+        .read_text(encoding="utf-8")
+    )
+    assert ".error, .success, .info { overflow-wrap: anywhere; }" in css
+    assert "td { overflow-wrap: anywhere; }" in css
+
+
 def test_the_page_offers_the_join_form_when_no_window_is_open(tmp_path):
     client = make_client(tmp_path=tmp_path, network_mcp=FakeEndpoint(tmp_path))
     text = client.get("/network-mcp").text
@@ -738,6 +856,129 @@ def test_removing_nothing_says_so_rather_than_rotating(tmp_path):
     assert response.status_code == 200
     assert "No core was named to remove" in response.text
     assert endpoint.revoked == 0
+
+
+def test_an_unknown_slug_removes_nothing_and_rotates_nothing(tmp_path):
+    """The worst thing this product can do, done for a typo, with nothing to show.
+
+    ``remove_enrolled_core`` rotates the token for a slug it cannot find, on
+    purpose — it is written for a caller that has already decided a core must
+    lose access, and a missing row is not evidence that it has. From a *form*
+    that rule is the wrong one: a mistyped or crafted slug would lock out every
+    enrolled core and delete nothing, leaving the owner no removed row to
+    connect the effect back to. So the route refuses first.
+
+    Asserted on the token, not on the response: the response says something
+    reasonable either way, and only the token says whether the destructive half
+    actually ran.
+    """
+    enrol(tmp_path)
+    before = ensure_token(tmp_path)
+    endpoint = FakeEndpoint(tmp_path)
+    client = make_client(tmp_path=tmp_path, network_mcp=endpoint)
+
+    response = client.post(
+        "/network-mcp/enrolled/remove", data={"slug": "front-desx"},
+    )
+
+    assert response.status_code == 200
+    assert ensure_token(tmp_path) == before, "an unknown slug must not rotate"
+    assert endpoint.revoked == 0
+    assert [c.slug for c in join_module.list_enrolled_cores(state_dir=tmp_path)] == [
+        "front-desk",
+    ]
+    assert "was NOT rotated" in response.text
+
+
+def test_a_real_slug_still_rotates_so_the_guard_did_not_break_removal(tmp_path):
+    """The other half of the guard: it must refuse only what it should.
+
+    With nothing registered as the live endpoint, ``join._revoke_token`` rotates
+    the token *file*, which it documents as the whole of what "in force" can
+    mean when nothing is serving. The next test covers the other branch.
+    """
+    enrol(tmp_path)
+    before = ensure_token(tmp_path)
+    client = make_client(tmp_path=tmp_path, network_mcp=FakeEndpoint(tmp_path))
+
+    client.post("/network-mcp/enrolled/remove", data={"slug": "front-desk"})
+
+    assert ensure_token(tmp_path) != before, "a real slug must rotate"
+    assert join_module.list_enrolled_cores(state_dir=tmp_path) == ()
+
+
+def test_a_running_endpoint_is_revoked_through_itself_not_through_the_file(
+    tmp_path, monkeypatch,
+):
+    """Rotating the file alone leaves the running listener accepting the old
+    value until the next restart, which is the window a removal exists to close."""
+    enrol(tmp_path)
+    endpoint = FakeEndpoint(tmp_path)
+    monkeypatch.setattr(join_module, "_endpoint", endpoint)
+    client = make_client(tmp_path=tmp_path, network_mcp=endpoint)
+
+    client.post("/network-mcp/enrolled/remove", data={"slug": "front-desk"})
+
+    assert endpoint.revoked == 1
+    assert join_module.list_enrolled_cores(state_dir=tmp_path) == ()
+
+
+def test_an_unknown_slug_does_not_revoke_a_running_endpoint_either(
+    tmp_path, monkeypatch,
+):
+    """Finding 1 on the branch that actually locks a live core out."""
+    enrol(tmp_path)
+    endpoint = FakeEndpoint(tmp_path)
+    monkeypatch.setattr(join_module, "_endpoint", endpoint)
+    client = make_client(tmp_path=tmp_path, network_mcp=endpoint)
+
+    client.post("/network-mcp/enrolled/remove", data={"slug": "front-desx"})
+
+    assert endpoint.revoked == 0
+    assert [c.slug for c in join_module.list_enrolled_cores(state_dir=tmp_path)] == [
+        "front-desk",
+    ]
+
+
+def test_an_unexpected_removal_failure_names_the_type_and_not_the_exception(
+    tmp_path, monkeypatch,
+):
+    """Consistent with join_post, deliberately: str(exc) on an httpx error can
+    quote the request, and the request carries the body the code was in."""
+    enrol(tmp_path)
+
+    def explode(*_args, **_kwargs):
+        leaky = f"revocation blew up while holding code={CODE}"
+        raise RuntimeError(leaky)
+
+    monkeypatch.setattr(
+        "workstation_agent.ui.backend.routers.network_mcp_routes.remove_enrolled_core",
+        explode,
+    )
+    client = make_client(tmp_path=tmp_path, network_mcp=FakeEndpoint(tmp_path))
+
+    response = client.post(
+        "/network-mcp/enrolled/remove", data={"slug": "front-desk"},
+    )
+
+    assert response.status_code == 200
+    assert "RuntimeError" in response.text
+    assert CODE not in response.text
+    assert "blew up" not in response.text
+
+
+def test_the_remove_button_says_what_it_does(tmp_path):
+    """Someone who reads only the button, never the paragraph or the dialog,
+    must not be surprised. A bare "Remove" in a row reads as row-scoped."""
+    enrol(tmp_path)
+    client = make_client(tmp_path=tmp_path, network_mcp=FakeEndpoint(tmp_path))
+
+    text = client.get("/network-mcp").text
+
+    assert "Remove — locks out every enrolled core</button>" in text
+    # The other two warnings stay; the label is an addition, not a replacement.
+    assert "Removing any core here locks out every core here" in text
+    assert "return confirm(" in text
 
 
 def test_no_bearer_token_is_offered_anywhere_in_the_enrolment_surface(tmp_path):
