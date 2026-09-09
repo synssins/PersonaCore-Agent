@@ -11,7 +11,18 @@ from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from workstation_agent.updater_client.source_pin import (
+    MAX_REDIRECTS,
+    REDIRECT_STATUS,
+    SourcePin,
+    SourcePinError,
+    check_artifact_origin,
+    resolve_redirect,
+)
+
 if TYPE_CHECKING:
+    from collections.abc import Callable, Mapping
+
     import httpx
 
 
@@ -40,10 +51,14 @@ class ArtifactRef(BaseModel):
     @field_validator("url")
     @classmethod
     def _url_shape(cls, v: str) -> str:
-        if not v.startswith(("http://", "https://")):
-            msg = "url must be http:// or https://"
-            raise ValueError(msg)
-        return v
+        """Reject anything that is not a GitHub release download.
+
+        This is the shape gate — https, ``github.com``, a
+        ``…/releases/download/<tag>/<asset>`` path — and it runs wherever a
+        manifest is parsed. Which *repository* the download must belong to is
+        checked in :func:`fetch`, where the locally-configured pin is known.
+        """
+        return check_artifact_origin(v)
 
 
 class ArtifactSet(BaseModel):
@@ -84,6 +99,17 @@ class UpdateManifest(BaseModel):
             raise ValueError(msg)
         return v
 
+    @field_validator("notes_url")
+    @classmethod
+    def _notes_url(cls, v: str) -> str:
+        # Not origin-pinned (release notes may legitimately live elsewhere),
+        # but it may end up in front of a user, so no cleartext and no
+        # javascript:/file: smuggling.
+        if not v.startswith("https://"):
+            msg = "notes_url must be https://"
+            raise ValueError(msg)
+        return v
+
 
 _SEMVER_PARTS = 3
 
@@ -103,23 +129,69 @@ def is_newer(candidate: str, current: str) -> bool:
     return _parse_version(candidate) > _parse_version(current)
 
 
+async def _get_pinned(
+    http: httpx.AsyncClient,
+    url: str,
+    *,
+    check_initial: Callable[[str], str],
+    headers: Mapping[str, str] | None = None,
+) -> httpx.Response:
+    """GET *url* with the update-source pin enforced at every stage.
+
+    The initial URL goes through *check_initial*; redirects are followed by
+    hand — with ``follow_redirects=False`` on each request, so the caller's
+    client settings cannot quietly hand control of the chain to the server —
+    and each hop is checked against the redirect allowlist.
+
+    Raises:
+        SourcePinError: the initial URL or some hop is off the pinned source,
+            or the chain is longer than :data:`MAX_REDIRECTS`.
+    """
+    check_initial(url)
+    current = url
+    for _ in range(MAX_REDIRECTS):
+        resp = await http.get(current, headers=dict(headers or {}), follow_redirects=False)
+        if resp.status_code not in REDIRECT_STATUS:
+            resp.raise_for_status()
+            return resp
+        current = resolve_redirect(current, resp.headers.get("location", ""))
+    msg = f"update fetch exceeded {MAX_REDIRECTS} redirects starting at {url}"
+    raise SourcePinError(msg)
+
+
 async def fetch(
     github_repo: str,
     http: httpx.AsyncClient,
 ) -> tuple[UpdateManifest, bytes, bytes]:
     """Fetch and parse the latest release manifest.
 
+    Every request is pinned to *github_repo*'s GitHub release hosting: the
+    manifest feed must be that repo's ``api.github.com`` endpoint, the two
+    asset URLs the API hands back must be that repo's release downloads, and
+    redirects may only land on GitHub-operated hosts. See
+    :mod:`workstation_agent.updater_client.source_pin`.
+
     Returns a tuple of ``(manifest, raw_manifest_bytes, signature_bytes)``.
     The raw bytes are exactly what the server sent — they are the input to
     the Ed25519 verifier and must NOT be re-serialised before verification.
 
     Args:
-        github_repo: e.g. ``"synssins/PersonaCore-Agent"``.
+        github_repo: e.g. ``"synssins/PersonaCore-Agent"``. A local setting;
+            never taken from the payload being validated.
         http: an ``httpx.AsyncClient`` (or drop-in test double).
+
+    Raises:
+        SourcePinError: if the feed, an asset URL, or a redirect leaves the
+            pinned repository's GitHub release hosting.
+        ValueError: if the release is missing the manifest or its signature.
     """
-    api_url = f"https://api.github.com/repos/{github_repo}/releases/latest"
-    resp = await http.get(api_url, headers={"Accept": "application/vnd.github+json"})
-    resp.raise_for_status()
+    pin = SourcePin(github_repo)
+    resp = await _get_pinned(
+        http,
+        pin.api_latest_release_url,
+        check_initial=pin.check_api_url,
+        headers={"Accept": "application/vnd.github+json"},
+    )
     payload = resp.json()
 
     manifest_url: str | None = None
@@ -135,8 +207,16 @@ async def fetch(
         msg = "release missing manifest.json and/or manifest.json.sig assets"
         raise ValueError(msg)
 
-    manifest_bytes = (await http.get(manifest_url)).content
-    sig_bytes = (await http.get(sig_url)).content
+    # The API response is payload, not authority: its download URLs get the
+    # same stage-1 gate as anything the manifest itself names.
+    manifest_bytes = (
+        await _get_pinned(http, manifest_url, check_initial=pin.check_artifact_url)
+    ).content
+    sig_bytes = (await _get_pinned(http, sig_url, check_initial=pin.check_artifact_url)).content
 
     manifest = UpdateManifest.model_validate_json(manifest_bytes)
+    # The model gate proved the artifacts are GitHub release downloads; this
+    # proves they are *this* repository's.
+    pin.check_artifact_url(manifest.artifacts.agent.url)
+    pin.check_artifact_url(manifest.artifacts.updater.url)
     return manifest, manifest_bytes, sig_bytes

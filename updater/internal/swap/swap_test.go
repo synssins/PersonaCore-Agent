@@ -11,7 +11,22 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/synssins/PersonaCore-Agent/updater/internal/origin"
 )
+
+// testPolicy pins to the real repo but also permits the loopback fixture
+// servers these tests spin up - the same escape a test build of Updater.exe
+// bakes in via -ldflags, and the only way a non-GitHub origin is ever
+// reachable.
+func testPolicy(t *testing.T) *origin.Policy {
+	t.Helper()
+	pol, err := origin.New(origin.DefaultRepo, []string{"http://127.0.0.1", "http://localhost"})
+	if err != nil {
+		t.Fatalf("origin.New: %v", err)
+	}
+	return pol
+}
 
 func TestDownload_VerifiesSHA256(t *testing.T) {
 	payload := []byte("hello updater world")
@@ -25,7 +40,7 @@ func TestDownload_VerifiesSHA256(t *testing.T) {
 	defer srv.Close()
 
 	dest := filepath.Join(t.TempDir(), "sub", "dl.bin")
-	n, err := Download(nil, srv.URL, dest, sumHex)
+	n, err := Download(nil, testPolicy(t), srv.URL, dest, sumHex)
 	if err != nil {
 		t.Fatalf("Download: %v", err)
 	}
@@ -42,7 +57,7 @@ func TestDownload_VerifiesSHA256(t *testing.T) {
 
 	// Wrong hash -> error, no dest file.
 	dest2 := filepath.Join(t.TempDir(), "dl2.bin")
-	_, err = Download(nil, srv.URL, dest2, "00"+sumHex[2:])
+	_, err = Download(nil, testPolicy(t), srv.URL, dest2, "00"+sumHex[2:])
 	if err == nil {
 		t.Fatal("expected sha mismatch error")
 	}
@@ -56,7 +71,7 @@ func TestDownload_HTTPError(t *testing.T) {
 		w.WriteHeader(500)
 	}))
 	defer srv.Close()
-	if _, err := Download(nil, srv.URL, filepath.Join(t.TempDir(), "x"), ""); err == nil {
+	if _, err := Download(nil, testPolicy(t), srv.URL, filepath.Join(t.TempDir(), "x"), ""); err == nil {
 		t.Fatal("expected HTTP error")
 	}
 }

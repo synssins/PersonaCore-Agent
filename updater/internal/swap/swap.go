@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/synssins/PersonaCore-Agent/updater/internal/junction"
+	"github.com/synssins/PersonaCore-Agent/updater/internal/origin"
 )
 
 // InstallLayout describes the directory layout the updater operates on.
@@ -109,10 +110,22 @@ func pidAlive(pid int) bool {
 // Download fetches url into destPath, verifying its SHA-256 against
 // wantSHA256Hex as it streams. Overwrites destPath if it exists.
 // Returns the actual size in bytes.
-func Download(client *http.Client, url, destPath, wantSHA256Hex string) (int64, error) {
+//
+// pol is mandatory: the URL is checked against the origin pin before a
+// connection is opened, and the client is hardened with the pin's redirect
+// policy regardless of what the caller handed us. A nil pol is a programming
+// error and is refused rather than defaulting to "anything goes".
+func Download(client *http.Client, pol *origin.Policy, url, destPath, wantSHA256Hex string) (int64, error) {
+	if pol == nil {
+		return 0, errors.New("download: no update-source policy (refusing unpinned download)")
+	}
+	if err := pol.CheckArtifactURL(url); err != nil {
+		return 0, fmt.Errorf("download refused: %w", err)
+	}
 	if client == nil {
 		client = &http.Client{Timeout: 5 * time.Minute}
 	}
+	client = pol.Harden(client, 5*time.Minute)
 	if err := os.MkdirAll(filepath.Dir(destPath), 0o755); err != nil {
 		return 0, err
 	}

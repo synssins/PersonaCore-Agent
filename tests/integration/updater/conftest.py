@@ -13,9 +13,15 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 from nacl.signing import SigningKey
+
+from workstation_agent.updater_client.source_pin import allow_extra_origins
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 UPDATER_SRC = REPO_ROOT / "updater"
@@ -42,7 +48,15 @@ def updater_binary(tmp_path_factory: pytest.TempPathFactory,
     outdir = tmp_path_factory.mktemp("updater-build")
     binary = outdir / "Updater.exe"
 
-    ldflags = f"-X main.PublicKeyHex={pubhex} -X main.UpdaterVersion=0.0.0-test"
+    # The updater refuses any download that does not start at
+    # https://github.com/<pinned repo>/releases/download/... Bake the loopback
+    # escape into THIS build so the fixture HTTP server is reachable; a
+    # release build passes no -X main.ExtraOrigins and is therefore
+    # GitHub-only, with no runtime flag or env var that can widen it.
+    ldflags = (
+        f"-X main.PublicKeyHex={pubhex} -X main.UpdaterVersion=0.0.0-test "
+        f"-X main.ExtraOrigins=http://127.0.0.1,http://localhost"
+    )
     cmd = [
         go_exe,
         "build",
@@ -66,6 +80,20 @@ def updater_binary(tmp_path_factory: pytest.TempPathFactory,
         )
     assert binary.exists(), f"expected binary at {binary}"
     return binary
+
+
+@pytest.fixture(autouse=True)
+def _allow_fixture_server_origin() -> Iterator[None]:
+    """Let this package's tests use the local pytest-httpserver as an origin.
+
+    The Python client pins artifact downloads to the project's GitHub release
+    hosting, exactly as the Go updater does. These tests serve their fixtures
+    from ``http://localhost:<port>``, so they take the same process-local
+    escape the Go test build bakes in. Nothing outside this repository's own
+    test process can set it, and no manifest can.
+    """
+    with allow_extra_origins("http://localhost", "http://127.0.0.1"):
+        yield
 
 
 def _resolve_go() -> str | None:

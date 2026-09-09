@@ -1,0 +1,76 @@
+diff --git a/src/workstation_agent/ui/backend/routers/first_run.py b/src/workstation_agent/ui/backend/routers/first_run.py
+index 6763dc3..4149dd7 100644
+--- a/src/workstation_agent/ui/backend/routers/first_run.py
++++ b/src/workstation_agent/ui/backend/routers/first_run.py
+@@ -25,6 +25,7 @@ log = logging.getLogger(__name__)
+ router = APIRouter(prefix="/first-run", tags=["first-run"])
+ 
+ _WYOMING_PORT_MAX = 65535
++_HTTP_ERROR_STATUS_MIN = 400
+ 
+ 
+ def _split_url(url: str, default_port: int = 8053) -> tuple[str, int]:
+@@ -83,7 +84,7 @@ async def detect_models(
+     try:
+         async with httpx.AsyncClient(timeout=4.0) as client:
+             resp = await client.get(url, headers=headers)
+-        if resp.status_code >= 400:
++        if resp.status_code >= _HTTP_ERROR_STATUS_MIN:
+             return JSONResponse({
+                 "models": [], "error": f"HTTP {resp.status_code}",
+             })
+@@ -97,16 +98,37 @@ async def detect_models(
+         return JSONResponse({"models": [], "error": str(exc)})
+ 
+ 
++class _LLMStepForm:
++    """Form fields for the LLM wizard step, grouped into one dependency.
++
++    FastAPI resolves each ``Form()`` field itself; grouping them here keeps
++    the route handler below at a framework-reasonable argument count instead
++    of listing every form field as its own parameter.
++    """
++
++    def __init__(
++        self,
++        llm_host: Annotated[str, Form()] = "192.168.1.150",
++        llm_port: Annotated[int, Form()] = 8053,
++        model: Annotated[str, Form()] = "gpt-4o",
++        api_key_ref: Annotated[str, Form()] = "",
++    ) -> None:
++        self.llm_host = llm_host
++        self.llm_port = llm_port
++        self.model = model
++        self.api_key_ref = api_key_ref
++
++
+ @router.post("/llm", response_class=HTMLResponse, response_model=None)
+ async def first_run_llm(
+     request: Request,
+     ctx: Annotated[BackendContext, Depends(get_context)],
+-    llm_host: Annotated[str, Form()] = "192.168.1.150",
+-    llm_port: Annotated[int, Form()] = 8053,
+-    model: Annotated[str, Form()] = "gpt-4o",
+-    api_key_ref: Annotated[str, Form()] = "",
++    form: Annotated[_LLMStepForm, Depends()],
+ ) -> HTMLResponse | RedirectResponse:
+     """Process LLM step of the wizard."""
++    llm_host, llm_port, model, api_key_ref = (
++        form.llm_host, form.llm_port, form.model, form.api_key_ref,
++    )
+     errors: dict[str, str] = {}
+     llm_host = llm_host.strip()
+     # Accept the whole URL pasted into the host field — reparse.
+diff --git a/src/workstation_agent/ui/webview/window.py b/src/workstation_agent/ui/webview/window.py
+index 475332a..1c54cba 100644
+--- a/src/workstation_agent/ui/webview/window.py
++++ b/src/workstation_agent/ui/webview/window.py
+@@ -187,7 +187,7 @@ class WebviewWindow:
+         self._window.load_url(url)
+         try:
+             self._window.show()
+-        except Exception:  # noqa: BLE001
++        except Exception:
+             log.debug("window.show() no-op'd", exc_info=True)
+         log.debug("Navigated window to %s", url)
+ 

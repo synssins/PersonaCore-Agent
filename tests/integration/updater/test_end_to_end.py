@@ -491,8 +491,8 @@ def test_stage_pending_atomic(tmp_path: Path) -> None:
         mandatory=False,
         notes_url="https://example.invalid",
         artifacts=ArtifactSet(
-            agent=ArtifactRef(url="https://a", sha256="a" * 64, size=1),
-            updater=ArtifactRef(url="https://u", sha256="b" * 64, size=1),
+            agent=ArtifactRef(url=_RELEASE_BASE + "/agent.zip", sha256="a" * 64, size=1),
+            updater=ArtifactRef(url=_RELEASE_BASE + "/Updater.exe", sha256="b" * 64, size=1),
         ),
         min_updater_version="1.0.0",
     )
@@ -517,6 +517,12 @@ def test_stage_pending_atomic(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+# Artifact URLs are pinned to the configured repo's GitHub release hosting,
+# so fixtures have to look like the real thing. The poller/fetch tests below
+# use repo "o/r".
+_RELEASE_BASE = "https://github.com/o/r/releases/download/v1.2.3"
+
+
 def _make_manifest_dict(*, version: str = "1.2.3") -> dict[str, Any]:
     return {
         "version": version,
@@ -525,8 +531,8 @@ def _make_manifest_dict(*, version: str = "1.2.3") -> dict[str, Any]:
         "mandatory": False,
         "notes_url": "https://example.invalid/notes",
         "artifacts": {
-            "agent": {"url": "https://x/agent.zip", "sha256": "a" * 64, "size": 10},
-            "updater": {"url": "https://x/updater.exe", "sha256": "b" * 64, "size": 5},
+            "agent": {"url": _RELEASE_BASE + "/agent.zip", "sha256": "a" * 64, "size": 10},
+            "updater": {"url": _RELEASE_BASE + "/updater.exe", "sha256": "b" * 64, "size": 5},
         },
         "min_updater_version": "1.0.0",
     }

@@ -19,6 +19,7 @@ import (
 
 	"github.com/synssins/PersonaCore-Agent/updater/internal/logging"
 	"github.com/synssins/PersonaCore-Agent/updater/internal/manifest"
+	"github.com/synssins/PersonaCore-Agent/updater/internal/origin"
 	"github.com/synssins/PersonaCore-Agent/updater/internal/prune"
 	"github.com/synssins/PersonaCore-Agent/updater/internal/selfexec"
 	"github.com/synssins/PersonaCore-Agent/updater/internal/swap"
@@ -35,6 +36,49 @@ var PublicKeyHex = ""
 
 // UpdaterVersion is stamped in the same way (defaults for dev builds).
 var UpdaterVersion = "0.0.0-dev"
+
+// Repo is the GitHub repository update artifacts must come from. It is a
+// build-time constant — stamped with
+//
+//	-ldflags "-X main.Repo=owner/name"
+//
+// so a fork can retarget its own updater — and is deliberately NOT readable
+// from the environment, the CLI, or (least of all) the manifest: the thing
+// being validated must never be able to authorise itself.
+var Repo = origin.DefaultRepo
+
+// ExtraOrigins is a comma-separated "scheme://host" list of additional
+// permitted origins, likewise stamped at build time:
+//
+//	-ldflags "-X main.ExtraOrigins=http://127.0.0.1"
+//
+// It exists solely so the test-suite can build an updater that talks to a
+// local fixture server. Release builds leave it empty, which makes the binary
+// GitHub-only with no runtime way to widen it.
+var ExtraOrigins = ""
+
+// originPolicy builds the pin from the baked-in build constants.
+func originPolicy() (*origin.Policy, error) {
+	return origin.New(Repo, origin.ParseOriginList(ExtraOrigins))
+}
+
+// checkArtifacts validates every download URL a manifest names, in a fixed
+// order so the failure message is reproducible. Returns the offending
+// artifact's label and the reason, or ("", nil) when all of them are pinned.
+func checkArtifacts(pol *origin.Policy, m *manifest.UpdateManifest) (string, error) {
+	for _, art := range []struct {
+		label string
+		url   string
+	}{
+		{"agent", m.Artifacts.Agent.URL},
+		{"updater", m.Artifacts.Updater.URL},
+	} {
+		if err := pol.CheckArtifactURL(art.url); err != nil {
+			return art.label, err
+		}
+	}
+	return "", nil
+}
 
 func main() {
 	os.Exit(run(os.Args[1:]))
@@ -136,6 +180,21 @@ func cmdUpdate(log *logging.Logger, pubkeyHex, installOverride, pendingOverride 
 	}
 	m := &pending.Manifest
 
+	// Pin the update source before anything else touches the network. The
+	// policy comes from build-time constants only; the manifest we are about
+	// to act on gets no say in where its own bytes may be fetched from.
+	pol, err := originPolicy()
+	if err != nil {
+		log.Error("update: %v", err)
+		return 1
+	}
+	// Fail fast, before we spawn a relay child, if the manifest names a
+	// download anywhere but the pinned repo's release hosting.
+	if label, cerr := checkArtifacts(pol, m); cerr != nil {
+		log.Error("update: %s artifact rejected: %v", label, cerr)
+		return 1
+	}
+
 	// Self-relay so we can swap `current` without holding it open.
 	relayed, spawned, err := selfexec.RelayIfNeeded(m.Version, os.Args[1:])
 	if err != nil {
@@ -188,7 +247,7 @@ func cmdUpdate(log *logging.Logger, pubkeyHex, installOverride, pendingOverride 
 	agentZip := filepath.Join(incoming, "agent.zip")
 	client := &http.Client{Timeout: 15 * time.Minute}
 	log.Info("update: downloading %s", m.Artifacts.Agent.URL)
-	if _, err := swap.Download(client, m.Artifacts.Agent.URL, agentZip, m.Artifacts.Agent.SHA256); err != nil {
+	if _, err := swap.Download(client, pol, m.Artifacts.Agent.URL, agentZip, m.Artifacts.Agent.SHA256); err != nil {
 		log.Error("update: download agent: %v", err)
 		return 1
 	}
@@ -304,13 +363,18 @@ func cmdCheck(log *logging.Logger, pubkeyHex, manifestURL, sigURL string) int {
 		fmt.Fprintln(os.Stderr, "--check requires --check-manifest and --check-sig URLs")
 		return 2
 	}
+	pol, err := originPolicy()
+	if err != nil {
+		log.Error("check: %v", err)
+		return 1
+	}
 	client := &http.Client{Timeout: 30 * time.Second}
-	mBytes, err := httpGetBytes(client, manifestURL)
+	mBytes, err := httpGetBytes(client, pol, manifestURL)
 	if err != nil {
 		log.Error("check: manifest: %v", err)
 		return 1
 	}
-	sBytes, err := httpGetBytes(client, sigURL)
+	sBytes, err := httpGetBytes(client, pol, sigURL)
 	if err != nil {
 		log.Error("check: sig: %v", err)
 		return 1
@@ -330,13 +394,29 @@ func cmdCheck(log *logging.Logger, pubkeyHex, manifestURL, sigURL string) int {
 		log.Error("check: parse: %v", err)
 		return 1
 	}
+	// A valid signature says the manifest is ours; it does not say the URLs
+	// inside it are. Report the pin violation instead of printing a manifest
+	// that --update would then refuse.
+	if label, cerr := checkArtifacts(pol, m); cerr != nil {
+		log.Error("check: %s artifact rejected: %v", label, cerr)
+		fmt.Println("REJECTED")
+		return 1
+	}
 	out, _ := json.MarshalIndent(m, "", "  ")
 	fmt.Println(string(out))
 	return 0
 }
 
-func httpGetBytes(client *http.Client, url string) ([]byte, error) {
-	resp, err := client.Get(url)
+// httpGetBytes fetches a pinned URL. Both the initial URL and every redirect
+// hop are checked against pol.
+func httpGetBytes(client *http.Client, pol *origin.Policy, url string) ([]byte, error) {
+	if pol == nil {
+		return nil, fmt.Errorf("no update-source policy (refusing unpinned fetch)")
+	}
+	if err := pol.CheckArtifactURL(url); err != nil {
+		return nil, err
+	}
+	resp, err := pol.Harden(client, 30*time.Second).Get(url)
 	if err != nil {
 		return nil, err
 	}
