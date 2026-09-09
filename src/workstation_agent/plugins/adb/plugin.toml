@@ -1,0 +1,74 @@
+id = "adb"
+name = "ADB"
+version = "0.1.0"
+runtime = "python"
+entry = ["-m", "workstation_agent.plugins.adb"]
+declared_permissions = [
+  "tool:adb.devices",
+  "tool:adb.shell",
+  "tool:adb.push",
+  "tool:adb.pull",
+  "tool:adb.install",
+  "tool:adb.logcat",
+
+  # Roots for the two tools that read a file from THIS workstation.  §6:
+  # "adb_push, adb_install and files_* take workstation paths, and all of them
+  # are confined to the declared roots: a path outside is denied for push and
+  # install exactly as for files_read.  Otherwise adb_push would read any file
+  # on the workstation onto a device."
+  "path:%USERPROFILE%\\Documents",
+  "path:%USERPROFILE%\\Downloads",
+
+  # What each argument IS.  args:<tool>:<mode>[:[!]<name>=<class>,...]
+  # mode is read|action; class is ws_path|ws_command|web_target|foreign|opaque;
+  # "!" marks the argument required.  A tool with no entry here is refused, and
+  # so is a call carrying an argument no entry names.
+  #
+  # THE TOOL NAME IS DOTTED.  host.invoke() receives `tool.internal_name`
+  # ("adb.pull") on every path that exists -- network_mcp/server.py passes it
+  # directly and the underscore wire spelling is translated at the endpoint
+  # boundary, never reaching the gate.  Under default-deny, "args:adb_pull:..."
+  # declares a tool that does not exist and leaves adb.pull undeclared, i.e. a
+  # tool nobody can call.
+  #
+  # THE foreign/ws_path SPLIT IS THE WHOLE POINT OF THIS FAMILY, and it is
+  # wrong in both directions if you generalise it:
+  #
+  #   device_path and command run on the PHONE.  They are `foreign`.  Declaring
+  #   a phone path `ws_path` compares "/sdcard/DCIM/x.jpg" against
+  #   %USERPROFILE%\Documents, which never matches, and denies every
+  #   legitimate call.
+  #
+  #   workstation_path is a path on THIS MACHINE.  It is `ws_path` and stays
+  #   confined.  Declaring it `foreign` to "make adb work" would exempt it from
+  #   root comparison and let adb_push copy any file on the workstation onto a
+  #   phone -- the exact hole §6 names.
+  #
+  # serial is `opaque`, not `foreign`: it is an identifier, in the same family
+  # as a job id, and does not name a location or a command in any namespace.
+  # The two classes are identical in mechanism and differ only in what they
+  # tell the audit reader, so the distinction is worth keeping honest.
+  #
+  # NO confirmable_conditions ARE DECLARED, and that is deliberate.  The
+  # hard-guard loop in evaluate_detailed skips any guard a plugin lists as a
+  # confirmable condition; listing outside_declared_paths would turn an
+  # out-of-roots push into a prompt that a person could approve.  §6 says it is
+  # `denied`, "exactly as for files_read", so the guard stays hard and the
+  # answer is a refusal in both read and action modes.  §7's always-prompt
+  # entry for adb_shell / adb_push / adb_install is a separate mechanism (the
+  # operator-editable list, B3) and is not expressible here -- CONDITION_CHECKERS
+  # has no "always" checker.
+  #
+  # read|action follows §7's two lists exactly: never-prompt tools are `read`,
+  # always-prompt tools are `action`.
+  "args:adb.devices:read",
+  "args:adb.shell:action:serial=opaque,!command=foreign,wait_s=opaque",
+  "args:adb.push:action:serial=opaque,!workstation_path=ws_path,!device_path=foreign",
+  "args:adb.pull:read:serial=opaque,!device_path=foreign",
+  "args:adb.install:action:serial=opaque,!workstation_path=ws_path",
+  "args:adb.logcat:read:serial=opaque,seconds=opaque,filter=opaque",
+]
+confirmable_conditions = []
+
+[compat]
+min_host_version = "0.1.0"

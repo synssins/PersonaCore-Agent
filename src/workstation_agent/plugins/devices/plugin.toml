@@ -1,0 +1,27 @@
+id = "devices"
+name = "Devices"
+version = "0.1.0"
+runtime = "python"
+entry = ["-m", "workstation_agent.plugins.devices"]
+declared_permissions = [
+  "tool:devices.list",
+  # What each argument IS.  args:<tool>:<mode>[:[!]<name>=<class>,...]
+  # The tool name is the DOTTED form: host.invoke() is given
+  # `tool.internal_name` ("devices.list") on every path that exists, and the
+  # gate is default-deny, so "args:devices_list:..." would declare nothing and
+  # produce a tool nobody can call.
+  #
+  # devices_list takes no arguments at all.  A bare mode is a real declaration
+  # -- it says "this tool has no arguments" -- so anything supplied to it is
+  # undeclared and refuses the call.
+  #
+  # `read`: devices_list is on §7's never-prompt list, and reads nothing
+  # outside the family's own enumeration.  No path: root is declared because
+  # no argument is a workstation path; under _outside_declared_paths that is
+  # "no path arguments to check", not "unrestricted".
+  "args:devices.list:read",
+]
+confirmable_conditions = []
+
+[compat]
+min_host_version = "0.1.0"
