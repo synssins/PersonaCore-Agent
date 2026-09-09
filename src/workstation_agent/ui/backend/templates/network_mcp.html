@@ -1,0 +1,89 @@
+<!-- SKELETON — visual design lands in interface-design pass, do not polish here -->
+{% extends "layout.html" %}
+{% block title %}Network MCP{% endblock %}
+{% block content %}
+<h1>Network MCP Endpoint</h1>
+
+<p>Lets PersonaCore reach this workstation's capability families over the LAN
+  (contract §1-§3). Off unless <code>network_mcp.enabled</code> is turned on
+  in Config.</p>
+
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
+{% if reveal_error %}<p class="error">{{ reveal_error }}</p>{% endif %}
+
+{% if not enabled %}
+  <p>The network MCP endpoint is not running.</p>
+{% elif info %}
+<section>
+  <h2>Identity</h2>
+  <table>
+    <tbody>
+      <tr><td>Status</td><td>{{ "running" if info.running else "stopped" }}</td></tr>
+      <tr><td>URL</td>
+        <td><code id="nm-url">{{ info.url }}</code>
+          <button type="button" data-copy-target="nm-url">Copy</button></td></tr>
+      <tr><td>Tools served</td><td>{{ info.tool_names | length }}</td></tr>
+      <tr><td>Certificate expires</td><td>{{ info.certificate_expires }}</td></tr>
+      <tr><td>Certificate SANs</td><td>{{ info.certificate_sans | join(", ") }}</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section>
+  <h2>Certificate fingerprint</h2>
+  {% if reveal_fingerprint %}
+    <p>Pin this into the registration's <code>tls_fingerprint</code> field.
+      Shown once — copy it now.</p>
+    <p><code id="nm-fingerprint">{{ info.fingerprint }}</code>
+      <button type="button" data-copy-target="nm-fingerprint">Copy</button></p>
+  {% elif reveal_error %}
+    <p>Not shown -- see the error above.</p>
+  {% else %}
+    <p>Already shown. Regenerate the certificate to see a new one.</p>
+  {% endif %}
+  <form method="post" action="/network-mcp/regenerate-certificate"
+        onsubmit="return confirm('Regenerating changes the fingerprint. The registration must be re-exported and reinstalled on the Plugins page, or the core will stop connecting. Continue?');">
+    <button type="submit">Regenerate Certificate</button>
+  </form>
+</section>
+
+<section>
+  <h2>Bearer token</h2>
+  {% if reveal_token %}
+    <p>Paste this into PersonaCore's secret store as <code>workstation_token</code>.
+      Shown once — copy it now.</p>
+    <p><code id="nm-token">{{ info.token }}</code>
+      <button type="button" data-copy-target="nm-token">Copy</button></p>
+  {% elif reveal_error %}
+    <p>Not shown -- see the error above.</p>
+  {% else %}
+    <p>Already shown. Rotate the token to see a new one.</p>
+  {% endif %}
+  <form method="post" action="/network-mcp/rotate-token"
+        onsubmit="return confirm('Rotating invalidates the token PersonaCore is currently using. Continue?');">
+    <button type="submit">Rotate Token</button>
+  </form>
+</section>
+
+<section>
+  <h2>Export registration</h2>
+  <p>Run <code>Agent.exe export-registration</code> on this workstation to write
+    <code>workstation-registration.zip</code> for the Plugins page. It carries this
+    fingerprint but never the token.</p>
+</section>
+{% endif %}
+
+<script>
+  document.querySelectorAll("[data-copy-target]").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      var el = document.getElementById(btn.getAttribute("data-copy-target"));
+      if (!el || !navigator.clipboard) { return; }
+      navigator.clipboard.writeText(el.textContent).then(function () {
+        var original = btn.textContent;
+        btn.textContent = "Copied";
+        setTimeout(function () { btn.textContent = original; }, 1500);
+      });
+    });
+  });
+</script>
+{% endblock %}

@@ -1,4 +1,4 @@
-# -*- mode: python ; coding: utf-8 -*-
+# -*- mode: python -*-
 # PyInstaller spec for PersonaCore-Agent — one-folder Windows build.
 #
 # Produces ``dist/Agent/Agent.exe`` alongside every data file the app
@@ -43,6 +43,8 @@ hiddenimports = [
     "workstation_agent.ui.backend.routers.first_run",
     "workstation_agent.ui.backend.routers.config_routes",
     "workstation_agent.ui.backend.routers.plugins_routes",
+    "workstation_agent.ui.backend.routers.network_mcp_routes",
+    "workstation_agent.ui.backend.credential_reveal",
     "workstation_agent.ui.backend.routers.audit_routes",
     "workstation_agent.ui.backend.routers.logs_routes",
     "workstation_agent.ui.backend.routers.about_routes",
@@ -51,6 +53,26 @@ hiddenimports = [
     "uvicorn.protocols.http.auto",
     "uvicorn.protocols.websockets.auto",
     "uvicorn.lifespan.on",
+    # B4's network MCP endpoint (src/workstation_agent/network_mcp/server.py)
+    # imports these lazily, inside functions, so a build off a machine where
+    # they were never imported at module scope during analysis can miss
+    # them. Declared explicitly rather than hoped for.
+    "workstation_agent.network_mcp",
+    "workstation_agent.network_mcp.server",
+    "workstation_agent.network_mcp.tools",
+    "workstation_agent.network_mcp.certs",
+    "workstation_agent.network_mcp.credentials",
+    "workstation_agent.network_mcp.hardening",
+    "workstation_agent.registration_export",
+    "mcp",
+    "mcp.server",
+    "mcp.server.lowlevel",
+    "mcp.server.streamable_http",
+    "mcp.server.streamable_http_manager",
+    "mcp.server.transport_security",
+    "mcp.types",
+    "sse_starlette",
+    "sse_starlette.sse",
 ]
 
 block_cipher = None

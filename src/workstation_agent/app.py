@@ -135,6 +135,7 @@ class _Subsystems:
     tray: Any = None
     update_poller: Any = None
     claude_code: Any = None
+    network_mcp: Any = None
     mcp_server_task: asyncio.Task[None] | None = None
     audio_task: asyncio.Task[None] | None = None
     uvicorn_server: Any = None
@@ -323,6 +324,12 @@ class Application:
         # Step 3 — MCP host.
         self._subs.mcp_host = await self._start_mcp_host(self._subs.config)
 
+        # Step 3b — the LAN-facing network MCP endpoint (contract §1-§3),
+        # off unless the operator has opted in. Started here, before the
+        # FastAPI backend (step 7), so BackendContext can carry the live
+        # NetworkMCPServer for the UI's credential surface.
+        await self._start_network_mcp(self._subs.config)
+
         # Steps 4 & 5 & 6 — audio + LLM + wiring.
         await self._start_audio_pipeline(self._subs.config)
 
@@ -346,7 +353,7 @@ class Application:
 
         self._webview_ready.set()
 
-    async def _shutdown_async(self) -> None:
+    async def _shutdown_async(self) -> None:  # noqa: PLR0912 — one more subsystem to tear down
         """Reverse-order teardown from the asyncio thread."""
         subs = self._subs
 
@@ -362,6 +369,10 @@ class Application:
         if subs.tray is not None:
             with contextlib.suppress(Exception):
                 subs.tray.stop()
+
+        if subs.network_mcp is not None:
+            with contextlib.suppress(Exception):
+                await subs.network_mcp.stop()
 
         if subs.uvicorn_server is not None:
             with contextlib.suppress(Exception):
@@ -491,6 +502,43 @@ class Application:
             return host
         self._subs.started["mcp_host"] = Health(ok=True, detail="started")
         return host
+
+    async def _start_network_mcp(self, cfg: Any) -> None:
+        """Start the LAN-facing MCP endpoint (contract §1-§3), if enabled.
+
+        ``NetworkMcpConfig.enabled`` defaults to ``False`` — turning this on
+        puts this workstation's capability families on the network, so it
+        only ever runs because the operator explicitly opted in. B4's own
+        handover for this call site (self-contained module, no application
+        wiring of its own):
+
+            if cfg.network_mcp.enabled:
+                subs.network_mcp = NetworkMCPServer(cfg.network_mcp, mcp_host=subs.mcp_host)
+                info = await subs.network_mcp.start()
+
+        A failure to bind (port in use, a contract-violating served-tool
+        table) is logged and recorded as unhealthy rather than raised: one
+        subsystem failing to start must not take the rest of the Agent down
+        with it, exactly as :meth:`_start_mcp_host` and
+        :meth:`_start_update_poller` already treat their own failures.
+        """
+        if not cfg.network_mcp.enabled:
+            self._subs.started["network_mcp"] = Health(ok=True, detail="disabled")
+            return
+
+        from workstation_agent.network_mcp.server import NetworkMCPServer
+
+        server = NetworkMCPServer(cfg.network_mcp, mcp_host=self._subs.mcp_host)
+        self._subs.network_mcp = server
+        try:
+            info = await server.start()
+        except Exception as exc:
+            log.warning("network MCP endpoint failed to start: %s", exc)
+            self._subs.started["network_mcp"] = Health(ok=False, detail=repr(exc))
+            return
+        self._subs.started["network_mcp"] = Health(
+            ok=True, detail=f"{info.url} ({len(info.tool_names)} tools)",
+        )
 
     async def _start_audio_pipeline(self, cfg: Any) -> None:
         from workstation_agent.audio.session import AudioSession, SessionMode
@@ -667,6 +715,7 @@ class Application:
             update_poller=self._subs.update_poller,
             audit_reader=_audit.query,
             current_version=_pkg_version(),
+            network_mcp=self._subs.network_mcp,
         )
         app = create_app(ctx)
 

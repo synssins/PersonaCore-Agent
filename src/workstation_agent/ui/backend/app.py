@@ -88,6 +88,11 @@ class BackendContext:
     audit_reader: Any = field(default=None)
     """Callable(AuditQuery) -> list[AuditEvent] (or fake)."""
 
+    network_mcp: Any = field(default=None)
+    """workstation_agent.network_mcp.server.NetworkMCPServer (or fake), or
+    None when ``network_mcp.enabled`` is false. Backs the /network-mcp
+    credential surface (contract §3: URL, fingerprint, token, shown once)."""
+
     log_dir: Path = field(default_factory=lambda: _appdata_root() / "logs")
     """Directory containing rotated JSONL log files."""
 
@@ -158,6 +163,7 @@ def create_app(ctx: BackendContext | None = None) -> FastAPI:
         dashboard,
         first_run,
         logs_routes,
+        network_mcp_routes,
         plugins_routes,
     )
 
@@ -165,6 +171,7 @@ def create_app(ctx: BackendContext | None = None) -> FastAPI:
     app.include_router(dashboard.router)
     app.include_router(config_routes.router)
     app.include_router(plugins_routes.router)
+    app.include_router(network_mcp_routes.router)
     app.include_router(audit_routes.router)
     app.include_router(logs_routes.router)
     app.include_router(about_routes.router)

@@ -102,12 +102,13 @@ class FakeAuditReader:
 # Fixture helpers
 # ---------------------------------------------------------------------------
 
-def make_client(
+def make_client(  # noqa: PLR0913, PLR0917 -- one param per injected BackendContext field
     config_store: Any = None,
     mcp_host: Any = None,
     audit_reader: Any = None,
     log_dir: Path | None = None,
     tmp_path: Path | None = None,
+    network_mcp: Any = None,
 ) -> TestClient:
     """Build a TestClient with a fully-injected BackendContext."""
     ctx = BackendContext(
@@ -115,6 +116,7 @@ def make_client(
         mcp_host=mcp_host or FakeMCPHost(),
         audit_reader=audit_reader or FakeAuditReader(),
         log_dir=log_dir or (tmp_path / "logs" if tmp_path else Path.cwd() / ".logs_test"),
+        network_mcp=network_mcp,
     )
     app = create_app(ctx)
     # Wrap with loopback spoof so the middleware passes in tests
