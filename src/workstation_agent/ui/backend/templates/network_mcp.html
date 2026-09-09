@@ -13,7 +13,7 @@
 {% if field_errors._global is defined %}<p class="error">{{ field_errors._global }}</p>{% endif %}
 {% if saved %}<p class="success">Settings saved.{% if notice %} {{ notice }}{% endif %}</p>{% endif %}
 
-<section>
+<section id="nm-endpoint">
   <h2>Endpoint</h2>
 
   {% if not can_configure %}
@@ -210,12 +210,14 @@
 
 {% endif %}
 
-<section>
-  <h2>Enrol with PersonaCore</h2>
+<section id="nm-join">
+  <h2>Join a PersonaCore</h2>
   <p>Instead of copying the token and fingerprint by hand: in PersonaCore press
     <strong>+ Add a workstation</strong>, read the pairing code it shows, type it
-    below and press Join. PersonaCore then sends this workstation the token it
-    minted, over this endpoint's own HTTPS connection.</p>
+    below with the core's address and press Join. This workstation sends the code
+    to PersonaCore, PersonaCore sends back the token it minted over this
+    endpoint's own HTTPS connection, and the enrolment is finished before this
+    page comes back.</p>
 
   {% if join_error %}<p class="error">{{ join_error }}</p>{% endif %}
   {% if join_notice %}<p class="success">{{ join_notice }}</p>{% endif %}
@@ -236,8 +238,35 @@
     <form method="post" action="/network-mcp/join/cancel">
       <button type="submit">Cancel Join</button>
     </form>
+  {% elif listen_empty %}
+    {# The empty picker is not a dropdown with no entries: an empty control the
+       owner cannot act on is where a product stops working with no explanation.
+       The message is begin_join's own refusal, and the link is the difference
+       between being told the rule and being taken to the control that fixes it. #}
+    <p class="error">{{ listen_empty }}</p>
+    <p><a href="#nm-endpoint">Choose a LAN address in Endpoint settings, at the top
+      of this page</a>, save, then come back here and join.</p>
   {% else %}
     <form method="post" action="/network-mcp/join">
+      <label for="nm-core-address">PersonaCore's address:</label>
+      {# Not a secret, and echoed back on a failure so a refusal costs one
+         correction rather than three. #}
+      <input type="text" id="nm-core-address" name="core_address"
+             value="{{ join_values.core_address }}"
+             autocomplete="off" spellcheck="false" placeholder="192.168.1.150:8053">
+
+      <label for="nm-listen-address">Reach this workstation at:</label>
+      <select id="nm-listen-address" name="listen_address">
+        {% for c in listen_choices %}
+          <option value="{{ c.value }}"
+            {% if join_values.listen_address == c.value or (not join_values.listen_address and loop.first) %}selected{% endif %}>{{ c.label }}</option>
+        {% endfor %}
+      </select>
+      <p>Only addresses this endpoint is actually answering on are listed, and
+        loopback addresses are left out on purpose: <code>127.0.0.1</code> means
+        PersonaCore itself on the machine PersonaCore runs on, so telling it to
+        connect there tells it to connect to itself.</p>
+
       <label for="nm-code">Pairing code from PersonaCore:</label>
       <!-- Always rendered empty, on every outcome including failures: a code
            echoed back into the page is a code in a screenshot. -->
@@ -248,8 +277,87 @@
   {% endif %}
 </section>
 
-<section>
-  <h2>Export registration</h2>
+<section id="nm-enrolled">
+  <h2>Enrolled cores</h2>
+
+  {% if remove_error %}<p class="error">{{ remove_error }}</p>{% endif %}
+  {% if remove_notice %}<p class="success">{{ remove_notice }}</p>{% endif %}
+
+  {% if not enrolled %}
+    <p>This workstation is not enrolled with any PersonaCore yet. Join one above.</p>
+  {% else %}
+    {# Stated before the button exists, not in the aftermath. The owner asked
+       that Remove actually prevent reconnection; the way it does that is by
+       rotating the bearer token, and this endpoint has exactly one of those. #}
+    <p class="error"><strong>Removing any core here locks out every core here.</strong>
+      Remove works by rotating this workstation's bearer token, which is what stops
+      the removed core reconnecting — and there is one token for the whole endpoint.
+      Anything else still listed will start getting refused and has to join again.</p>
+    <table>
+      <tr>
+        <th>PersonaCore</th>
+        <th>Name</th>
+        <th>Plugin on the core</th>
+        <th>Joined</th>
+        <th></th>
+      </tr>
+      {% for core in enrolled %}
+      <tr>
+        <td><code>{{ core.core_address }}</code></td>
+        <td>{{ core.display_name }}{% if not core.confirmed %}
+          — the name this Agent sent{% endif %}</td>
+        <td>
+          {%- if core.plugin -%}
+            <code>{{ core.plugin }}</code>
+          {%- else -%}
+            {# Left empty on purpose upstream: workstation-&lt;slug&gt; is the core's
+               rule to apply, and filling it in here would be this Agent asserting
+               a name no core ever told it. #}
+            Not known
+          {%- endif -%}
+        </td>
+        <td>{{ core.joined_at.strftime("%Y-%m-%d %H:%M UTC") }}</td>
+        <td>
+          <form method="post" action="/network-mcp/enrolled/remove"
+                onsubmit="return confirm('Removing a core rotates the bearer token for this endpoint, so EVERY core enrolled here is locked out, not just this one. Each remaining core has to join again. Continue?');">
+            <input type="hidden" name="slug" value="{{ core.slug }}">
+            {# The label carries the blast radius, not just the dialog. A button
+               that says only "Remove" sits in a row and reads as row-scoped;
+               muscle memory then dismisses the confirmation without reading it.
+               Someone who reads the button and nothing else should not be
+               surprised by what happens, so the button says what happens.
+               This is a symptom of one bearer token for the whole endpoint —
+               token-per-core is the fix and is logged as future work in
+               join.py's module docstring. #}
+            <button type="submit">Remove — locks out every enrolled core</button>
+          </form>
+        </td>
+      </tr>
+      {% if not core.confirmed %}
+      <tr>
+        <td colspan="5" class="error">PersonaCore never confirmed this one. Its token
+          reached this workstation and is in force, so the Agent is holding a working
+          credential — but the core stopped answering before it said what it had done,
+          and it saves its own record after sending the token. Open PersonaCore's
+          Plugins screen and look for this workstation. If it is not there, get a
+          fresh pairing code and join again.</td>
+      </tr>
+      {% endif %}
+      {% endfor %}
+    </table>
+  {% endif %}
+</section>
+
+<section id="nm-recovery">
+  <h2>Recovery — install the registration by hand</h2>
+  <p>Only for a core that Join cannot reach: this writes the same details into a
+    file you carry to PersonaCore's Plugins page yourself. If Join above worked,
+    there is nothing to do here.</p>
+  {# Collapsed so it does not compete with Join for attention, but never
+     collapsed over something the owner needs to read: an export result, a
+     pre-flight problem or a file already on disk springs it open. #}
+  <details {% if export_error or export_result or export_problems or have_previous_export %}open{% endif %}>
+  <summary>Export registration</summary>
   <p>Produces <code>workstation-registration.zip</code> for PersonaCore's Plugins
     page. It carries this endpoint's URL and fingerprint, and never the token.</p>
 
@@ -293,6 +401,7 @@
     <p><a href="/network-mcp/registration.zip" download>Download workstation-registration.zip</a>
       — saves to this browser's downloads folder.</p>
   {% endif %}
+  </details>
 </section>
 
 <script>

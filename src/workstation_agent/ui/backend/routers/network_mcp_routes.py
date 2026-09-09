@@ -37,19 +37,40 @@ again -- no config file, no command line:
   pre-flight (:func:`registration_problems`) reads the *live* endpoint, so a
   registration for a stopped endpoint, or one pointing at loopback, is
   reported before it is written rather than discovered on the core.
-* **Opening the enrolment window.** ``POST /network-mcp/join`` takes the pairing
-  code the owner read off PersonaCore's console and hands it to
-  :meth:`NetworkMCPServer.begin_join`; the core then pushes the token it minted
-  to the endpoint's own ``POST /enrol/token``. See
-  ``network_mcp/enrolment.py`` for the handshake and why the code lives in
-  memory only.
+* **Joining a PersonaCore.** ``POST /network-mcp/join`` takes three things the
+  owner supplies — the core's address, the pairing code its console is showing,
+  and which of this machine's bound addresses the core should reach it on — and
+  hands them to :func:`~workstation_agent.network_mcp.join.join_core`. That call
+  owns the whole handshake: it opens the enrolment window, sends the Join, and
+  closes the window again on every failure. See ``network_mcp/join.py`` for the
+  order and why it is that order.
+
+  **This router does not call ``begin_join`` itself, and must not start.**
+  ``join_core`` opens the window *inside its own* ``try``/``finally``, which is
+  what guarantees the window closes when the outbound leg fails. A window opened
+  out here would be opened outside the block that closes it, and this endpoint's
+  one unauthenticated route would be left standing open for the rest of its TTL.
+  ``can_join`` still asks whether ``begin_join`` exists, because that is the
+  member ``join_core`` needs on the endpoint — asking is not calling.
 
   **The code is never echoed back into the page and never logged**, here or
   anywhere below. The field is rendered empty on every outcome, including the
   failures — a re-rendered form that helpfully preserves what the owner typed is
   a pairing code sitting in a page, in a webview, in a screenshot. Nor does any
   of this reach the audit database, whose ``args_json`` is *truncated* to 200
-  characters, which is not the same thing as redacted.
+  characters, which is not the same thing as redacted. The core's *address* is
+  not a secret and is echoed back on a failure so the owner does not retype it,
+  but it is still kept out of the log: nothing is gained by writing down which
+  household machine talks to which, and a log line is the easiest place for that
+  to end up by accident.
+
+* **Listing what this workstation is enrolled with, and removing it.**
+  ``POST /network-mcp/enrolled/remove`` calls
+  :func:`~workstation_agent.network_mcp.join.remove_enrolled_core`, which drops
+  the row **and rotates the bearer token** so the removed core cannot reconnect.
+  This endpoint holds exactly one token, so that rotation locks out *every*
+  enrolled core, not only the one removed. The page says so before the button is
+  pressed, not after — see the Enrolled section of ``network_mcp.html``.
 """
 
 from __future__ import annotations
@@ -58,8 +79,10 @@ import contextlib
 import hashlib
 import inspect
 import logging
+from collections import Counter
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Annotated, Any
+from pathlib import Path
+from typing import TYPE_CHECKING, Annotated, Any, Final
 
 from fastapi import APIRouter, Depends, Form, Request
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
@@ -67,6 +90,11 @@ from pydantic import ValidationError
 
 from workstation_agent.config.schema import NetworkMcpConfig
 from workstation_agent.network_mcp.enrolment import EnrolmentError
+from workstation_agent.network_mcp.join import (
+    join_and_report,
+    list_enrolled_cores,
+    remove_enrolled_core,
+)
 from workstation_agent.registration_export import (
     REGISTRATION_ZIP_NAME,
     export_registration_from_endpoint,
@@ -86,8 +114,6 @@ from workstation_agent.ui.backend.credential_reveal import (
 )
 
 if TYPE_CHECKING:  # pragma: no cover
-    from pathlib import Path
-
     from workstation_agent.config.schema import AgentConfig
 
 log = logging.getLogger(__name__)
@@ -96,6 +122,92 @@ router = APIRouter(prefix="/network-mcp", tags=["network-mcp"])
 
 _PORT_MIN = 0
 _PORT_MAX = 65535
+
+#: Ceiling on an operator-facing message before it is rendered.
+#:
+#: The reason is the Join: a core's refusal is passed through **verbatim**,
+#: which is right — it is the diagnosis, and rewording it would throw the
+#: diagnosis away — but it is also a string chosen by a remote machine at an
+#: address someone typed, arriving through ``join._refusal_of``, which reads a
+#: ``detail`` out of a body capped at 64 KiB and does not bound the sentence.
+#: 64 KiB of unbroken characters in a ``<p>`` is a page the owner cannot use.
+#: Generous enough that no real refusal is ever cut — the core's are one line —
+#: and the cut says so when it happens, because a truncated message that looks
+#: whole is worse than one that admits it.
+_MAX_MESSAGE_CHARS: Final = 400
+
+
+def _bounded(message: str | None) -> str | None:
+    """Cap a message at :data:`_MAX_MESSAGE_CHARS`, visibly.
+
+    Applied in :func:`_render` rather than at each call site, so a path that
+    forgets cannot exist. Local messages are far below the cap and pass through
+    untouched; this is here for the ones written by the core.
+    """
+    if message is None or len(message) <= _MAX_MESSAGE_CHARS:
+        return message
+    return message[:_MAX_MESSAGE_CHARS].rstrip() + " … (message truncated)"
+
+
+#: Ceiling on a **table cell**, which wants a far shorter one than a paragraph.
+#:
+#: 400 characters in a cell is already an unreadable row, and this table is what
+#: the owner reads to decide which core to remove. 64 is not an arbitrary
+#: smaller number: it is the core's own ceiling on a plugin name, the figure
+#: ``join._MAX_SLUG_CHARS`` is derived from (``64 - len("workstation-")``). So
+#: no name any working core can produce is ever cut, and anything that is cut
+#: came from a core that is broken, misconfigured or hostile.
+_MAX_CELL_CHARS: Final = 64
+
+#: How much of an over-long cell is kept from the **end** rather than the start.
+#:
+#: Elision in the middle, not at the tail, because two names are most often
+#: distinguished by their endings ("...-study" against "...-workshop") and a
+#: head-only cut throws exactly that away. See :func:`_disambiguated` for the
+#: case this does not solve.
+_CELL_TAIL_CHARS: Final = 16
+
+
+def _bounded_cell(value: str) -> str:
+    """Cap one table cell at :data:`_MAX_CELL_CHARS`, visibly and from the middle.
+
+    The marker is not decoration. The owner may be choosing between two similar
+    names, and a cut name that looks whole is a wrong click; a cut name that
+    says it is cut is a question they know to ask.
+    """
+    if len(value) <= _MAX_CELL_CHARS:
+        return value
+    head = value[: _MAX_CELL_CHARS - _CELL_TAIL_CHARS]
+    return f"{head}… (truncated) …{value[-_CELL_TAIL_CHARS:]}"
+
+
+def _disambiguated(originals: Sequence[str], shown: Sequence[str]) -> list[str]:
+    """Stop truncation turning two different cells into the same cell.
+
+    Two names differing only inside the elided middle cut to identical text, and
+    the removal decision is made off these cells — so a collision created *by
+    the display* would be the display causing the wrong core to be picked. That
+    is a different class of fault from a name merely being long.
+
+    Only cells that were actually truncated get a mark; two rows that genuinely
+    carry the same name are the same name, and saying otherwise would invent a
+    distinction. The mark is six hex of the full value's digest: it is not
+    meaningful to read, and it is not meant to be — it is there to say "these
+    two are not the same" for a pair of cells that would otherwise claim they
+    were. Two distinct values colliding in both the truncation *and* those six
+    hex digits is possible and is not defended against; at that point the row is
+    identified by its address column and its position, and the honest ceiling on
+    this is that a core sending 64 KiB names is broken and the page says so.
+    """
+    counts = Counter(shown)
+    out: list[str] = []
+    for original, text in zip(originals, shown, strict=True):
+        if counts[text] > 1 and original != text:
+            digest = hashlib.sha256(original.encode("utf-8", "replace")).hexdigest()[:6]
+            out.append(f"{text} [{digest}]")
+        else:
+            out.append(text)
+    return out
 
 #: Sentinel value for the "type an address the list did not offer" option.
 _OTHER = "__other__"
@@ -358,6 +470,200 @@ def _join_status(server: Any) -> Any:  # noqa: ANN401
         return None
 
 
+def _enrolled_state_dir(server: Any) -> Path:  # noqa: ANN401 — whatever was injected
+    """Where *this page's* enrolled-core rows live.
+
+    Asked of the endpoint the page is rendering, not of
+    :data:`~workstation_agent.network_mcp.join._endpoint`, so a listing and the
+    removal that follows it are always about the same directory — the failure
+    mode ``join._state_dir_for`` calls "a bug with no symptom".
+
+    The fallback matters only for a stub or an endpoint object old enough not to
+    expose ``state_dir``. It is spelled through :func:`_appdata_root` rather than
+    imported from ``credentials.DEFAULT_STATE_DIR`` because that constant is
+    computed at import time from ``%APPDATA%`` and cannot see a later override,
+    so a test with ``PC_AGENT_APPDATA`` set would read — and a removal would
+    rotate a token in — the real user's profile.
+    """
+    directory = getattr(server, "state_dir", None)
+    if isinstance(directory, Path):
+        return directory
+    return _appdata_root() / "network-mcp"
+
+
+def _enrolled_cores(server: Any) -> tuple[Any, ...]:  # noqa: ANN401 — see _read_info
+    """Every core this workstation has joined, for the listing.
+
+    ``list_enrolled_cores`` already answers an unreadable file with an empty
+    tuple for the reason this wrapper exists as well: the Remove button on that
+    page is what an operator fixes a bad state *with*, and a listing that raised
+    would take it away. What is caught here is the layer below it — an
+    ``%APPDATA%`` that cannot be resolved at all.
+    """
+    try:
+        return tuple(list_enrolled_cores(state_dir=_enrolled_state_dir(server)))
+    except Exception:
+        log.warning("network-mcp: the enrolled-core listing could not be read", exc_info=True)
+        return ()
+
+
+def _display_rows(cores: Sequence[Any]) -> tuple[dict[str, Any], ...]:
+    """The enrolled rows as the template renders them: every cell capped.
+
+    **The cap lives here, where the rows are built, and not in the template**,
+    for the reason :func:`_bounded` lives in :func:`_render`: a cell added later
+    goes through this function or it does not appear, whereas a cap applied per
+    ``<td>`` is a cap the next ``<td>`` forgets.
+
+    What is in these cells is not ours. ``plugin`` is the core's own
+    normalisation of a name and ``display_name`` is what the core sent back, so
+    a core that is broken or hostile chooses their length; ``core_address`` is
+    what a form said. ``overflow-wrap`` stops any of them stretching the page
+    sideways, but the text is still in the document, and 64 KiB in a cell
+    stretches the page *down* until the table is no use — and this table is what
+    the owner reads to decide which core to remove, so making it unreadable has
+    a consequence rather than being untidy.
+
+    **``slug`` is deliberately not capped.** It is not rendered as text; it is
+    the hidden field :func:`enrolled_remove` matches a row on. Truncating it
+    would post a value matching no row, and the removal would be refused by the
+    very guard that exists to catch input that names nothing.
+    """
+    names = [str(getattr(c, "display_name", "") or "") for c in cores]
+    plugins = [str(getattr(c, "plugin", "") or "") for c in cores]
+    shown_names = _disambiguated(names, [_bounded_cell(n) for n in names])
+    shown_plugins = _disambiguated(plugins, [_bounded_cell(p) for p in plugins])
+    return tuple(
+        {
+            "slug": getattr(core, "slug", ""),
+            "display_name": shown_names[index],
+            "plugin": shown_plugins[index],
+            "core_address": _bounded_cell(str(getattr(core, "core_address", "") or "")),
+            "joined_at": getattr(core, "joined_at", None),
+            "confirmed": bool(getattr(core, "confirmed", True)),
+        }
+        for index, core in enumerate(cores)
+    )
+
+
+def _listen_choices(info: Any) -> list[dict[str, str]]:  # noqa: ANN401 — see _read_info
+    """The addresses the owner may tell PersonaCore to reach this machine at.
+
+    Built from the endpoint's own :attr:`~...server.NetworkEndpointInfo.urls`
+    and ``bind_hosts`` — which while running are the addresses that actually
+    *bound*, so an address the operator chose and that failed to bind is not
+    offered as somewhere the core can connect.
+
+    **Loopback is filtered out, and the filter is not the rule.** Telling the
+    core to connect to ``127.0.0.1`` tells it to connect to *itself*. Both
+    :meth:`~...server.NetworkMCPServer.begin_join` and the core refuse such an
+    address already; dropping it here only spares the owner choosing something
+    that was always going to be refused. When the filter leaves nothing, the
+    page says so rather than showing an empty dropdown — see
+    :func:`_no_listen_address_message`.
+    """
+    hosts = [str(h) for h in (getattr(info, "bind_hosts", ()) or ()) if str(h)]
+    urls = [str(u) for u in (getattr(info, "urls", ()) or ()) if str(u)]
+    if not hosts:
+        # A stub, or a build predating the multi-bind fields. The preferred
+        # address is the whole of what such an endpoint can tell us.
+        one = str(getattr(info, "bind_host", "") or "")
+        hosts = [one] if one else []
+        urls = urls or ([str(getattr(info, "url", "") or "")] if one else [])
+
+    choices: list[dict[str, str]] = []
+    for index, host in enumerate(hosts):
+        if is_loopback_host(host):
+            continue
+        url = urls[index] if index < len(urls) else ""
+        # The URL is the label's payload, not decoration: it is literally what
+        # gets written into the core's plugin manifest, so the owner is picking
+        # a connection string and should be able to read the one they picked.
+        label = f"{host} — PersonaCore will connect to {url}" if url else host
+        choices.append({"value": host, "label": label, "url": url})
+    return choices
+
+
+def _no_listen_address_message(info: Any) -> str:  # noqa: ANN401 — see _read_info
+    """Why there is nothing to pick, when :func:`_listen_choices` came back empty.
+
+    The first two sentences are **deliberately the same sentences**
+    :meth:`~...server.NetworkMCPServer.begin_join` refuses a loopback-only
+    endpoint with. The owner meets this condition by two routes — pre-empted
+    here, or refused there if they get as far as pressing Join — and being told
+    it twice in two different voices reads as two different problems. Where the
+    two differ is the ending: ``begin_join`` says "bind a LAN address first",
+    which is advice; this one can point at the control that does it, which is a
+    click.
+    """
+    hosts = [str(h) for h in (getattr(info, "bind_hosts", ()) or ()) if str(h)]
+    if not hosts:
+        one = str(getattr(info, "bind_host", "") or "")
+        hosts = [one] if one else []
+    listed = ", ".join(hosts)
+    if not listed:
+        return (
+            "The endpoint is not answering on any address, so there is nothing to "
+            "tell PersonaCore to connect to. Switch it on in Endpoint settings above, "
+            "wait for it to report that it is listening, then join."
+        )
+    return (
+        f"The endpoint is bound to {listed}, which is this machine only. "
+        f"PersonaCore runs elsewhere and cannot reach it to push the token. "
+        f"Bind a LAN address first, then join."
+    )
+
+
+def _refuse_listen_address(typed: str, choices: Sequence[dict[str, str]]) -> str | None:
+    """Refuse a listen address this endpoint is not actually answering on.
+
+    **This is the gate; the ``<select>`` is not.** It is the same relationship
+    :func:`_gate_uncovered` has with its ``<option disabled>``: a dropdown
+    constrains a browser being operated normally and constrains nothing else,
+    and every field on a form is attacker-supplied whatever the page offered.
+    Without this check a hand-made POST carrying ``listen_address=127.0.0.1``
+    walks straight past the loopback-only screen the template renders so
+    carefully — ``begin_join`` would not catch it either, because what *it*
+    asks is whether the endpoint is loopback-*bound*, which is a different
+    question from what address the core is being told to dial.
+
+    It has to live here rather than in ``join.py`` for the reason ``listen_url``
+    gives for not checking loopback itself: only the router can see the live
+    bind set, and :func:`_listen_choices` is built from it, so comparing against
+    that list is comparing against the endpoint.
+
+    An empty value is passed through untouched. ``join.listen_url`` already
+    refuses it with a sentence written for the operator, and answering the same
+    condition here would be a second wording of it.
+
+    Returns:
+        The refusal, or ``None`` if *typed* is one this endpoint is serving.
+    """
+    wanted = typed.strip().lower()
+    if not wanted:
+        return None
+    if any(c["value"].strip().lower() == wanted for c in choices):
+        return None
+
+    if is_loopback_host(typed.strip()):
+        # The core's own sentence for this exact condition, quoted in
+        # ``join.listen_url``'s docstring. It is the authority on what it will
+        # accept, and a refusal of ours in different words for the same reason
+        # would read as a different problem when the owner met both.
+        return (
+            f"{typed.strip()} is not an address another machine can be reached at. "
+            f"Give the workstation's address on the network the core is on."
+        )
+    offered = ", ".join(c["value"] for c in choices)
+    if not offered:
+        return _no_listen_address_message(None)
+    return (
+        f"This endpoint is not answering on the address that was submitted, so "
+        f"PersonaCore would be sent somewhere it cannot reach this workstation. "
+        f"It is answering on {offered}. Choose one of those and join again."
+    )
+
+
 def _render(  # noqa: PLR0913 — one parameter per independent page outcome
     request: Request,
     ctx: BackendContext,
@@ -371,6 +677,9 @@ def _render(  # noqa: PLR0913 — one parameter per independent page outcome
     export_error: str | None = None,
     join_error: str | None = None,
     join_notice: str | None = None,
+    join_values: dict[str, str] | None = None,
+    remove_error: str | None = None,
+    remove_notice: str | None = None,
     uncovered: tuple[str, ...] = (),
 ) -> HTMLResponse:
     """Render ``network_mcp.html`` for every outcome this router produces.
@@ -422,6 +731,7 @@ def _render(  # noqa: PLR0913 — one parameter per independent page outcome
     choices = _interface_choices(
         bind_hosts, sans, check_coverage=_readable_sans(info) is not None,
     )
+    listen_choices = _listen_choices(info) if info is not None else []
     last_export = export_dir() / REGISTRATION_ZIP_NAME
     try:
         have_export = last_export.is_file()
@@ -472,10 +782,32 @@ def _render(  # noqa: PLR0913 — one parameter per independent page outcome
             "have_previous_export": have_export,
             # enrolment. ``join`` never carries the pairing code, and no
             # template variable holds it: see this module's docstring.
+            # ``join_values`` deliberately has no ``code`` key at all -- an
+            # absent key cannot be re-rendered by a template that forgets.
             "join": _join_status(ctx.network_mcp),
-            "join_error": join_error,
-            "join_notice": join_notice,
+            # Bounded here rather than at each call site: both of these can
+            # carry a sentence the *core* wrote, and a path that forgot to cap
+            # one would be a page a remote machine could stretch. See
+            # :func:`_bounded`.
+            "join_error": _bounded(join_error),
+            "join_notice": _bounded(join_notice),
+            "join_values": {
+                "core_address": (join_values or {}).get("core_address", ""),
+                "listen_address": (join_values or {}).get("listen_address", ""),
+            },
             "can_join": callable(getattr(ctx.network_mcp, "begin_join", None)),
+            "listen_choices": listen_choices,
+            # Rendered only when there is nothing to choose, so the owner never
+            # meets an empty dropdown with no explanation beside it.
+            "listen_empty": (
+                _no_listen_address_message(info) if info is not None and not listen_choices
+                else None
+            ),
+            # enrolled cores. Both messages quote display names the core
+            # normalised, so they are remote text too and capped alike.
+            "enrolled": _display_rows(_enrolled_cores(ctx.network_mcp)),
+            "remove_error": _bounded(remove_error),
+            "remove_notice": _bounded(remove_notice),
         },
     )
 
@@ -999,20 +1331,42 @@ async def join_post(
     request: Request,
     ctx: Annotated[BackendContext, Depends(get_context)],
     code: Annotated[str, Form(alias="code")] = "",
+    core_address: Annotated[str, Form(alias="core_address")] = "",
+    listen_address: Annotated[str, Form(alias="listen_address")] = "",
 ) -> HTMLResponse:
-    """Open the enrolment window for the pairing code the owner typed.
+    """Run the whole Join: address in, pairing code in, enrolled row out.
 
-    Declared as ``str`` with a default for the same reason every other field on
-    this page is: FastAPI answers a missing form field with a 422 JSON body,
-    which is a dead end in a webview with no way back to the form.
+    Every field is declared as ``str`` with a default for the same reason every
+    other field on this page is: FastAPI answers a missing form field with a 422
+    JSON body, which is a dead end in a webview with no way back to the form.
 
-    Nothing here logs, echoes or stores *code*. It goes straight to
-    :meth:`NetworkMCPServer.begin_join`, which keeps it in memory as bytes for
-    the length of the window and nowhere else.
+    **This calls ``join_core`` and never ``begin_join``, and calling both would
+    be a defect.** ``join_core`` opens the enrolment window itself, inside the
+    ``try``/``finally`` that closes it again on every failure. Opening one out
+    here as well would put the open outside the block that closes it and leave
+    this endpoint's one unauthenticated route standing open for the rest of its
+    TTL. It is called through this module's global so a test can substitute it;
+    the substitution is a stand-in for the same function, never a second path.
+
+    The endpoint is passed explicitly rather than left to ``join_core``'s
+    registered default. The page is rendered from ``ctx.network_mcp``, so that is
+    the endpoint the owner is looking at and the one their click has to be about;
+    resolving a different object would enrol something the page never described.
+
+    Nothing here logs, echoes or stores *code*. It goes into
+    :func:`~workstation_agent.network_mcp.join.join_core`, which keeps it out of
+    every log line, exception and stored row, and scrubs the request body once
+    the call is over.
+
+    Every refusal reaches the owner as its own author wrote it.
+    :class:`~workstation_agent.network_mcp.join.JoinError` subclasses
+    ``EnrolmentError``, so the core's verbatim refusal, the receiver's "the
+    endpoint is not running", and the "a Join is already in progress" that makes
+    a second Join a refusal rather than a queue all arrive through one
+    ``except`` and are rendered unwrapped.
     """
     server = ctx.network_mcp
-    begin = getattr(server, "begin_join", None)
-    if server is None or not callable(begin):
+    if server is None or not callable(getattr(server, "begin_join", None)):
         return _render(
             request,
             ctx,
@@ -1021,29 +1375,62 @@ async def join_post(
             ),
         )
 
+    # The core's address and the chosen listen address go back into the form on
+    # every failure so a refusal costs one correction rather than three. The
+    # pairing code is not among them and there is no key for it to occupy.
+    typed = {"core_address": core_address, "listen_address": listen_address}
+
+    # Checked **before the window opens**, and it is the only check there is:
+    # see :func:`_refuse_listen_address` for why neither the dropdown nor
+    # ``begin_join`` covers this. *core_address* deliberately gets no gate of
+    # its own here -- ``join.core_enrol_url`` runs first thing inside the call,
+    # ahead of the window, and already refuses an empty address, an unparseable
+    # authority, a scheme that is not http(s), an address naming no host, and
+    # one carrying userinfo, each with its own operator-facing sentence. A
+    # second set of rules out here could only agree with those or contradict
+    # them, and the second is the likelier outcome over time.
+    refusal = _refuse_listen_address(listen_address, _listen_choices(_read_info(server)[0]))
+    if refusal is not None:
+        log.warning("network-mcp: a Join named an address this endpoint is not serving")
+        return _render(request, ctx, join_error=refusal, join_values=typed)
+
     try:
-        begin(code)
+        result = await join_and_report(
+            core_address, code, listen_address, endpoint=server,
+        )
     except EnrolmentError as exc:
-        # The receiver writes these to be read by the owner, so the message is
-        # passed through as-is rather than wrapped in framing of our own.
-        return _render(request, ctx, join_error=str(exc))
+        # Written by whoever refused — the core, the receiver, or the address
+        # parser — to be read by the owner, so it is passed through as-is rather
+        # than wrapped in framing of our own.
+        return _render(request, ctx, join_error=str(exc), join_values=typed)
     except Exception as exc:  # noqa: BLE001 — reported on the page, never raised
-        log.warning("network-mcp: could not open the enrolment window: %s", exc)
+        # ``type(exc).__name__``, not ``exc``: an unexpected exception from
+        # inside the Join can be an httpx error, and an httpx error holds the
+        # request, and the request holds the body the pairing code was in. This
+        # is the same refusal ``join._post_join`` makes for the same reason.
+        log.warning(
+            "network-mcp: the Join failed unexpectedly (%s)", type(exc).__name__,
+        )
         return _render(
             request,
             ctx,
-            join_error=f"Could not open the enrolment window: {exc}",
+            join_error=(
+                f"The Join failed unexpectedly ({type(exc).__name__}). Check the "
+                f"Agent's log, then try again with a fresh pairing code."
+            ),
+            join_values=typed,
         )
 
-    # Deliberately no code, no length, no prefix in this line.
-    log.info("network-mcp: enrolment window opened from the UI")
+    # No code, no length, no prefix, and no address either: see this module's
+    # docstring. ``join.py`` logs the plugin name and health it was told.
+    log.info("network-mcp: joined a PersonaCore from the UI")
     return _render(
         request,
         ctx,
-        join_notice=(
-            "Waiting for PersonaCore to send the token. Finish adding this "
-            "workstation there; this page will show it once it arrives."
-        ),
+        # The core writes this sentence to be shown to the operator, and when
+        # the core never answered, ``join.py`` writes the one that says exactly
+        # that. Either way it is the truest available account of what happened.
+        join_notice=result.message,
     )
 
 
@@ -1058,6 +1445,131 @@ async def join_cancel(
             cancel()
         log.info("network-mcp: enrolment window closed from the UI")
     return RedirectResponse(url="/network-mcp", status_code=303)
+
+
+@router.post("/enrolled/remove", response_class=HTMLResponse, response_model=None)
+async def enrolled_remove(
+    request: Request,
+    ctx: Annotated[BackendContext, Depends(get_context)],
+    slug: Annotated[str, Form(alias="slug")] = "",
+) -> HTMLResponse:
+    """Remove an enrolled core, and stop it being able to come back.
+
+    :func:`~workstation_agent.network_mcp.join.remove_enrolled_core` drops the
+    row **and rotates this endpoint's bearer token**, because the owner asked
+    that removing a core actually prevent it reconnecting rather than hide a
+    listing. This endpoint holds one token, so that rotation locks out every
+    core enrolled here, not only the one removed.
+
+    That consequence is stated three times before it can happen — in the
+    button's own label, in the paragraph above the table, and in the browser
+    confirmation — so this handler does not have to guess whether the owner
+    understood it. What it does add is the *specific* aftermath — which cores
+    were, in fact, just locked out — because "every enrolled core" is an
+    abstraction until it is a list of names.
+
+    A slug naming no listed core is refused here and never reaches the
+    removal; see the guard below for why that is this function's job and not
+    ``remove_enrolled_core``'s.
+
+    Renders rather than redirects, unlike :func:`join_cancel`, so that
+    aftermath survives to be read; a 303 back to the page would drop it.
+    """
+    server = ctx.network_mcp
+    wanted = slug.strip().lower()
+    if not wanted:
+        return _render(
+            request,
+            ctx,
+            remove_error=(
+                "No core was named to remove. Use the Remove button beside the one "
+                "you want gone."
+            ),
+        )
+
+    # Read before the removal, because after it the row is gone and the count of
+    # collateral is unrecoverable from the listing.
+    before = _enrolled_cores(server)
+    target = next((core for core in before if getattr(core, "slug", "") == wanted), None)
+
+    # **Refused before ``remove_enrolled_core`` is reached, and this guard is
+    # not redundant with it.** That function rotates the token for a slug it
+    # cannot find, deliberately and by a documented rule: it is written for a
+    # caller that has already decided a core must lose access, and a row that is
+    # missing (hand-edited file, half-finished Join) is not evidence that it
+    # has. That is right for the lever and wrong for the button. Here the slug
+    # arrives from a form, so a typo or a crafted POST would otherwise perform
+    # the most destructive act in the product — locking out every enrolled core
+    # — and delete nothing, with no row gone to connect the effect back to. The
+    # guard belongs on the caller that cannot vouch for its input, which is this
+    # one; putting it in ``join.py`` instead would take away the only means of
+    # revoking a credential whose row is already gone.
+    if target is None:
+        return _render(
+            request,
+            ctx,
+            remove_error=(
+                "That core is not in this workstation's list, so nothing was removed "
+                "and the bearer token was NOT rotated — everything listed below still "
+                "works. Reload this page and use the Remove button beside the core you "
+                "want gone."
+            ),
+        )
+
+    # Cell-capped, not message-capped: these are names, and they are quoted into
+    # a sentence that also has to stay readable. One 64 KiB name would otherwise
+    # spend the whole message budget and push the part that matters -- what was
+    # locked out -- past the cut.
+    named = _bounded_cell(str(getattr(target, "display_name", "") or wanted))
+    others = [
+        _bounded_cell(str(getattr(core, "display_name", "") or getattr(core, "slug", "")))
+        for core in before
+        if getattr(core, "slug", "") != wanted
+    ]
+
+    try:
+        remove_enrolled_core(wanted, state_dir=_enrolled_state_dir(server))
+    except EnrolmentError as exc:
+        # Written for the operator by the function that failed, and the state it
+        # describes is specific: the token is already rotated by the time this
+        # can be raised, so the core is out and the listing is merely stale.
+        return _render(request, ctx, remove_error=str(exc))
+    except Exception as exc:  # noqa: BLE001 — reported on the page, never raised
+        # **The type name and nothing else, exactly as :func:`join_post` does
+        # it, and deliberately alike so the two do not drift apart.** The reason
+        # is the same one: an arbitrary exception escaping this call can be an
+        # httpx error from the revocation path, an httpx error holds the
+        # request, and a request on this page's Join is the one that carried the
+        # pairing code. ``str(exc)`` would put that in the log and on the page.
+        log.warning(
+            "network-mcp: could not remove an enrolled core (%s)", type(exc).__name__,
+        )
+        return _render(
+            request,
+            ctx,
+            remove_error=(
+                f"Could not remove that core ({type(exc).__name__}). Check the Agent's "
+                f"log. The bearer token may or may not have been rotated, so treat "
+                f"every enrolled core as needing to join again."
+            ),
+        )
+
+    log.info("network-mcp: an enrolled core was removed from the UI")
+    if others:
+        listed = ", ".join(others)
+        notice = (
+            f"Removed {named}, and rotated this workstation's bearer token so it "
+            f"cannot reconnect. This endpoint has one token, so rotating it also "
+            f"locked out everything else that was enrolled here: {listed}. "
+            f"Each of those has to join again."
+        )
+    else:
+        notice = (
+            f"Removed {named}, and rotated this workstation's bearer token so it "
+            f"cannot reconnect. Nothing else was enrolled here, so nothing else "
+            f"was affected."
+        )
+    return _render(request, ctx, remove_notice=notice)
 
 
 # ---------------------------------------------------------------------------
