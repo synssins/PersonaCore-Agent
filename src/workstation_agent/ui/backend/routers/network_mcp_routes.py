@@ -515,29 +515,35 @@ def _display_rows(cores: Sequence[Any]) -> tuple[dict[str, Any], ...]:
     goes through this function or it does not appear, whereas a cap applied per
     ``<td>`` is a cap the next ``<td>`` forgets.
 
-    What is in these cells is not ours. ``plugin`` is the core's own
-    normalisation of a name and ``display_name`` is what the core sent back, so
-    a core that is broken or hostile chooses their length; ``core_address`` is
-    what a form said. ``overflow-wrap`` stops any of them stretching the page
-    sideways, but the text is still in the document, and 64 KiB in a cell
-    stretches the page *down* until the table is no use — and this table is what
-    the owner reads to decide which core to remove, so making it unreadable has
-    a consequence rather than being untidy.
+    What is in these cells is not ours. ``display_name`` is what the core sent
+    back, so a core that is broken or hostile chooses its length;
+    ``core_address`` is what a form said. ``overflow-wrap`` stops any of them
+    stretching the page sideways, but the text is still in the document, and
+    64 KiB in a cell stretches the page *down* until the table is no use —
+    and this table is what the owner reads to decide which core to remove,
+    so making it unreadable has a consequence rather than being untidy.
 
     **``slug`` is deliberately not capped.** It is not rendered as text; it is
     the hidden field :func:`enrolled_remove` matches a row on. Truncating it
     would post a value matching no row, and the removal would be refused by the
     very guard that exists to catch input that names nothing.
+
+    **There is no ``plugin`` cell any more.** PersonaCore used to install one
+    plugin per enrolled machine (``workstation-<slug>``), which made
+    :attr:`~workstation_agent.network_mcp.join.EnrolledCore.plugin` a
+    per-row name worth a column. It now installs a single plugin, named
+    ``workstation``, for every machine it has ever enrolled — so that field
+    reads the same on every confirmed row and distinguishes nothing. Showing
+    it would waste a column in a table the owner uses to pick which core to
+    remove. An unconfirmed row still gets its own visible marker, just not
+    through this field: see the ``display_name`` suffix in the template.
     """
     names = [str(getattr(c, "display_name", "") or "") for c in cores]
-    plugins = [str(getattr(c, "plugin", "") or "") for c in cores]
     shown_names = _disambiguated(names, [_bounded_cell(n) for n in names])
-    shown_plugins = _disambiguated(plugins, [_bounded_cell(p) for p in plugins])
     return tuple(
         {
             "slug": getattr(core, "slug", ""),
             "display_name": shown_names[index],
-            "plugin": shown_plugins[index],
             "core_address": _bounded_cell(str(getattr(core, "core_address", "") or "")),
             "joined_at": getattr(core, "joined_at", None),
             "confirmed": bool(getattr(core, "confirmed", True)),

@@ -294,10 +294,15 @@
       the removed core reconnecting — and there is one token for the whole endpoint.
       Anything else still listed will start getting refused and has to join again.</p>
     <table>
+      {# No "plugin on the core" column: PersonaCore now installs a single
+         plugin, named "workstation", for every enrolled machine, so that
+         field reads the same on every confirmed row and would distinguish
+         nothing here. An unconfirmed row still gets its own visible marker
+         below, via the Name cell's suffix and the full-width notice, not
+         through a plugin name this Agent was never told. #}
       <tr>
         <th>PersonaCore</th>
         <th>Name</th>
-        <th>Plugin on the core</th>
         <th>Joined</th>
         <th></th>
       </tr>
@@ -306,16 +311,6 @@
         <td><code>{{ core.core_address }}</code></td>
         <td>{{ core.display_name }}{% if not core.confirmed %}
           — the name this Agent sent{% endif %}</td>
-        <td>
-          {%- if core.plugin -%}
-            <code>{{ core.plugin }}</code>
-          {%- else -%}
-            {# Left empty on purpose upstream: workstation-&lt;slug&gt; is the core's
-               rule to apply, and filling it in here would be this Agent asserting
-               a name no core ever told it. #}
-            Not known
-          {%- endif -%}
-        </td>
         <td>{{ core.joined_at.strftime("%Y-%m-%d %H:%M UTC") }}</td>
         <td>
           <form method="post" action="/network-mcp/enrolled/remove"
@@ -335,7 +330,7 @@
       </tr>
       {% if not core.confirmed %}
       <tr>
-        <td colspan="5" class="error">PersonaCore never confirmed this one. Its token
+        <td colspan="4" class="error">PersonaCore never confirmed this one. Its token
           reached this workstation and is in force, so the Agent is holding a working
           credential — but the core stopped answering before it said what it had done,
           and it saves its own record after sending the token. Open PersonaCore's

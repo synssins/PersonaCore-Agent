@@ -149,74 +149,36 @@ def test_load_secret_missing_llm_key_remedy_is_enter_again(
     assert "API Key field" in msg
 
 
-def test_load_secret_missing_per_machine_workstation_token_names_the_machine(
+def test_load_secret_missing_fixed_workstation_token_names_the_role(
     tmp_appdata: Path, patched_store: None,
 ) -> None:
-    """A PersonaCore per-machine token (workstation_<slug>_token) names the machine.
+    """The fixed ``workstation_token`` table entry still names its role.
 
-    PersonaCore's enrolment derives one secret name per enrolled machine
-    rather than a single fixed name, so this cannot be a table lookup -- it
-    is a pattern match, and the slug (an operator-chosen machine name) must
-    come through readably rather than as a raw underscored identifier.
+    Unlike the per-machine slug pattern this product used to derive
+    (removed -- PersonaCore now has a single plugin per core, not one per
+    machine), ``workstation_token`` is a literal, fixed name in
+    ``_SECRET_ROLES``, matched by table lookup rather than pattern.
     """
     _ = tmp_appdata
     _ = patched_store
     with pytest.raises(KeyError) as exc_info:
-        store.load_secret("workstation_front_desk_token")
+        store.load_secret("workstation_token")
     msg = exc_info.value.args[0]
-    assert "workstation" in msg.lower()
-    assert "Front Desk" in msg
+    assert "bearer token" in msg.lower()
 
 
-def test_load_secret_missing_workstation_token_remedy_is_reenrol_not_enter(
-    tmp_appdata: Path, patched_store: None,
-) -> None:
-    """A per-machine token is pushed by PersonaCore at enrolment -- never typed.
+def test_secret_role_generic_fallback_is_sanitised_and_length_capped() -> None:
+    """An unrecognised name is untrusted text: no structure, no unbounded length.
 
-    There is no field anywhere in this product for a person to type a
-    bearer token into on purpose, so the remedy must not tell the operator
-    to "enter" or "re-enter" it -- that sends them hunting for a control
-    that does not exist. The correct remedy is to re-enrol.
-    """
-    _ = tmp_appdata
-    _ = patched_store
-    with pytest.raises(KeyError) as exc_info:
-        store.load_secret("workstation_front_desk_token")
-    msg = exc_info.value.args[0]
-    assert "join" in msg.lower() or "re-enrol" in msg.lower()
-    assert "enter it again" not in msg.lower()
-    assert "re-enter" not in msg.lower()
-
-
-def test_secret_role_workstation_slug_is_sanitised_and_length_capped() -> None:
-    """The machine-name slug is untrusted text: no structure, no unbounded length.
-
-    A slug an operator typed could contain punctuation or be very long; the
+    A name a caller passes could contain punctuation or be very long; the
     role text must never let it inject formatting or blow past a sane size.
     """
-    noisy_name = "workstation_" + ("kitchen<script>!!__" * 5) + "_token"
+    noisy_name = "kitchen<script>!!__" * 5
     info = store._secret_role(noisy_name)
     assert "<" not in info.role
     assert ">" not in info.role
     assert "!" not in info.role
     assert len(info.role) < 120
-
-
-def test_secret_role_workstation_slug_that_sanitises_to_nothing_is_safe() -> None:
-    """A slug made entirely of unsafe characters must not fall through unsanitised.
-
-    The bug this guards: the sanitised branch was only taken when something
-    safe remained, and the *default* it fell through to on failure embedded
-    the raw, unsanitised name. A safe static phrase must be what is
-    returned, not what is skipped past.
-    """
-    noisy_name = "workstation_</>_token"
-    info = store._secret_role(noisy_name)
-    assert "</>" not in info.role
-    assert noisy_name not in info.role
-    assert "workstation" in info.role.lower()
-    # Still an enrolment-pushed credential -- same remedy as the readable case.
-    assert "join" in info.remedy.lower() or "re-enrol" in info.remedy.lower()
 
 
 def test_load_secret_missing_unknown_name_has_readable_fallback(
@@ -254,9 +216,9 @@ def test_load_secret_missing_unknown_name_has_no_invented_remedy(
 def test_secret_role_unknown_name_that_sanitises_to_nothing_is_safe() -> None:
     """A totally unrecognised name made of unsafe characters must not leak through.
 
-    This is the fallback-of-the-fallback: not the workstation-token pattern
-    at all, just an arbitrary name nobody anticipated. It must still never
-    echo the raw input once sanitising it leaves nothing safe.
+    This is the generic fallback for any secret name not in the fixed role
+    table: an arbitrary name nobody anticipated. It must still never echo
+    the raw input once sanitising it leaves nothing safe.
     """
     noisy_name = "</>!!!"
     info = store._secret_role(noisy_name)
@@ -289,21 +251,23 @@ def test_load_secret_decrypt_failure_names_the_credential(
     assert "top-secret-value" not in msg
 
 
-def test_load_secret_decrypt_failure_workstation_token_says_reenrol(
+def test_load_secret_decrypt_failure_fixed_workstation_token_names_the_role(
     tmp_appdata: Path, patched_store: None, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A decrypt failure on a per-machine token also gets the re-enrol remedy.
+    """A decrypt failure on the fixed ``workstation_token`` name names its role.
 
-    The remedy must be consistent between the missing-secret and the
-    decrypt-failure paths for the same kind of secret -- both are "this
-    Agent no longer has a usable value," and the fix is the same either way.
+    ``_secret_role`` is looked up once and used for both the missing-secret
+    and decrypt-failure paths, so this exercises the same table entry as
+    :func:`test_load_secret_missing_fixed_workstation_token_names_the_role`
+    through the other error path. No remedy is verified for this name (see
+    ``_SECRET_ROLES``), so none should be invented here either.
     """
     import workstation_agent.security.dpapi as _dpapi_mod
 
     _ = tmp_appdata
     _ = patched_store
 
-    store.save_secret("workstation_front_desk_token", b"pushed-by-personacore")
+    store.save_secret("workstation_token", b"pushed-by-personacore")
 
     def _broken_unprotect(blob: bytes, *, entropy: bytes | None = None) -> bytes:
         _ = blob, entropy
@@ -313,9 +277,9 @@ def test_load_secret_decrypt_failure_workstation_token_says_reenrol(
     monkeypatch.setattr(_dpapi_mod, "unprotect", _broken_unprotect)
 
     with pytest.raises(_dpapi_mod.DpapiError) as exc_info:
-        store.load_secret("workstation_front_desk_token")
+        store.load_secret("workstation_token")
     msg = str(exc_info.value).lower()
-    assert "join" in msg or "re-enrol" in msg
+    assert "bearer token" in msg
     assert "enter it again" not in msg
     assert "pushed-by-personacore" not in msg
 
