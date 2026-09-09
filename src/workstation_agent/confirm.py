@@ -404,3 +404,232 @@ class ConfirmPresenter:
             log.exception("confirm[%s]: spoken line failed", correlation_id)
             return False
         return True
+
+
+# --------------------------------------------------------------------------
+# §7 confirmation policy — never/always-prompt lists and session memory (B3)
+# --------------------------------------------------------------------------
+#
+# ConfirmPresenter above is the *mechanism*: show one prompt, wait for one
+# answer.  This section is the *policy* that decides, for a given tool and a
+# gate decision, whether that mechanism gets invoked at all — contract §7's
+# operator-editable never-prompt / always-prompt lists, and the per-tool
+# "remember for this session" that lets a burst of calls to the same tool
+# ask only once.
+#
+# Name mapping
+# ------------
+# Contract §7 and ``AgentConfig.confirmation`` spell tool names in the
+# underscore ``family_verb`` form (``files_read``, ``jobs_*``) — the same
+# spelling the contract text and the settings UI use.  The gate
+# (``mcp_host.permissions.evaluate_detailed``) and ``MCPHost.invoke`` work in
+# the dotted ``family.verb`` form the plugin manifests declare
+# (``filesystem.read``).  :func:`underscore_to_dotted` converts, and
+# :func:`tool_matches_pattern` compares case-insensitively, so a hand-typed
+# or mis-cased entry (``Files_write``) still matches.  ``jobs_*`` is the one
+# family wildcard: it becomes ``jobs.*`` and matches every dotted tool
+# *within* the ``jobs`` family (not the bare word ``jobs`` itself, which is
+# not a real tool id) — see :func:`tool_matches_pattern`.
+#
+# A name that still fails to match anything real — a typo the case-fold
+# doesn't rescue, a family that has not been built yet — fails *toward* the
+# gate's own decision, but that is **not symmetrically safe for both
+# lists**: for a never-prompt entry, "matches nothing" means the gate's own
+# decision stands, which is at worst an extra prompt. For an always-prompt
+# entry, "matches nothing" *also* means the gate's own decision stands —
+# and for an action tool the gate often already says "allow" on its own, so
+# a broken always-prompt match can silently produce no prompt at all where
+# §7 wanted one every time. Treat "fails toward prompting" as a claim about
+# the never-prompt list only; case-folding closes the one way this was
+# reachable through an ordinary operator typo, but it is not a guarantee
+# that every possible mismatch on the always-prompt side is harmless.
+#
+# What this can and cannot do
+# ----------------------------
+# * It never runs before the gate and never sees a ``"deny"`` —
+#   ``MCPHost.invoke`` only consults it for calls the gate already resolved
+#   to ``"confirm"`` or ``"allow"``.  A pre-approved (never-prompt) tool that
+#   the gate denies stays denied; this module has no path back to that
+#   decision at all, by construction rather than by a check that could be
+#   missed.
+# * For a gate ``"confirm"``: the policy can only *suppress* the prompt
+#   (never-prompt, or an already-remembered tool+session) — the call still
+#   had to be "allowed in principle" by the gate first.
+# * For a gate ``"allow"``: the policy can *add* a prompt (always-prompt)
+#   that the gate itself did not require — contract §7 wants every
+#   ``shell_run`` and ``files_write`` confirmed even when the
+#   argument-confinement gate has nothing to complain about.
+# * If a tool is (mis)configured into both lists, "always" wins: the safe
+#   failure direction is more confirmation, not less.
+
+
+def underscore_to_dotted(name: str) -> str:
+    """Convert a §7 tool name to the gate's dotted ``family.verb`` form.
+
+    ``"files_read"`` -> ``"files.read"``.  ``"jobs_*"`` (the one family
+    wildcard the contract defines) -> ``"jobs.*"``.  A name with no ``_`` at
+    all — already dotted, empty, or just not a recognised shape — is
+    returned unchanged, which will not match a real dotted tool id.
+
+    Case is *not* folded here — :func:`tool_matches_pattern` does that on
+    both sides at comparison time, once, rather than here and at every call
+    site that might otherwise forget to.
+    """
+    name = name.strip()
+    if not name:
+        return name
+    if name.endswith("_*"):
+        family = name[:-2]
+        return f"{family}.*" if family else name
+    if "_" not in name:
+        return name
+    family, verb = name.split("_", 1)
+    return f"{family}.{verb}"
+
+
+def tool_matches_pattern(pattern: str, tool_id: str) -> bool:
+    """True if dotted *pattern* (from :func:`underscore_to_dotted`) matches *tool_id*.
+
+    Case-folded on both sides before comparing, so an operator- or hand-typed
+    entry like ``Files_write`` still matches the gate's (always lower-case)
+    ``files.write`` — see the asymmetry note below for why this matters more
+    than it looks.
+
+    A trailing ``.*`` matches every tool *within* that family (``jobs.*``
+    matches ``jobs.wait``, ``jobs.output``, ... but not the bare name
+    ``jobs`` itself, which is not a real dotted tool id and should not be
+    swept in just because it shares the family's spelling). Everything else
+    is an exact match only — there is no implicit prefix matching, so
+    ``files.rea`` never matches ``files.read``.
+
+    Failing to match is **not symmetrically safe**. A never-prompt entry
+    that fails to match falls back to the gate's own decision — at worst an
+    extra prompt, never a widened permission. An always-prompt entry that
+    fails to match (a mis-cased config line, say) falls back to the gate's
+    own decision too, but for an action tool the gate often says "allow" on
+    its own — so a broken always-prompt match can silently produce *no*
+    prompt at all where §7 wanted one every time. Case-folding here removes
+    the one way that was reachable through ordinary operator typos.
+    """
+    if not pattern or not tool_id:
+        return False
+    pattern = pattern.casefold()
+    tool_id = tool_id.casefold()
+    if pattern == tool_id:
+        return True
+    if pattern.endswith(".*"):
+        family = pattern[:-2]
+        return bool(family) and tool_id.startswith(family + ".")
+    return False
+
+
+class PromptPolicy:
+    """Runtime view of contract §7's confirmation policy for one MCPHost.
+
+    See :class:`workstation_agent.mcp_host.host.MCPHost`, which owns one
+    instance of this class.  Reads the operator's ``AgentConfig.confirmation``
+    lists via
+    *config_provider*, called fresh on every query — there is no cached copy
+    to go stale, so a setting changed through the UI takes effect on the very
+    next call.
+
+    Session memory (:meth:`remember` / :meth:`is_remembered`) is the only
+    stateful part of this class, and it is deliberately narrow:
+
+    * **per session AND per tool** — keyed by ``(session_id, tool_id)``, so
+      remembering ``serial.write`` for session ``s1`` cannot suppress a
+      prompt for ``files.write`` in ``s1``, nor for ``serial.write`` in a
+      different session ``s2``;
+    * **in memory only** — a plain dict on this instance, never written to
+      disk and never shared with another :class:`PromptPolicy`, so it cannot
+      outlive the process or leak to another one; and
+    * **cleared by** :meth:`reset`, which ``MCPHost.start`` calls on every
+      (re)start — "must not survive an Agent restart" is enforced by that
+      call always happening, not by a TTL that happens to be short enough.
+    """
+
+    def __init__(self, config_provider: Callable[[], Any] | None = None) -> None:
+        """Build a policy view; *config_provider* is called lazily, per query."""
+        self._config_provider = config_provider
+        self._remembered: dict[str, set[str]] = {}
+
+    def reset(self) -> None:
+        """Drop all remembered session approvals.  Called by ``MCPHost.start``."""
+        self._remembered = {}
+
+    def _policy_config(self) -> Any:  # noqa: ANN401 — duck-typed AgentConfig.confirmation
+        if self._config_provider is None:
+            return None
+        try:
+            cfg = self._config_provider()
+        except Exception:
+            log.exception("confirm policy: config provider raised")
+            return None
+        if cfg is None:
+            return None
+        return getattr(cfg, "confirmation", None)
+
+    def classify(self, tool_id: str) -> str | None:
+        """Return ``"always"``, ``"never"``, or ``None`` for *tool_id*.
+
+        ``None`` means "the operator has not named this tool" — the caller
+        must defer entirely to the gate's own decision.  A tool named in
+        both lists resolves to ``"always"`` (see the module docstring).
+        """
+        policy = self._policy_config()
+        if policy is None:
+            return None
+        always = getattr(policy, "always_prompt", None) or ()
+        if any(tool_matches_pattern(underscore_to_dotted(p), tool_id) for p in always):
+            return "always"
+        never = getattr(policy, "never_prompt", None) or ()
+        if any(tool_matches_pattern(underscore_to_dotted(p), tool_id) for p in never):
+            return "never"
+        return None
+
+    def remember_enabled(self, tool_id: str) -> bool:
+        """True if the operator opted *tool_id* into "remember for session"."""
+        policy = self._policy_config()
+        if policy is None:
+            return False
+        patterns = getattr(policy, "remember_for_session", None) or ()
+        return any(tool_matches_pattern(underscore_to_dotted(p), tool_id) for p in patterns)
+
+    def is_remembered(self, session_id: str | None, tool_id: str) -> bool:
+        """True if *tool_id* was already explicitly allowed in *session_id*.
+
+        Always false without a session id — there is nothing to key on, so
+        an in-process caller with no transport session is never remembered
+        and always goes through the real prompt.
+
+        Trust boundary this rests on: keying by ``session_id`` only isolates
+        remembered approvals per session if ``session_id`` itself is
+        unguessable and never reused. This class does not mint or validate
+        it -- it takes whatever ``MCPHost.invoke`` was handed, which comes
+        from ``SessionContext`` (B2), minted per connection with
+        ``uuid.uuid4().hex`` in ``mcp_host/mcp_server.py`` at the time this
+        was written. If that ever changes to something predictable or
+        reused across connections (e.g. derived from a client-supplied
+        value, or recycled from a pool), a never-explicitly-approved caller
+        could inherit another session's remembered approvals purely by
+        presenting its id -- this method has no way to detect that.
+        """
+        if not session_id:
+            return False
+        return tool_id in self._remembered.get(session_id, ())
+
+    def remember(self, session_id: str | None, tool_id: str) -> None:
+        """Record an explicit Allow for *tool_id* in *session_id*, if enabled.
+
+        A no-op without a session id, and a no-op unless the operator opted
+        *tool_id* into remembering (:meth:`remember_enabled`) — remembering
+        is never turned on silently just because a prompt happened to
+        succeed.
+        """
+        if not session_id or not self.remember_enabled(tool_id):
+            return
+        self._remembered.setdefault(session_id, set()).add(tool_id)
+
+    def forget_session(self, session_id: str) -> None:
+        """Drop remembered approvals for one session (e.g. on disconnect)."""
+        self._remembered.pop(session_id, None)

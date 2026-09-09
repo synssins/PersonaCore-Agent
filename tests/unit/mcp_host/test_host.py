@@ -22,6 +22,7 @@ from workstation_agent.mcp_host.host import (
     _resolve_entry,
 )
 from workstation_agent.mcp_host.loader import PluginManifest, VerifyResult
+from workstation_agent.mcp_host.permissions import SessionContext
 from workstation_agent.mcp_host.supervisor import ResourceLimits, SubprocessHandle
 
 
@@ -708,3 +709,272 @@ async def test_invoke_tool_error_logged(isolated_audit_db):
     rows = audit_mod.query(audit_mod.AuditQuery(event="tool_error"), db_path=isolated_audit_db)
     assert len(rows) == 1
     assert rows[0].code == "error"
+
+
+# ---------------------------------------------------------------------------
+# §7 confirmation policy (B3) — never/always-prompt, remember, mapping
+# ---------------------------------------------------------------------------
+
+
+def _ok_client() -> AsyncMock:
+    client = AsyncMock()
+    client.tools_call = AsyncMock(return_value={
+        "content": [{"type": "text", "text": "done"}],
+        "isError": False,
+    })
+    return client
+
+
+def _policy_cfg(*, never=(), always=(), remember=()) -> AgentConfig:
+    cfg = AgentConfig()
+    cfg.confirmation.never_prompt = list(never)
+    cfg.confirmation.always_prompt = list(always)
+    cfg.confirmation.remember_for_session = list(remember)
+    return cfg
+
+
+def _serial_write_runtime() -> host_mod._PluginRuntime:
+    """A `serial.write` tool whose gate decision is "confirm" for this path."""
+    manifest = _make_manifest(
+        "serial",
+        declared_permissions=[
+            "tool:serial.write",
+            "path:/safe/",
+            "args:serial.write:action:!path=ws_path",
+        ],
+    )
+    manifest.confirmable_conditions = ["outside_declared_paths"]
+    return host_mod._PluginRuntime(
+        manifest=manifest,
+        verify_result=VerifyResult(status="unsigned"),
+        status="running",
+        tools=[{"name": "serial.write"}],
+        granted_permissions={"tool:serial.write"},
+        client=_ok_client(),
+    )
+
+
+def _shell_run_runtime(client: AsyncMock | None = None) -> host_mod._PluginRuntime:
+    """A `shell.run` tool whose `cmd:*` allowlist makes the gate say "allow"."""
+    manifest = _make_manifest(
+        "shell",
+        declared_permissions=[
+            "tool:shell.run",
+            "cmd:*",
+            "args:shell.run:action:!command=ws_command",
+        ],
+    )
+    manifest.confirmable_conditions = ["command_outside_allowlist"]
+    return host_mod._PluginRuntime(
+        manifest=manifest,
+        verify_result=VerifyResult(status="unsigned"),
+        status="running",
+        tools=[{"name": "shell.run"}],
+        granted_permissions={"tool:shell.run"},
+        client=client or _ok_client(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_never_prompt_suppresses_a_gate_confirm(isolated_audit_db):
+    """A never-prompt tool that the gate would confirm does not prompt at all."""
+    h = MCPHost()
+    h._runtimes["serial"] = _serial_write_runtime()
+    h._config = _policy_cfg(never=["serial_write"])
+
+    confirm_cb = AsyncMock(return_value=True)
+    h._confirm_cb = confirm_cb
+
+    result = await h.invoke("serial.write", {"path": "/unsafe/x.txt"})
+
+    assert result.ok is True
+    confirm_cb.assert_not_called()
+
+    rows = audit_mod.query(
+        audit_mod.AuditQuery(event="tool_confirmed"), db_path=isolated_audit_db,
+    )
+    assert any(r.decision == "confirm_preapproved" for r in rows)
+
+
+@pytest.mark.asyncio
+async def test_always_prompt_forces_a_prompt_on_a_gate_allow(isolated_audit_db):
+    """An always-prompt tool the gate would silently allow still prompts."""
+    h = MCPHost()
+    h._runtimes["shell"] = _shell_run_runtime()
+    h._config = _policy_cfg(always=["shell_run"])
+
+    confirm_cb = AsyncMock(return_value=True)
+    h._confirm_cb = confirm_cb
+
+    result = await h.invoke("shell.run", {"command": "dir"})
+
+    assert result.ok is True
+    confirm_cb.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_capitalised_always_prompt_entry_still_prompts(isolated_audit_db):
+    """Rework cycle 1, finding #1 -- the unsafe direction, end to end.
+
+    `Shell_Run` (hand-typed with a capital) must still force a prompt for
+    `shell.run`. Before case-folding, `underscore_to_dotted("Shell_Run")`
+    stayed `"Shell.Run"` and never matched the gate's lower-case
+    `shell.run`, so the tool would have silently fallen through to the
+    gate's own "allow" -- no prompt at all for a tool the operator meant to
+    always confirm.
+    """
+    h = MCPHost()
+    h._runtimes["shell"] = _shell_run_runtime()
+    h._config = _policy_cfg(always=["Shell_Run"])
+    confirm_cb = AsyncMock(return_value=True)
+    h._confirm_cb = confirm_cb
+
+    result = await h.invoke("shell.run", {"command": "dir"})
+
+    assert result.ok is True
+    confirm_cb.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_always_prompt_rejection_is_unconfirmed(isolated_audit_db):
+    """A forced always-prompt that the operator denies is `unconfirmed`, not a silent allow."""
+    h = MCPHost()
+    client = _ok_client()
+    h._runtimes["shell"] = _shell_run_runtime(client=client)
+    h._config = _policy_cfg(always=["shell_run"])
+    h._confirm_cb = AsyncMock(return_value=False)
+
+    result = await h.invoke("shell.run", {"command": "dir"})
+
+    assert result.ok is False
+    assert result.code == "unconfirmed"
+    client.tools_call.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_moving_a_tool_between_lists_takes_effect(isolated_audit_db):
+    """set_config (the UI's live push) changes behaviour on the very next call."""
+    h = MCPHost()
+    h._runtimes["shell"] = _shell_run_runtime()
+    h._config = _policy_cfg()  # shell_run on neither list -> gate's own "allow" stands
+    confirm_cb = AsyncMock(return_value=True)
+    h._confirm_cb = confirm_cb
+
+    await h.invoke("shell.run", {"command": "dir"})
+    confirm_cb.assert_not_called()
+
+    h.set_config(_policy_cfg(always=["shell_run"]))
+    await h.invoke("shell.run", {"command": "dir"})
+    confirm_cb.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_remember_suppresses_second_prompt_same_session(isolated_audit_db):
+    """§7: "a burst of serial writes asks once" — same tool, same session."""
+    h = MCPHost()
+    h._runtimes["shell"] = _shell_run_runtime()
+    h._config = _policy_cfg(always=["shell_run"], remember=["shell_run"])
+    confirm_cb = AsyncMock(return_value=True)
+    h._confirm_cb = confirm_cb
+    session = SessionContext(session_id="s1")
+
+    r1 = await h.invoke("shell.run", {"command": "dir"}, session=session)
+    r2 = await h.invoke("shell.run", {"command": "dir /w"}, session=session)
+
+    assert r1.ok is True
+    assert r2.ok is True
+    confirm_cb.assert_awaited_once()  # only the first call actually prompted
+
+
+@pytest.mark.asyncio
+async def test_remember_does_not_leak_to_a_different_session(isolated_audit_db):
+    h = MCPHost()
+    h._runtimes["shell"] = _shell_run_runtime()
+    h._config = _policy_cfg(always=["shell_run"], remember=["shell_run"])
+    confirm_cb = AsyncMock(return_value=True)
+    h._confirm_cb = confirm_cb
+
+    await h.invoke("shell.run", {"command": "dir"}, session=SessionContext(session_id="s1"))
+    await h.invoke("shell.run", {"command": "dir"}, session=SessionContext(session_id="s2"))
+
+    assert confirm_cb.await_count == 2  # a different session prompts again
+
+
+@pytest.mark.asyncio
+async def test_remember_does_not_survive_a_restart(cfg_allow_unsigned, isolated_audit_db):
+    """§5.5: sessions die with the Agent — MCPHost.start must drop remembered approvals."""
+    h = MCPHost()
+    h._runtimes["shell"] = _shell_run_runtime()
+    h._config = _policy_cfg(always=["shell_run"], remember=["shell_run"])
+    h._confirm_cb = AsyncMock(return_value=True)
+    session = SessionContext(session_id="s1")
+
+    await h.invoke("shell.run", {"command": "dir"}, session=session)
+    assert h._prompt_policy.is_remembered(session.session_id, "shell.run")
+
+    with patch("workstation_agent.mcp_host.host.discover", return_value=[]):
+        await h.start(cfg_allow_unsigned)
+        await h.stop()
+
+    assert not h._prompt_policy.is_remembered(session.session_id, "shell.run")
+
+
+@pytest.mark.asyncio
+async def test_remember_without_opt_in_prompts_every_time(isolated_audit_db):
+    """always-prompt without the remember flag never suppresses -- burst still asks each time."""
+    h = MCPHost()
+    h._runtimes["shell"] = _shell_run_runtime()
+    h._config = _policy_cfg(always=["shell_run"])  # no remember_for_session entry
+    confirm_cb = AsyncMock(return_value=True)
+    h._confirm_cb = confirm_cb
+    session = SessionContext(session_id="s1")
+
+    await h.invoke("shell.run", {"command": "dir"}, session=session)
+    await h.invoke("shell.run", {"command": "dir /w"}, session=session)
+
+    assert confirm_cb.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_never_prompt_cannot_widen_a_gate_denial(isolated_audit_db):
+    """Mutation-tested claim: pre-approval must never turn a `deny` into an `allow`.
+
+    `files.read` outside its declared root is a hard `deny` from the gate's
+    read/action split (contract §11 item 6) -- never a `confirm`.  Putting it
+    on the never-prompt list, and even wiring a confirm callback that would
+    happily say yes, must not change the outcome: the policy layer is never
+    consulted for a `deny` at all.
+    """
+    manifest = _make_manifest(
+        "files",
+        declared_permissions=[
+            "tool:files.read",
+            "path:/safe/",
+            "args:files.read:read:!path=ws_path",
+        ],
+    )
+    client = _ok_client()
+    fake_runtime = host_mod._PluginRuntime(
+        manifest=manifest,
+        verify_result=VerifyResult(status="unsigned"),
+        status="running",
+        tools=[{"name": "files.read"}],
+        granted_permissions={"tool:files.read"},
+        client=client,
+    )
+
+    h = MCPHost()
+    h._runtimes["files"] = fake_runtime
+    h._config = _policy_cfg(never=["files_read"])
+    confirm_cb = AsyncMock(return_value=True)  # would allow anything, if ever asked
+    h._confirm_cb = confirm_cb
+
+    result = await h.invoke("files.read", {"path": "/unsafe/x.txt"})
+
+    assert result.ok is False
+    assert result.code == "denied"
+    confirm_cb.assert_not_called()
+    client.tools_call.assert_not_called()
+
+    rows = audit_mod.query(audit_mod.AuditQuery(event="tool_denied"), db_path=isolated_audit_db)
+    assert any(r.code == "denied" for r in rows)

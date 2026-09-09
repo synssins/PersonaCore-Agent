@@ -23,9 +23,12 @@ from workstation_agent.confirm import (
     OUTCOME_UNCONFIRMED,
     ConfirmDecision,
     ConfirmPresenter,
+    PromptPolicy,
     command_text,
     prompt_line,
     toast_stack_available,
+    tool_matches_pattern,
+    underscore_to_dotted,
 )
 from workstation_agent.mcp_host.host import ConfirmationRequestImpl
 from workstation_agent.ui.notifications import toast as toast_mod
@@ -593,3 +596,211 @@ async def test_show_raising_after_a_click_still_denies():
     decision = await presenter.request(make_req())
     assert decision.outcome == OUTCOME_DENIED
     assert decision.reason == "toast_failed"
+
+
+# ---------------------------------------------------------------------------
+# §7 confirmation policy (B3) — name mapping
+# ---------------------------------------------------------------------------
+
+
+class TestUnderscoreToDotted:
+    def test_simple_family_verb(self):
+        assert underscore_to_dotted("files_read") == "files.read"
+        assert underscore_to_dotted("shell_run") == "shell.run"
+
+    def test_family_wildcard(self):
+        assert underscore_to_dotted("jobs_*") == "jobs.*"
+
+    def test_no_underscore_returned_unchanged(self):
+        """No family separator to find -- returned as-is, matching nothing real."""
+        assert underscore_to_dotted("alreadydotted") == "alreadydotted"
+
+    def test_empty_string(self):
+        assert underscore_to_dotted("") == ""
+
+    def test_whitespace_is_stripped(self):
+        assert underscore_to_dotted("  files_read  ") == "files.read"
+
+    def test_only_first_underscore_splits(self):
+        """A verb that itself contains an underscore keeps it (e.g. multi-word verbs)."""
+        assert underscore_to_dotted("adb_factory_reset") == "adb.factory_reset"
+
+
+class TestToolMatchesPattern:
+    def test_exact_match(self):
+        assert tool_matches_pattern("files.read", "files.read")
+
+    def test_exact_mismatch(self):
+        assert not tool_matches_pattern("files.read", "files.write")
+
+    def test_no_partial_prefix_match(self):
+        assert not tool_matches_pattern("files.rea", "files.read")
+
+    def test_family_wildcard_matches_every_verb(self):
+        assert tool_matches_pattern("jobs.*", "jobs.wait")
+        assert tool_matches_pattern("jobs.*", "jobs.output")
+        assert tool_matches_pattern("jobs.*", "jobs.list")
+
+    def test_family_wildcard_does_not_match_other_family(self):
+        assert not tool_matches_pattern("jobs.*", "adb.devices")
+
+    def test_family_wildcard_does_not_match_the_bare_family_name(self):
+        """`jobs.*` matches tools *within* the family, not the word `jobs` itself.
+
+        Rework cycle 1, finding #2: no real tool is named exactly its
+        family, but the wildcard should describe "within the family", not
+        "starts with the family's spelling".
+        """
+        assert not tool_matches_pattern("jobs.*", "jobs")
+
+    def test_empty_pattern_or_tool_never_matches(self):
+        assert not tool_matches_pattern("", "files.read")
+        assert not tool_matches_pattern("files.read", "")
+
+    def test_case_insensitive_exact_match(self):
+        """Rework cycle 1, finding #1: a mis-cased pattern must still match.
+
+        `underscore_to_dotted("Files_write")` -> `"Files.write"` (case is not
+        folded there by design); the gate's tool id is always lower-case
+        (`files.write`). Without folding here, an always-prompt entry typed
+        with a capital would silently stop matching -- the unsafe direction.
+        """
+        assert tool_matches_pattern("Files.write", "files.write")
+        assert tool_matches_pattern("files.write", "FILES.WRITE")
+
+    def test_case_insensitive_wildcard_match(self):
+        assert tool_matches_pattern("JOBS.*", "jobs.output")
+        assert tool_matches_pattern("jobs.*", "JOBS.OUTPUT")
+
+
+# ---------------------------------------------------------------------------
+# §7 confirmation policy (B3) — PromptPolicy
+# ---------------------------------------------------------------------------
+
+
+def _cfg_with_policy(*, never=(), always=(), remember=()) -> AgentConfig:
+    cfg = AgentConfig()
+    cfg.confirmation.never_prompt = list(never)
+    cfg.confirmation.always_prompt = list(always)
+    cfg.confirmation.remember_for_session = list(remember)
+    return cfg
+
+
+class TestPromptPolicyClassify:
+    def test_no_config_provider_is_neutral(self):
+        policy = PromptPolicy(config_provider=None)
+        assert policy.classify("files.read") is None
+
+    def test_config_provider_raising_is_neutral(self):
+        def _boom():
+            msg = "config unavailable"
+            raise RuntimeError(msg)
+
+        policy = PromptPolicy(config_provider=_boom)
+        assert policy.classify("files.read") is None
+
+    def test_config_without_confirmation_attr_is_neutral(self):
+        policy = PromptPolicy(config_provider=lambda: object())
+        assert policy.classify("files.read") is None
+
+    def test_never_prompt_classification(self):
+        cfg = _cfg_with_policy(never=["files_read"])
+        policy = PromptPolicy(config_provider=lambda: cfg)
+        assert policy.classify("files.read") == "never"
+
+    def test_always_prompt_classification(self):
+        cfg = _cfg_with_policy(always=["shell_run"])
+        policy = PromptPolicy(config_provider=lambda: cfg)
+        assert policy.classify("shell.run") == "always"
+
+    def test_unlisted_tool_is_neutral(self):
+        cfg = _cfg_with_policy(never=["files_read"], always=["shell_run"])
+        policy = PromptPolicy(config_provider=lambda: cfg)
+        assert policy.classify("clipboard.paste") is None
+
+    def test_wildcard_family_classification(self):
+        cfg = _cfg_with_policy(never=["jobs_*"])
+        policy = PromptPolicy(config_provider=lambda: cfg)
+        assert policy.classify("jobs.output") == "never"
+        assert policy.classify("jobs.wait") == "never"
+
+    def test_capitalised_always_prompt_entry_still_classifies_always(self):
+        """Rework cycle 1, finding #1 -- the unsafe direction.
+
+        An always-prompt entry typed (or hand-edited into config.toml) with
+        different casing must still classify as "always": if it silently
+        stopped matching, an action tool the gate would otherwise "allow"
+        on its own could run with no prompt at all.
+        """
+        cfg = _cfg_with_policy(always=["Shell_Run"])
+        policy = PromptPolicy(config_provider=lambda: cfg)
+        assert policy.classify("shell.run") == "always"
+
+    def test_listed_in_both_resolves_to_always(self):
+        """Misconfiguration (both lists) fails toward more confirmation."""
+        cfg = _cfg_with_policy(never=["shell_run"], always=["shell_run"])
+        policy = PromptPolicy(config_provider=lambda: cfg)
+        assert policy.classify("shell.run") == "always"
+
+    def test_config_reread_on_every_call(self):
+        """No cached copy -- a config swapped mid-flight is picked up live."""
+        cfg = _cfg_with_policy()
+        policy = PromptPolicy(config_provider=lambda: cfg)
+        assert policy.classify("shell.run") is None
+        cfg.confirmation.always_prompt = ["shell_run"]
+        assert policy.classify("shell.run") == "always"
+
+
+class TestPromptPolicySessionMemory:
+    def test_not_remembered_without_session_id(self):
+        cfg = _cfg_with_policy(remember=["shell_run"])
+        policy = PromptPolicy(config_provider=lambda: cfg)
+        policy.remember(None, "shell.run")
+        assert not policy.is_remembered(None, "shell.run")
+        assert not policy.is_remembered("", "shell.run")
+
+    def test_remember_requires_opt_in(self):
+        """remember() is a no-op unless the tool is on remember_for_session."""
+        cfg = _cfg_with_policy()  # remember list empty
+        policy = PromptPolicy(config_provider=lambda: cfg)
+        policy.remember("s1", "shell.run")
+        assert not policy.is_remembered("s1", "shell.run")
+
+    def test_remember_then_is_remembered(self):
+        cfg = _cfg_with_policy(remember=["shell_run"])
+        policy = PromptPolicy(config_provider=lambda: cfg)
+        policy.remember("s1", "shell.run")
+        assert policy.is_remembered("s1", "shell.run")
+
+    def test_remember_is_per_tool(self):
+        """Remembering shell.run must not remember files.write in the same session."""
+        cfg = _cfg_with_policy(remember=["shell_run", "files_write"])
+        policy = PromptPolicy(config_provider=lambda: cfg)
+        policy.remember("s1", "shell.run")
+        assert policy.is_remembered("s1", "shell.run")
+        assert not policy.is_remembered("s1", "files.write")
+
+    def test_remember_does_not_leak_across_sessions(self):
+        cfg = _cfg_with_policy(remember=["shell_run"])
+        policy = PromptPolicy(config_provider=lambda: cfg)
+        policy.remember("s1", "shell.run")
+        assert policy.is_remembered("s1", "shell.run")
+        assert not policy.is_remembered("s2", "shell.run")
+
+    def test_reset_clears_all_sessions(self):
+        """reset() -- called by MCPHost.start on every restart -- forgets everything."""
+        cfg = _cfg_with_policy(remember=["shell_run"])
+        policy = PromptPolicy(config_provider=lambda: cfg)
+        policy.remember("s1", "shell.run")
+        assert policy.is_remembered("s1", "shell.run")
+        policy.reset()
+        assert not policy.is_remembered("s1", "shell.run")
+
+    def test_forget_session_only_clears_that_session(self):
+        cfg = _cfg_with_policy(remember=["shell_run"])
+        policy = PromptPolicy(config_provider=lambda: cfg)
+        policy.remember("s1", "shell.run")
+        policy.remember("s2", "shell.run")
+        policy.forget_session("s1")
+        assert not policy.is_remembered("s1", "shell.run")
+        assert policy.is_remembered("s2", "shell.run")

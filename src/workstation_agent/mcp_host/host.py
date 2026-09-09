@@ -32,6 +32,7 @@ if TYPE_CHECKING:
 
     from workstation_agent.config.schema import AgentConfig
 
+from workstation_agent.confirm import PromptPolicy
 from workstation_agent.mcp_host.audit import AuditEvent
 from workstation_agent.mcp_host.audit import log as audit_log
 from workstation_agent.mcp_host.loader import (
@@ -331,6 +332,11 @@ class MCPHost:
         self._tts_speak: Any | None = None
         self._config: AgentConfig | None = None
         self._lock = asyncio.Lock()
+        #: Contract §7's operator-editable confirmation policy (B3).  Reads
+        #: ``self._config`` lazily on every query, so a setting saved through
+        #: the UI (via :meth:`set_config`) takes effect on the very next
+        #: ``invoke`` — see ``workstation_agent.confirm.PromptPolicy``.
+        self._prompt_policy = PromptPolicy(config_provider=lambda: self._config)
 
     async def start(
         self,
@@ -355,6 +361,10 @@ class MCPHost:
         self._confirm_cb = confirm_cb
         self._tts_speak = tts_speak
         self._attach_voice()
+        # §7 "remember for this session" must not survive an Agent restart
+        # (§5.5: sessions die with the Agent) -- every (re)start drops
+        # whatever the prompt policy had remembered.
+        self._prompt_policy.reset()
 
         manifests = discover()
         allow_unsigned = config.plugins.allow_unsigned
@@ -406,6 +416,18 @@ class MCPHost:
         )
         await self._watchdog.start()
         audit_log(AuditEvent(event="host_started"))
+
+    def set_config(self, config: AgentConfig) -> None:
+        """Push an updated config into the running host without a restart.
+
+        The settings UI calls this after saving a §7 confirmation-policy
+        change (never/always-prompt lists, "remember for this session") so
+        the new lists apply to the very next ``invoke`` call. Unlike
+        :meth:`start`, this does **not** reset remembered session approvals
+        or touch running plugins -- only a real restart does that (§5.5:
+        sessions die with the Agent, not with a settings save).
+        """
+        self._config = config
 
     async def _spawn(self, runtime: _PluginRuntime) -> None:
         """Spawn the subprocess, connect the client, collect tools."""
@@ -599,32 +621,68 @@ class MCPHost:
             )
             return failure_result(CODE_DENIED, outcome.reason, is_error=False)
 
+        # ---- §7 confirmation policy (B3) -----------------------------
+        #
+        # The gate above has already resolved "deny" (returned) or one of
+        # "confirm" / "allow".  The operator's never-prompt / always-prompt
+        # lists only ever act on those two: they can suppress a prompt the
+        # gate asked for ("confirm" + never-prompt, or an already-remembered
+        # tool+session), or add one the gate did not ask for ("allow" +
+        # always-prompt).  There is no branch here that reaches a "deny" --
+        # pre-approval cannot widen one because it is never consulted for one.
         correlation_id: str | None = None
-        if outcome.decision == "confirm":
-            confirmed, correlation_id = await self._do_confirm(
-                runtime, tool_id, args, condition=outcome.condition,
-            )
-            if not confirmed:
+        policy_class = self._prompt_policy.classify(tool_id)
+        wants_prompt = (
+            policy_class != "never" if outcome.decision == "confirm" else policy_class == "always"
+        )
+
+        if wants_prompt:
+            if self._prompt_policy.is_remembered(session_id, tool_id):
                 _audit(
-                    "tool_denied",
-                    "confirm_rejected",
-                    CODE_UNCONFIRMED,
+                    "tool_confirmed",
+                    "confirm_remembered",
+                    None,
                     plugin_id=plugin_id,
-                    result="unconfirmed",
+                    detail=outcome.rule or "policy_always_prompt",
+                )
+            else:
+                confirmed, correlation_id = await self._do_confirm(
+                    runtime, tool_id, args, condition=outcome.condition,
+                )
+                if not confirmed:
+                    _audit(
+                        "tool_denied",
+                        "confirm_rejected",
+                        CODE_UNCONFIRMED,
+                        plugin_id=plugin_id,
+                        result="unconfirmed",
+                        correlation_id=correlation_id,
+                        detail=outcome.rule,
+                    )
+                    return failure_result(
+                        CODE_UNCONFIRMED,
+                        f"Nobody confirmed {tool_id} on the workstation, so it was not run.",
+                        is_error=False,
+                    )
+                self._prompt_policy.remember(session_id, tool_id)
+                _audit(
+                    "tool_confirmed",
+                    "confirm_allowed",
+                    None,
+                    plugin_id=plugin_id,
                     correlation_id=correlation_id,
                     detail=outcome.rule,
                 )
-                return failure_result(
-                    CODE_UNCONFIRMED,
-                    f"Nobody confirmed {tool_id} on the workstation, so it was not run.",
-                    is_error=False,
-                )
+        elif outcome.decision == "confirm":
+            # policy_class == "never": the gate wanted a prompt but the
+            # operator's never-prompt list pre-approves this tool.  Logged
+            # distinctly from a plain "allow" so the audit trail shows the
+            # prompt was suppressed by policy, not that none was ever due.
             _audit(
                 "tool_confirmed",
-                "confirm_allowed",
+                "confirm_preapproved",
                 None,
                 plugin_id=plugin_id,
-                correlation_id=correlation_id,
                 detail=outcome.rule,
             )
 

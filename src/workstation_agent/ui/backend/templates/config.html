@@ -77,4 +77,50 @@
 
   <button type="submit">Save</button>
 </form>
+
+<h2>Confirmation Policy (contract §7)</h2>
+<p>
+  Tools that never prompt on this workstation, tools that always prompt, and
+  which of those may be "remembered" for the rest of one session once
+  explicitly allowed (a burst of calls then asks only once).
+</p>
+
+{% if policy_saved %}<p class="success">Confirmation policy saved.</p>{% endif %}
+{% if policy_errors._global is defined %}<p class="error">{{ policy_errors._global }}</p>{% endif %}
+
+<form method="post" action="/config/confirmation">
+  <fieldset>
+    <legend>Per-tool prompting</legend>
+    <table>
+      <thead>
+        <tr>
+          <th>Tool</th>
+          <th>Never prompt</th>
+          <th>Always prompt</th>
+          <th>Remember for session</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for tool in confirmation_tools %}
+        <tr>
+          <td><code>{{ tool }}</code></td>
+          <td>
+            <input type="radio" name="policy_{{ tool }}" value="never"
+              {% if cfg and tool in cfg.confirmation.never_prompt %}checked{% endif %}>
+          </td>
+          <td>
+            <input type="radio" name="policy_{{ tool }}" value="always"
+              {% if cfg and tool in cfg.confirmation.always_prompt %}checked{% endif %}>
+          </td>
+          <td>
+            <input type="checkbox" name="remember_{{ tool }}" value="true"
+              {% if cfg and tool in cfg.confirmation.remember_for_session %}checked{% endif %}>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </fieldset>
+  <button type="submit">Save Confirmation Policy</button>
+</form>
 {% endblock %}

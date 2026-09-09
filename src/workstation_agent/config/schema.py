@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Final, Literal
 
 from pydantic import AnyHttpUrl, BaseModel, Field, field_validator
 
@@ -105,6 +105,73 @@ class PluginsConfig(BaseModel):
     per_plugin: dict[str, PluginConfig] = Field(default_factory=dict)
 
 
+#: Contract §7's default confirmation policy, in the contract's own
+#: underscore ``family_verb`` spelling.  The gate
+#: (``mcp_host.permissions.evaluate_detailed``) and ``MCPHost.invoke`` work in
+#: the dotted ``family.verb`` form the plugin manifests declare; the mapping
+#: between the two lives entirely in
+#: :func:`workstation_agent.confirm.underscore_to_dotted`, never here — this
+#: module only stores what the operator typed.  ``jobs_*`` is the one
+#: family-wildcard entry: it is expanded to ``jobs.*`` at evaluation time and
+#: matches every tool in the ``jobs`` family.
+DEFAULT_NEVER_PROMPT_TOOLS: Final[tuple[str, ...]] = (
+    "workstation_status",
+    "devices_list",
+    "jobs_*",
+    "adb_devices",
+    "adb_pull",
+    "adb_logcat",
+    "serial_ports",
+    "serial_read",
+    "serial_close",
+    "files_list",
+    "files_read",
+)
+
+DEFAULT_ALWAYS_PROMPT_TOOLS: Final[tuple[str, ...]] = (
+    "shell_run",
+    "adb_shell",
+    "adb_push",
+    "adb_install",
+    "files_write",
+    "serial_open",
+    "serial_write",
+)
+
+
+class ConfirmationPolicyConfig(BaseModel):
+    """Operator-editable confirmation policy (contract §7).
+
+    Tool names here are §7's underscore ``family_verb`` form (``files_read``,
+    ``jobs_*``) — the same spelling the contract and the settings UI use.
+    :func:`workstation_agent.confirm.underscore_to_dotted` converts to the
+    gate's dotted form at the point of use; a name that does not convert to
+    anything real simply matches nothing, which fails toward prompting (the
+    safe direction), never away from it.
+
+    ``never_prompt`` and ``always_prompt`` are meant to be mutually exclusive
+    per tool — the settings UI moves a tool from one to the other rather than
+    adding it to both — but if a tool is ever listed in both,
+    :meth:`workstation_agent.confirm.PromptPolicy.classify` resolves it to
+    ``"always"``: the safe failure direction is more confirmation, not less.
+
+    ``remember_for_session`` is a third, independent list: tools for which an
+    explicit Allow is remembered for the rest of the calling session, so a
+    burst of calls (contract §7: "a burst of serial writes asks once") only
+    prompts the first time. Off by default for every tool — the operator
+    opts a tool in explicitly. It is never persisted as *state* (only this
+    *setting* is); the actual remembered approvals live only in
+    :class:`workstation_agent.confirm.PromptPolicy`'s in-memory session map,
+    keyed by ``(session_id, tool)``, which is why they can never leak across
+    sessions and never survive an Agent restart (§5.5: sessions die with the
+    Agent).
+    """
+
+    never_prompt: list[str] = Field(default_factory=lambda: list(DEFAULT_NEVER_PROMPT_TOOLS))
+    always_prompt: list[str] = Field(default_factory=lambda: list(DEFAULT_ALWAYS_PROMPT_TOOLS))
+    remember_for_session: list[str] = Field(default_factory=list)
+
+
 class NetworkMcpConfig(BaseModel):
     """The LAN-facing MCP endpoint PersonaCore connects to (contract §1-§3).
 
@@ -193,6 +260,7 @@ class AgentConfig(BaseModel):
     ui: UIConfig = Field(default_factory=UIConfig)
     plugins: PluginsConfig = Field(default_factory=PluginsConfig)
     network_mcp: NetworkMcpConfig = Field(default_factory=NetworkMcpConfig)
+    confirmation: ConfirmationPolicyConfig = Field(default_factory=ConfirmationPolicyConfig)
 
     @field_validator("session", mode="before")
     @classmethod

@@ -72,6 +72,9 @@ class FakeMCPHost:
     def __init__(self, plugins_list: list[FakePluginInfo] | None = None) -> None:
         self._plugins = plugins_list or []
         self.reloaded: list[str] = []
+        #: Every config pushed via set_config(), most recent last -- lets a
+        #: test assert a UI save reached the running host without a restart.
+        self.configs_set: list[Any] = []
 
     async def plugins(self) -> list[FakePluginInfo]:
         return self._plugins
@@ -84,6 +87,10 @@ class FakeMCPHost:
 
     async def reload(self, plugin_id: str) -> None:
         self.reloaded.append(plugin_id)
+
+    def set_config(self, config: Any) -> None:
+        """Mirror ``MCPHost.set_config`` (B3, §7 policy live-push)."""
+        self.configs_set.append(config)
 
 
 # ---------------------------------------------------------------------------
