@@ -1,0 +1,48 @@
+id = "serial"
+name = "Serial"
+version = "0.1.0"
+runtime = "python"
+entry = ["-m", "workstation_agent.plugins.serial"]
+declared_permissions = [
+  "tool:serial.ports",
+  "tool:serial.open",
+  "tool:serial.write",
+  "tool:serial.read",
+  "tool:serial.close",
+  # What each argument IS.  args:<tool>:<mode>[:[!]<name>=<class>,...]
+  # mode is read|action; class is ws_path|ws_command|web_target|foreign|opaque;
+  # "!" marks the argument required.  A tool with no entry here is refused,
+  # and so is a call carrying an argument no entry names.
+  #
+  # None of this family's arguments are a workstation path, command or URL —
+  # a COM port name and a session id are opaque identifiers this plugin
+  # itself mints or compares, and a serial payload (text/hex to write, the
+  # `until` marker to read for) lives in the device's own namespace, not the
+  # workstation's.  Declaring any of `text`, `hex`, `until` as `ws_path`
+  # would compare a device payload against Windows filesystem roots it was
+  # never meant to resemble, and every legitimate write/read would then be
+  # denied outright (contract PLAN-BUILD.md, "a serial payload is NOT a
+  # workstation path") — `foreign` is the class that says so.
+  "args:serial.ports:read",
+  "args:serial.open:action:!port=opaque,!baud=opaque,bytesize=opaque,parity=opaque,stopbits=opaque,timeout_s=opaque",
+  "args:serial.write:action:!session_id=opaque,text=foreign,hex=foreign",
+  "args:serial.read:read:!session_id=opaque,until=foreign,max_bytes=opaque,timeout_s=opaque",
+  "args:serial.close:action:!session_id=opaque",
+]
+# No path:/cmd:/domain: entries: this family never touches a workstation
+# path, runs no workstation command, and dials no URL, so none of the three
+# hard-guard/confirmable conditions this gate knows about
+# (outside_declared_paths / command_outside_allowlist / domain_outside_allowlist)
+# apply here — leaving this empty is the correct declaration, not an
+# oversight.  Contract §7's own always-prompt list (serial_open, serial_write)
+# and pre-approved list (serial_ports, serial_read, serial_close) is "an
+# Agent setting" (contract §7) layered by B3 on top of this gate by tool
+# name, not something this manifest can express — B3 had not landed in this
+# worktree at the time this was built (verified: no such mapping exists yet
+# in confirm.py or config/schema.py). It needs no change here to pick up
+# serial_open/serial_write once it lands, because it keys on the served
+# wire names, not on anything declared in this file.
+confirmable_conditions = []
+
+[compat]
+min_host_version = "0.1.0"

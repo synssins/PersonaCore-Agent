@@ -38,7 +38,25 @@ dependencies = [
     "webrtcvad-wheels>=2.0,<3.0",
     "psutil>=5.0,<6.0",
     "mcp>=2.1.1,<2.2",
+    "pyserial>=3.5,<4.0",
 ]
+# Note on `pyserial` (import name `serial`), added by subtask B8 for the
+# `serial` family (contract §5.5, §6): `serial.Serial` backs
+# serial_open/write/read/close's actual device I/O, and `serial.tools.list_ports`
+# backs serial_ports. B8 owns adding this dependency; B7's `devices_list` also
+# uses `serial.tools.list_ports` and was told to rely on B8 having added it
+# rather than adding it a second time.
+#
+#   * Licence: BSD-3-Clause (Chris Liechti and contributors, pyserial project).
+#     Permissive, compatible with this project's MIT licence, and needs no
+#     attribution beyond this record — this comment IS the repo's dependency
+#     record for it, in the same place and the same way the `mcp` note above
+#     records its own reasoning.
+#   * No alternative was seriously considered: pyserial is the de facto
+#     standard cross-platform serial library for Python and is what the
+#     contract itself names ("`pyserial` (BSD-3); §5.5 sessions").
+#   * `>=3.5,<4.0` pins the current stable major line (3.5, 2020-03) with room
+#     for patch releases; there is no 4.x to plan around yet.
 # Note on `mcp`, amended by subtask B4 (full reasoning in
 # src/workstation_agent/network_mcp/DECISION.md):
 #
