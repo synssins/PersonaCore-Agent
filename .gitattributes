@@ -1,0 +1,26 @@
+# Plugin signatures are raw Ed25519 bytes, not text.  Git's own guess ("is
+# this binary?") is a heuristic over the printable-byte ratio, and a signature
+# that happened to guess "text" would have its 0x0A bytes rewritten to 0x0D0A
+# on checkout under core.autocrlf=true — silently producing a 66-byte file that
+# can never verify.  Say it explicitly instead of relying on the guess.
+src/workstation_agent/plugins/**/signature.sig binary
+
+# Deliberately NOT pinning the plugins' *.py or *.toml here.  Both are safe, but
+# for different reasons, and the plugin.toml one is easy to misread:
+#
+#   *.py    — hashed after CRLF and lone CR are normalised to LF (see
+#             workstation_agent.mcp_host.loader), so the bytes on disk verify
+#             identically under core.autocrlf true, false and input.
+#
+#   *.toml  — never hashed as bytes at all.  The signature covers
+#             canonical_json(_manifest_dict(manifest)), i.e. the *parsed* fields;
+#             _parse_toml reads the file with Path.read_text, whose universal
+#             newline handling has already collapsed CRLF to LF before tomlkit
+#             ever sees it.  A manifest's line endings cannot reach the digest.
+#
+# Pinning either would buy nothing while rewriting the working tree of every
+# existing checkout on the next `git checkout`.
+#
+# If a non-Python file is ever added to a plugin's *signed* set — an extension
+# module, a sourceless .pyc, a data file — it is hashed byte-for-byte and MUST
+# be pinned here.

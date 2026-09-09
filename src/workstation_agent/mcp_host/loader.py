@@ -12,15 +12,62 @@ Discovery sources (in precedence order — bundled first, then user-installed):
 Each source yields :class:`PluginManifest` instances.  Duplicates (same
 ``plugin_id``) are resolved by keeping the first occurrence (bundled wins).
 
-Signature verification computes::
+Signature verification computes (see :func:`signing_message`)::
 
-    message = canonical_json(manifest_dict) + b"\\n" + sha256(entry_bytes[0]) + ...
+    canonical_json(manifest) || b"\\n" || SCHEME || b"\\n"
+        || sha256(label_i) || digest(file_i)   for each covered file, in order
 
 and tries each supplied public key against the ``signature.sig`` file next to
 ``plugin.toml``.  If ``allow_unsigned`` is ``True`` a missing / zero-byte sig
 file returns ``VerifyResult(status='unsigned')`` instead of ``'quarantined'``.
+
+Four properties of that message matter enough to spell out:
+
+**Line endings are normalised out of the hash for Python source.**
+``digest()`` translates ``CRLF`` and lone ``CR`` to ``LF`` before hashing a
+``*.py`` file (:func:`_file_digest`).  Without this, signature validity is a
+property of the *checkout*, not of the plugin: git's ``core.autocrlf`` decides
+what lands on disk, so a plugin signed in an ``autocrlf=false`` clone is
+``invalid`` in an ``autocrlf=true`` one and vice versa — and since
+``allow_unsigned`` defaults to false, the wrong clone ships with no working
+plugins and an error message that never mentions line endings.
+
+The normalisation is deliberately scoped to ``*.py``.  It makes the hash
+non-injective — a CRLF file and its LF twin share one signature — so it is only
+sound where the two byte sequences are *the same program*.  For Python source
+they are: CPython's tokenizer performs exactly this translation before
+compiling, so every member of a collision class produces an identical code
+object.  Any other file type is hashed byte-for-byte, because for, say, a
+``.ps1`` here-string or a data file the two forms are *not* equivalent and
+collapsing them would be a real weakening of the signature.
+
+The boundary of that guarantee, stated exactly: it covers the *compiled code
+object*.  Code that reads its own raw source at runtime — ``inspect.getsource``,
+``traceback`` rendering a source line, ``doctest``, ``Path(__file__).read_bytes()``
+— sees the un-normalised bytes, so two members of a collision class can differ
+there.  Nothing in the signature stops that, and a plugin that derives security
+decisions from its own source text is outside what this scheme promises.
+
+**Every importable file in a package plugin is covered.**
+:func:`_resolve_module_files` walks the whole package tree, not just
+``__init__.py`` / ``__main__.py``, and "importable" means every format CPython's
+import machinery loads — source, sourceless bytecode, and extension modules
+(``.pyd`` / ``.so`` / ``.dylib``), not merely ``*.py``.  Covering only the two
+dunder sources left every other submodule outside the signature; covering only
+``*.py`` left a native ``submodule.pyd`` outside it, which is the same hole one
+file extension over.  Because the covered set is "all of them", adding,
+renaming, moving, or editing any of them changes the message and the plugin
+fails loudly as ``invalid``; there is no quiet path where a file is ignored.
+
+**Each digest is bound to the file's name.**  The message pairs
+``sha256(label)`` with each content digest.  Without that binding the message
+was a bare concatenation of digests, so any rename or directory move that
+preserved the sort order left the signed bytes byte-identical — and since the
+sort key is the relative path, renaming ``a.py``/``b.py`` to
+``a_evil.py``/``b_evil.py`` preserves it.  Deciding which module a given body of
+code is imported as is a capability worth signing.
 """
-# ruff: noqa: C901, PLR0912
+# ruff: noqa: C901
 
 from __future__ import annotations
 
@@ -75,6 +122,40 @@ class VerifyResult:
 
 
 _SENTINEL_UNSIGNED = b"UNSIGNED"
+
+# Files CPython's import machinery will load from inside a package.  Fixed and
+# platform-independent on purpose: ``importlib.machinery.EXTENSION_SUFFIXES`` is
+# whatever the *running* interpreter accepts, so keying off it would make the
+# covered set depend on the signing host — a ``.so`` covered on Linux and
+# invisible on Windows.  Matching is on the final suffix, lowercased, which is
+# what ``Path.suffix`` yields for the decorated forms too
+# (``m.cp312-win_amd64.pyd`` → ``.pyd``, ``m.abi3.so`` → ``.so``).
+# ``test_importable_suffixes_cover_this_interpreter`` fails if CPython grows a
+# suffix this set does not contain.
+_IMPORTABLE_SUFFIXES = frozenset(
+    {".py", ".pyw", ".pyc", ".pyo", ".pyd", ".so", ".dll", ".dylib"},
+)
+
+# The subset of the above that CPython compiles from text.  ``.pyw`` is in
+# ``importlib.machinery.SOURCE_SUFFIXES`` on Windows and is imported exactly
+# like ``.py``, so it gets the same newline normalisation; treating it as opaque
+# bytes would make a ``.pyw`` submodule checkout-dependent all over again.
+_SOURCE_SUFFIXES = frozenset({".py", ".pyw"})
+
+# ``__pycache__`` is excluded from the covered set.  It is a derived cache that
+# CPython rewrites on first import with the source's mtime and size baked in, so
+# hashing it would invalidate every signature the moment the plugin ran once.
+# The dangerous form of bytecode — a sourceless ``pkg/mod.pyc``, which the import
+# machinery loads directly — does NOT live in ``__pycache__`` and IS covered.
+# What remains uncovered is cache poisoning of an already-covered source file,
+# which no file-set policy can catch; the mitigation for that is to launch
+# plugins with bytecode writing disabled and hash-based .pyc checking forced,
+# which belongs to the supervisor, not to the signature.
+_BYTECODE_CACHE_DIR = "__pycache__"
+
+# Domain separator for the signed message.  Bumping it makes a signature from an
+# older scheme fail cleanly rather than being reinterpreted under the new rules.
+_SIGNING_SCHEME = b"workstation-agent/plugin-signature/2"
 
 
 def _parse_toml(path: Path, source: str = "unknown") -> PluginManifest | None:
@@ -232,74 +313,218 @@ def _manifest_dict(manifest: PluginManifest) -> dict[str, Any]:
     }
 
 
-def _resolve_module_paths(module_name: str) -> list[Path]:
-    """Return the .py files backing *module_name* (single file or package)."""
+def normalise_newlines(data: bytes) -> bytes:
+    """Translate ``CRLF`` and lone ``CR`` to ``LF``.
+
+    This is byte-for-byte what CPython's tokenizer does to a source file before
+    compiling it, which is why applying it inside the signature hash is safe for
+    Python source: the byte sequences it collapses together compile to the same
+    code object.
+    """
+    return data.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+
+
+def _is_python_source(path: Path) -> bool:
+    """Whether *path* is Python source, matched case-insensitively.
+
+    Case folding is not cosmetic.  ``rglob`` matches ``EVIL.PY`` on a
+    case-insensitive filesystem and not on a case-sensitive one, so a
+    case-sensitive ``== ".py"`` test gave one file three different treatments
+    depending on the host: normalised on Linux, hashed raw on Windows, invisible
+    to discovery elsewhere.  The covered set and the way each file is hashed
+    must both be properties of the plugin, not of the filesystem it sits on.
+    """
+    return path.suffix.lower() in _SOURCE_SUFFIXES
+
+
+def _file_digest(path: Path) -> bytes:
+    """SHA-256 of *path*, newline-normalised for Python source only.
+
+    Python source is hashed after :func:`normalise_newlines` so the signature
+    survives any ``core.autocrlf`` setting, any platform, and any archive that
+    rewrites text.  Everything else — extension modules, bytecode, data — is
+    hashed raw: for those the CRLF and LF forms are genuinely different content
+    and must not share a signature.
+    """
+    data = path.read_bytes()
+    if _is_python_source(path):
+        data = normalise_newlines(data)
+    return hashlib.sha256(data).digest()
+
+
+def _sorted_importable_files(root: Path) -> list[Path]:
+    """Every file under *root* that CPython can import, in an OS-independent order.
+
+    "Importable" is not "``*.py``".  Python's import machinery loads extension
+    modules (``.pyd`` on Windows, ``.so``/``.dylib`` on POSIX) and sourceless
+    bytecode (``.pyc``) natively, so a set restricted to source leaves a
+    ``submodule.pyd`` dropped beside the covered files hashed by nothing at all
+    — arbitrary native code executing under a ``valid`` signature.
+
+    The sort key is the ``/``-joined path relative to *root*.  Sorting
+    :class:`~pathlib.Path` objects directly would not do: on Windows their
+    comparison is case-insensitive and on POSIX it is not, so a package with
+    files differing only in case would hash in a different order on each OS and
+    the signature would again depend on where it was made.
+    """
+    files = [
+        p
+        for p in root.rglob("*")
+        if p.suffix.lower() in _IMPORTABLE_SUFFIXES
+        and _BYTECODE_CACHE_DIR not in p.relative_to(root).parts
+        and p.is_file()
+    ]
+    return sorted(files, key=lambda p: p.relative_to(root).as_posix())
+
+
+def _resolve_module_files(module_name: str) -> list[tuple[str, Path]]:
+    """Return ``(label, path)`` for every importable file backing *module_name*.
+
+    For a package this is the **whole tree**, recursively.  Covering only
+    ``__init__.py`` and ``__main__.py`` (as this once did) left every other
+    submodule unsigned while :func:`verify` still answered ``valid``.
+
+    The label is the module-relative name of the file, e.g.
+    ``workstation_agent.plugins.browser/deep/tool.py``.  It is deliberately not
+    the absolute path, which varies per install, and deliberately not omitted,
+    which is what let a file be renamed inside a signed package for free.
+    """
     try:
         spec = importlib.util.find_spec(module_name)
     except (ImportError, ValueError):
         return []
     if spec is None:
         return []
-    paths: list[Path] = []
-    if spec.origin and spec.origin != "built-in":
-        paths.append(Path(spec.origin))
+
     if spec.submodule_search_locations:  # it's a package
+        out: list[tuple[str, Path]] = []
         for loc in spec.submodule_search_locations:
-            pkg_dir = Path(loc)
-            for name in ("__init__.py", "__main__.py"):
-                p = pkg_dir / name
-                if p.exists() and p not in paths:
-                    paths.append(p)
-    return paths
+            root = Path(loc)
+            out.extend(
+                (f"{module_name}/{p.relative_to(root).as_posix()}", p)
+                for p in _sorted_importable_files(root)
+            )
+        return out
+
+    if spec.origin and spec.origin != "built-in":
+        origin = Path(spec.origin)
+        if origin.is_file():
+            return [(f"{module_name}{origin.suffix}", origin)]
+    return []
 
 
-def _entry_file_paths(entry: list[str], plugin_dir: Path) -> list[Path]:
-    """Resolve entry command to the set of code files whose hash is signed.
+def _resolve_module_paths(module_name: str) -> list[Path]:
+    """Paths only, for callers that do not need the signing labels."""
+    return [p for _label, p in _resolve_module_files(module_name)]
+
+
+def _plugin_dir_files(plugin_dir: Path) -> list[tuple[str, Path]]:
+    """Labelled fallback set: every importable file under *plugin_dir*."""
+    return [
+        (p.relative_to(plugin_dir).as_posix(), p) for p in _sorted_importable_files(plugin_dir)
+    ]
+
+
+def _covered_files(entry: list[str], plugin_dir: Path) -> list[tuple[str, Path]]:
+    """Resolve entry command to the ``(label, path)`` pairs the signature covers.
+
+    The *label* is the name the file is signed under.  It is what stops a file
+    inside a signed package from being renamed or moved for free: the message
+    used to be a bare concatenation of content digests, so any rename that
+    preserved the sort order — and the sort key *is* the relative path — left
+    the signed bytes identical.  Changing which module a given body of code is
+    imported as is a real capability, so each digest is now bound to its name.
+
+    Labels are location-independent: module-relative for a ``-m`` entry,
+    plugin-dir-relative for the fallback scan, and the literal manifest argument
+    for a positional file.  An absolute install path would differ per machine
+    and reintroduce exactly the class of fragility this module exists to avoid.
 
     For ``-m <module>`` entries, uses :func:`importlib.util.find_spec` to
-    resolve the module.  For plain module files, hashes the single file.
-    For packages, hashes ``__init__.py`` and ``__main__.py`` (both if present).
-    Also collects any positional argument that resolves to an existing file
-    on disk (either absolute or relative to *plugin_dir*).
+    resolve the module.  For a package this covers every importable file in the
+    tree; for a plain module file, that one file.  Also collects any positional
+    argument that resolves to an existing file on disk (either absolute or
+    relative to *plugin_dir*).
 
     When a ``-m <module>`` entry cannot be resolved via ``sys.path`` (typical
     for external user-installed plugins under ``%APPDATA%\\WorkstationAgent
-    \\plugins\\``), falls back to hashing every ``*.py`` file under
-    *plugin_dir* (recursively, deterministic order) so the signature always
-    covers the plugin's code.  Likewise, if the entry produces zero paths
-    (e.g. entry is just ``["python"]``), falls back to hashing every ``*.py``
-    under *plugin_dir* so the signature is never trivially empty.
+    \\plugins\\``), falls back to every importable file under *plugin_dir*
+    (recursively, deterministic order) so the signature always covers the
+    plugin's code.  Likewise, if the entry produces zero paths (e.g. entry is
+    just ``["python"]``), falls back to the same scan so the signature is never
+    trivially empty.
     """
-    paths: list[Path] = []
+    covered: list[tuple[str, Path]] = []
+    seen: set[Path] = set()
+
+    def _add(label: str, path: Path) -> None:
+        if path not in seen:
+            seen.add(path)
+            covered.append((label, path))
+
     it = iter(entry)
     for arg in it:
         if arg == "-m":
             module_name = next(it, None)
             if module_name is None:
                 break
-            resolved = _resolve_module_paths(module_name)
-            if resolved:
-                for p in resolved:
-                    if p not in paths:
-                        paths.append(p)
-            else:
+            resolved = _resolve_module_files(module_name)
+            if not resolved:
                 # External plugin whose module isn't on sys.path.
-                # Hash every .py file under plugin_dir (recursive, deterministic).
-                for py_path in sorted(plugin_dir.rglob("*.py")):
-                    if py_path not in paths:
-                        paths.append(py_path)
+                resolved = _plugin_dir_files(plugin_dir)
+            for label, path in resolved:
+                _add(label, path)
         else:
             candidate = Path(arg)
             if not candidate.is_absolute():
                 candidate = plugin_dir / arg
             if candidate.is_file():
-                paths.append(candidate)
-    # Fallback: if entry produced ZERO paths (e.g. entry is ["python"] with
-    # no -m and no positional file), hash every .py in plugin_dir so the
-    # signature is never trivially empty.
-    if not paths:
-        paths = sorted(plugin_dir.rglob("*.py"))
-    return paths
+                _add(arg, candidate)
+
+    if not covered:
+        for label, path in _plugin_dir_files(plugin_dir):
+            _add(label, path)
+    return covered
+
+
+def _entry_file_paths(entry: list[str], plugin_dir: Path) -> list[Path]:
+    """Paths only, for callers that do not need the signing labels."""
+    return [p for _label, p in _covered_files(entry, plugin_dir)]
+
+
+def signing_message(manifest: PluginManifest) -> bytes:
+    """Return the exact bytes a plugin signature is made over.
+
+    Single source of truth for :func:`verify`, ``scripts/sign_plugin.py`` and
+    the test fixtures, so the signer and the verifier cannot drift apart.
+
+    Layout::
+
+        canonical_json(manifest) || b"\\n" || SCHEME || b"\\n"
+            || sha256(label_0) || digest(file_0)
+            || sha256(label_1) || digest(file_1)
+            || ...
+
+    Each covered file contributes a fixed 64 bytes — 32 for its name, 32 for its
+    content — so the encoding is unambiguous without a separator: no arrangement
+    of labels can be reparsed as a different one, and ``a/b.py`` cannot collide
+    with ``a`` plus ``/b.py``.
+
+    Raises:
+        OSError: if a file the signature must cover cannot be read.  Callers in
+            :func:`verify` turn this into ``status='invalid'`` — a plugin whose
+            covered code is unreadable is not a plugin we will run.
+    """
+    parts = [
+        _sig.canonical_json(_manifest_dict(manifest)),
+        b"\n",
+        _SIGNING_SCHEME,
+        b"\n",
+    ]
+    for label, path in _covered_files(manifest.entry, manifest.plugin_dir):
+        parts.append(hashlib.sha256(label.encode("utf-8")).digest())
+        parts.append(_file_digest(path))
+    return b"".join(parts)
 
 
 def _verify_inner(
@@ -311,11 +536,11 @@ def _verify_inner(
     if len(raw_sig) != 64:  # noqa: PLR2004
         return VerifyResult(status="invalid", reason=f"bad signature length: {len(raw_sig)}")
 
-    manifest_bytes = _sig.canonical_json(_manifest_dict(manifest))
-    entry_paths = _entry_file_paths(manifest.entry, manifest.plugin_dir)
-    entry_hash_parts = [hashlib.sha256(p.read_bytes()).digest() for p in entry_paths]
-
-    message = manifest_bytes + b"\n" + b"".join(entry_hash_parts)
+    try:
+        message = signing_message(manifest)
+    except OSError as exc:
+        log.warning("plugin %s: cannot hash covered file: %s", manifest.id, exc)
+        return VerifyResult(status="invalid", reason=f"unreadable signed file: {exc}")
 
     for pubkey in pubkeys:
         if _sig.verify(pubkey, message, raw_sig):

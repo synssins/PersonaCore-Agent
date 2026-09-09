@@ -9,7 +9,6 @@ from pathlib import Path
 
 from nacl.signing import SigningKey
 
-import workstation_agent.security.signature as _sig
 from workstation_agent.mcp_host import loader
 
 _HELLO_WORLD_DIR = (
@@ -181,10 +180,7 @@ def test_verify_valid_signature(tmp_path):
     m = loader._parse_toml(toml_path)
     assert m is not None
 
-    manifest_dict = loader._manifest_dict(m)
-    msg = _sig.canonical_json(manifest_dict) + b"\n"
-    signed = signing_key.sign(msg)
-
+    signed = signing_key.sign(loader.signing_message(m))
     m.signature_file.write_bytes(signed.signature)
 
     result = loader.verify(m, [pubkey], allow_unsigned=False)
@@ -206,9 +202,7 @@ def test_verify_wrong_key(tmp_path):
     m = loader._parse_toml(toml_path)
     assert m is not None
 
-    manifest_dict = loader._manifest_dict(m)
-    msg = _sig.canonical_json(manifest_dict) + b"\n"
-    signed = signing_key1.sign(msg)
+    signed = signing_key1.sign(loader.signing_message(m))
     m.signature_file.write_bytes(signed.signature)
 
     result = loader.verify(m, [pubkey2])
@@ -260,14 +254,7 @@ def _sign_hello_world_bundle(pubkey_bytes: bytes, signing_key: SigningKey) -> No
     """Re-sign the bundled hello_world plugin with *signing_key* and register pubkey."""
     manifests = loader._discover_bundled()
     hw = next(m for m in manifests if m.id == "hello_world")
-    manifest_dict = loader._manifest_dict(hw)
-    manifest_bytes = _sig.canonical_json(manifest_dict)
-    entry_paths = loader._entry_file_paths(hw.entry, hw.plugin_dir)
-    entry_hash_parts = [
-        hashlib.sha256(p.read_bytes()).digest() for p in entry_paths
-    ]
-    message = manifest_bytes + b"\n" + b"".join(entry_hash_parts)
-    signed = signing_key.sign(message)
+    signed = signing_key.sign(loader.signing_message(hw))
     hw.signature_file.write_bytes(signed.signature)
     if pubkey_bytes not in loader.TRUSTED_PUBKEYS:
         loader.TRUSTED_PUBKEYS.append(pubkey_bytes)
@@ -332,12 +319,7 @@ def test_entry_file_paths_hashes_external_plugin_dir_when_module_not_on_syspath(
     pubkey = bytes(signing_key.verify_key)
     m = loader._parse_toml(plugin_dir / "plugin.toml")
     assert m is not None
-    manifest_dict = loader._manifest_dict(m)
-    manifest_bytes = _sig.canonical_json(manifest_dict)
-    entry_paths = loader._entry_file_paths(m.entry, m.plugin_dir)
-    entry_hash_parts = [hashlib.sha256(p.read_bytes()).digest() for p in entry_paths]
-    message = manifest_bytes + b"\n" + b"".join(entry_hash_parts)
-    signed = signing_key.sign(message)
+    signed = signing_key.sign(loader.signing_message(m))
     m.signature_file.write_bytes(signed.signature)
 
     # Unmodified: valid.

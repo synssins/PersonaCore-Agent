@@ -23,14 +23,12 @@ The fixture:
 from __future__ import annotations
 
 import contextlib
-import hashlib
 from pathlib import Path
 
 import pytest
 from nacl.signing import SigningKey
 
 import workstation_agent.mcp_host.loader as _loader
-import workstation_agent.security.signature as _sig
 
 _HELLO_WORLD_DIR = (
     Path(__file__).resolve().parents[2]
@@ -42,16 +40,41 @@ _HELLO_WORLD_DIR = (
 _SIG_FILE = _HELLO_WORLD_DIR / "signature.sig"
 
 
-def _build_message(manifest_dict: dict, plugin_dir: Path, entry: list[str]) -> bytes:
+def _hello_world_manifest() -> _loader.PluginManifest:
+    """The bundled hello_world manifest, or an equivalent built from scratch.
+
+    The fallback exists for the case where bundled discovery finds nothing (a
+    stripped install); it must describe the same plugin so the signature the
+    fixture writes is one the loader would accept.
+    """
+    discovered = next(
+        (m for m in _loader._discover_bundled() if m.id == "hello_world"), None,
+    )
+    if discovered is not None:
+        return discovered
+    return _loader.PluginManifest(
+        id="hello_world",
+        name="Hello World",
+        version="0.1.0",
+        runtime="python",
+        entry=["-m", "workstation_agent.plugins.hello_world"],
+        plugin_dir=_HELLO_WORLD_DIR,
+        signature_file=_SIG_FILE,
+        compat={"min_host_version": "0.1.0"},
+    )
+
+
+def _build_message(manifest: _loader.PluginManifest) -> bytes:
     """Reproduce the exact message that loader.verify() checks.
 
-    Delegates to :func:`loader._entry_file_paths` so any change to the loader's
-    hash-set is picked up automatically.
+    Delegates wholesale to :func:`loader.signing_message` rather than
+    reassembling the format here.  Reimplementing it is how this fixture went
+    stale the last two times the message changed — first when file hashing
+    gained newline normalisation, then when each digest gained its path binding
+    and the scheme tag.  There is one definition of the message and this is not
+    a second copy of it.
     """
-    manifest_bytes = _sig.canonical_json(manifest_dict)
-    entry_paths = _loader._entry_file_paths(entry, plugin_dir)
-    entry_hash_parts = [hashlib.sha256(p.read_bytes()).digest() for p in entry_paths]
-    return manifest_bytes + b"\n" + b"".join(entry_hash_parts)
+    return _loader.signing_message(manifest)
 
 
 @pytest.fixture(scope="session")
@@ -61,29 +84,10 @@ def signed_hello_world_keypair():
     Yields:
         Tuple of (public_key_bytes: bytes, signing_key: nacl.signing.SigningKey).
     """
-    manifest_list = _loader._discover_bundled()
-    hello_manifest = next((m for m in manifest_list if m.id == "hello_world"), None)
-
     signing_key = SigningKey.generate()
     pubkey_bytes = bytes(signing_key.verify_key)
 
-    if hello_manifest is not None:
-        manifest_dict = _loader._manifest_dict(hello_manifest)
-        message = _build_message(manifest_dict, hello_manifest.plugin_dir, hello_manifest.entry)
-    else:
-        manifest_dict = {
-            "id": "hello_world",
-            "name": "Hello World",
-            "version": "0.1.0",
-            "runtime": "python",
-            "entry": ["-m", "workstation_agent.plugins.hello_world"],
-            "declared_permissions": [],
-            "confirmable_conditions": [],
-            "compat": {"min_host_version": "0.1.0"},
-        }
-        message = _build_message(manifest_dict, _HELLO_WORLD_DIR, [])
-
-    signed = signing_key.sign(message)
+    signed = signing_key.sign(_build_message(_hello_world_manifest()))
     signature = signed.signature
 
     original_sig = _SIG_FILE.read_bytes() if _SIG_FILE.exists() else b"UNSIGNED"
