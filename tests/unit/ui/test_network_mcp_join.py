@@ -28,6 +28,7 @@ import datetime as dt
 import json
 import logging
 import pathlib
+import re
 
 import httpx
 import pytest
@@ -798,6 +799,105 @@ def test_an_unconfirmed_rows_plugin_name_is_not_invented(tmp_path):
 # ---------------------------------------------------------------------------
 # Remove
 # ---------------------------------------------------------------------------
+
+
+def test_an_enormous_display_name_cannot_make_the_table_useless(tmp_path):
+    """The cells are remote text too. ``overflow-wrap`` stops the page
+    stretching sideways; nothing stopped it stretching down."""
+    flood = "N" * 64000
+    enrol(tmp_path, display_name=flood)
+    client = make_client(tmp_path=tmp_path, network_mcp=FakeEndpoint(tmp_path))
+
+    text = client.get("/network-mcp").text
+
+    assert flood not in text
+    assert "(truncated)" in text, "a cut name must never look whole"
+    assert "N" * 40 in text, "and the readable part still gets through"
+
+
+def test_an_enormous_plugin_name_cannot_make_the_table_useless(tmp_path):
+    """``plugin`` is the core's own normalisation, so its length is the core's
+    choice and not ours."""
+    flood = "workstation-" + "P" * 64000
+    enrol(tmp_path, plugin=flood)
+    client = make_client(tmp_path=tmp_path, network_mcp=FakeEndpoint(tmp_path))
+
+    text = client.get("/network-mcp").text
+
+    assert flood not in text
+    assert "(truncated)" in text
+
+
+def test_a_name_the_core_could_really_send_is_never_cut(tmp_path):
+    """64 is the core's own ceiling on a plugin name, so nothing a working core
+    produces reaches the cap."""
+    longest = "workstation-" + "a" * 52
+    enrol(tmp_path, plugin=longest, display_name="a" * 52)
+    client = make_client(tmp_path=tmp_path, network_mcp=FakeEndpoint(tmp_path))
+
+    text = client.get("/network-mcp").text
+
+    assert longest in text
+    assert "(truncated)" not in text
+
+
+def test_truncation_does_not_merge_two_different_names_into_one(tmp_path):
+    """The removal decision is made off these cells, so a collision created by
+    the *display* would be the display picking the wrong core."""
+    shared = "S" * 64000
+    enrol(tmp_path, slug="one", display_name=shared + "-study", plugin="workstation-one")
+    enrol(tmp_path, slug="two", display_name=shared + "-workshop", plugin="workstation-two")
+    client = make_client(tmp_path=tmp_path, network_mcp=FakeEndpoint(tmp_path))
+
+    text = client.get("/network-mcp").text
+
+    # The tail is kept precisely so this common case needs no digest at all.
+    assert "-study" in text
+    assert "-workshop" in text
+
+
+def test_names_differing_only_in_the_elided_middle_are_still_told_apart(tmp_path):
+    """Head and tail identical, difference in the part that is cut away."""
+    head, tail = "H" * 100, "T" * 100
+    enrol(tmp_path, slug="one", display_name=head + "AAA" + tail, plugin="workstation-one")
+    enrol(tmp_path, slug="two", display_name=head + "BBB" + tail, plugin="workstation-two")
+    client = make_client(tmp_path=tmp_path, network_mcp=FakeEndpoint(tmp_path))
+
+    rows = client.get("/network-mcp").text
+    _, _, table = rows.partition('<section id="nm-enrolled">')
+    cells = re.findall(r"\[([0-9a-f]{6})\]", table)
+
+    assert len(cells) == 2, "both colliding cells are marked"
+    assert cells[0] != cells[1], "and the marks distinguish them"
+
+
+def test_two_rows_genuinely_sharing_a_name_are_not_given_a_false_distinction(
+    tmp_path,
+):
+    """Only truncation-created collisions get a mark. Inventing a distinction
+    between two rows that really do carry the same name would be a lie."""
+    enrol(tmp_path, slug="one", display_name="FRONT-DESK", plugin="workstation-one")
+    enrol(tmp_path, slug="two", display_name="FRONT-DESK", plugin="workstation-two")
+    client = make_client(tmp_path=tmp_path, network_mcp=FakeEndpoint(tmp_path))
+
+    text = client.get("/network-mcp").text
+
+    assert not re.search(r"\[[0-9a-f]{6}\]", text)
+
+
+def test_the_slug_the_remove_button_posts_is_never_truncated(tmp_path):
+    """It is not rendered as text -- it is the value the row is matched on.
+    Cutting it would post something naming no row, and the guard would refuse
+    a removal the owner correctly asked for."""
+    enrol(tmp_path, display_name="N" * 64000)
+    endpoint = FakeEndpoint(tmp_path)
+    client = make_client(tmp_path=tmp_path, network_mcp=endpoint)
+
+    assert 'value="front-desk"' in client.get("/network-mcp").text
+
+    response = client.post("/network-mcp/enrolled/remove", data={"slug": "front-desk"})
+    assert join_module.list_enrolled_cores(state_dir=tmp_path) == ()
+    assert "(truncated)" in response.text, "the name is capped in the message too"
 
 
 def test_the_page_warns_that_removal_locks_out_everything_before_it_happens(tmp_path):

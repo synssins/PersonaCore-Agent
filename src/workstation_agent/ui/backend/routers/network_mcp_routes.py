@@ -79,6 +79,7 @@ import contextlib
 import hashlib
 import inspect
 import logging
+from collections import Counter
 from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, Final
@@ -146,6 +147,67 @@ def _bounded(message: str | None) -> str | None:
     if message is None or len(message) <= _MAX_MESSAGE_CHARS:
         return message
     return message[:_MAX_MESSAGE_CHARS].rstrip() + " … (message truncated)"
+
+
+#: Ceiling on a **table cell**, which wants a far shorter one than a paragraph.
+#:
+#: 400 characters in a cell is already an unreadable row, and this table is what
+#: the owner reads to decide which core to remove. 64 is not an arbitrary
+#: smaller number: it is the core's own ceiling on a plugin name, the figure
+#: ``join._MAX_SLUG_CHARS`` is derived from (``64 - len("workstation-")``). So
+#: no name any working core can produce is ever cut, and anything that is cut
+#: came from a core that is broken, misconfigured or hostile.
+_MAX_CELL_CHARS: Final = 64
+
+#: How much of an over-long cell is kept from the **end** rather than the start.
+#:
+#: Elision in the middle, not at the tail, because two names are most often
+#: distinguished by their endings ("...-study" against "...-workshop") and a
+#: head-only cut throws exactly that away. See :func:`_disambiguated` for the
+#: case this does not solve.
+_CELL_TAIL_CHARS: Final = 16
+
+
+def _bounded_cell(value: str) -> str:
+    """Cap one table cell at :data:`_MAX_CELL_CHARS`, visibly and from the middle.
+
+    The marker is not decoration. The owner may be choosing between two similar
+    names, and a cut name that looks whole is a wrong click; a cut name that
+    says it is cut is a question they know to ask.
+    """
+    if len(value) <= _MAX_CELL_CHARS:
+        return value
+    head = value[: _MAX_CELL_CHARS - _CELL_TAIL_CHARS]
+    return f"{head}… (truncated) …{value[-_CELL_TAIL_CHARS:]}"
+
+
+def _disambiguated(originals: Sequence[str], shown: Sequence[str]) -> list[str]:
+    """Stop truncation turning two different cells into the same cell.
+
+    Two names differing only inside the elided middle cut to identical text, and
+    the removal decision is made off these cells — so a collision created *by
+    the display* would be the display causing the wrong core to be picked. That
+    is a different class of fault from a name merely being long.
+
+    Only cells that were actually truncated get a mark; two rows that genuinely
+    carry the same name are the same name, and saying otherwise would invent a
+    distinction. The mark is six hex of the full value's digest: it is not
+    meaningful to read, and it is not meant to be — it is there to say "these
+    two are not the same" for a pair of cells that would otherwise claim they
+    were. Two distinct values colliding in both the truncation *and* those six
+    hex digits is possible and is not defended against; at that point the row is
+    identified by its address column and its position, and the honest ceiling on
+    this is that a core sending 64 KiB names is broken and the page says so.
+    """
+    counts = Counter(shown)
+    out: list[str] = []
+    for original, text in zip(originals, shown, strict=True):
+        if counts[text] > 1 and original != text:
+            digest = hashlib.sha256(original.encode("utf-8", "replace")).hexdigest()[:6]
+            out.append(f"{text} [{digest}]")
+        else:
+            out.append(text)
+    return out
 
 #: Sentinel value for the "type an address the list did not offer" option.
 _OTHER = "__other__"
@@ -445,6 +507,45 @@ def _enrolled_cores(server: Any) -> tuple[Any, ...]:  # noqa: ANN401 — see _re
         return ()
 
 
+def _display_rows(cores: Sequence[Any]) -> tuple[dict[str, Any], ...]:
+    """The enrolled rows as the template renders them: every cell capped.
+
+    **The cap lives here, where the rows are built, and not in the template**,
+    for the reason :func:`_bounded` lives in :func:`_render`: a cell added later
+    goes through this function or it does not appear, whereas a cap applied per
+    ``<td>`` is a cap the next ``<td>`` forgets.
+
+    What is in these cells is not ours. ``plugin`` is the core's own
+    normalisation of a name and ``display_name`` is what the core sent back, so
+    a core that is broken or hostile chooses their length; ``core_address`` is
+    what a form said. ``overflow-wrap`` stops any of them stretching the page
+    sideways, but the text is still in the document, and 64 KiB in a cell
+    stretches the page *down* until the table is no use — and this table is what
+    the owner reads to decide which core to remove, so making it unreadable has
+    a consequence rather than being untidy.
+
+    **``slug`` is deliberately not capped.** It is not rendered as text; it is
+    the hidden field :func:`enrolled_remove` matches a row on. Truncating it
+    would post a value matching no row, and the removal would be refused by the
+    very guard that exists to catch input that names nothing.
+    """
+    names = [str(getattr(c, "display_name", "") or "") for c in cores]
+    plugins = [str(getattr(c, "plugin", "") or "") for c in cores]
+    shown_names = _disambiguated(names, [_bounded_cell(n) for n in names])
+    shown_plugins = _disambiguated(plugins, [_bounded_cell(p) for p in plugins])
+    return tuple(
+        {
+            "slug": getattr(core, "slug", ""),
+            "display_name": shown_names[index],
+            "plugin": shown_plugins[index],
+            "core_address": _bounded_cell(str(getattr(core, "core_address", "") or "")),
+            "joined_at": getattr(core, "joined_at", None),
+            "confirmed": bool(getattr(core, "confirmed", True)),
+        }
+        for index, core in enumerate(cores)
+    )
+
+
 def _listen_choices(info: Any) -> list[dict[str, str]]:  # noqa: ANN401 — see _read_info
     """The addresses the owner may tell PersonaCore to reach this machine at.
 
@@ -704,7 +805,7 @@ def _render(  # noqa: PLR0913 — one parameter per independent page outcome
             ),
             # enrolled cores. Both messages quote display names the core
             # normalised, so they are remote text too and capped alike.
-            "enrolled": _enrolled_cores(ctx.network_mcp),
+            "enrolled": _display_rows(_enrolled_cores(ctx.network_mcp)),
             "remove_error": _bounded(remove_error),
             "remove_notice": _bounded(remove_notice),
         },
@@ -1415,9 +1516,13 @@ async def enrolled_remove(
             ),
         )
 
-    named = str(getattr(target, "display_name", "") or wanted)
+    # Cell-capped, not message-capped: these are names, and they are quoted into
+    # a sentence that also has to stay readable. One 64 KiB name would otherwise
+    # spend the whole message budget and push the part that matters -- what was
+    # locked out -- past the cut.
+    named = _bounded_cell(str(getattr(target, "display_name", "") or wanted))
     others = [
-        str(getattr(core, "display_name", "") or getattr(core, "slug", ""))
+        _bounded_cell(str(getattr(core, "display_name", "") or getattr(core, "slug", "")))
         for core in before
         if getattr(core, "slug", "") != wanted
     ]
