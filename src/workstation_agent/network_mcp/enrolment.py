@@ -15,9 +15,14 @@ Then:
    supplied:** the core pushes the token to us.
 4. The core persists only after that push succeeds.
 
-**This module is step 3's receiver, and only that.** Step 1's outbound call is
-not built here: its request shape is not frozen, and building it against a guess
-would mean building it twice.
+**This module is step 3's receiver, and only that.** Step 1's outbound call
+lives in :mod:`~workstation_agent.network_mcp.join`, which was written once the
+core froze that request's shape — seven fields, no token, ``risk`` only ever
+``"safe"`` — rather than against a guess that would have had to be written
+twice. The two halves meet at :meth:`EnrolmentReceiver.open_join`:
+:func:`~workstation_agent.network_mcp.join.join_core` opens the window here
+*before* it dials, because the core's push arrives while its own POST is still
+open, and closes it again on every failure of that call.
 
 What the core does with our answer, read from its source
 --------------------------------------------------------
@@ -191,6 +196,22 @@ _TOKEN_MIN_ORD: Final = 0x21
 _TOKEN_MAX_ORD: Final = 0x7E
 
 
+#: What the owner is told when there is no endpoint for the core to push to.
+#:
+#: One sentence, in one place, because there are two ways to arrive at this
+#: condition and they must not answer it differently: the UI can press Join on a
+#: server object that is not serving (:meth:`...server.NetworkMCPServer.begin_join`
+#: checks ``running``), and ``join.join_core`` can be called with no endpoint
+#: registered at all (nothing registers until :meth:`...server.NetworkMCPServer.start`
+#: has bound). Both mean exactly "there is nothing listening", and an owner who
+#: hit the same wall by two routes and got two different sentences would
+#: reasonably conclude they were two different problems.
+ENDPOINT_NOT_RUNNING: Final = (
+    "The endpoint is not running, so PersonaCore has nothing to push the token to. "
+    "Switch it on, wait for it to report that it is listening, then join."
+)
+
+
 class EnrolmentError(Exception):
     """A Join could not be opened.
 
@@ -216,6 +237,25 @@ class JoinStatus:
     """Pushes seen against this Join, malformed ones included. A number climbing
     without a success is the owner's signal that something on the LAN is
     guessing."""
+    join_id: int = 0
+    """Which window this is, counting from 1 within this receiver.
+
+    Not a secret and grants nothing: it is a counter. It exists so a caller can
+    ask about **the window it opened** rather than about whatever window happens
+    to be current.
+
+    ``join.join_core`` is the caller that needs it, for a question only this
+    process can answer. Its POST to the core can fail without an answer *after*
+    the core has already pushed the token -- and the push arrives here, not at
+    the core -- so "did that Join actually land?" is ambiguous from outside and
+    a fact from inside. Answering it with "is a window open?" would be wrong
+    twice: a window is also closed by a cancel and by expiry, and the *next*
+    Join's completion must never be read as this one's. See
+    :meth:`EnrolmentReceiver.completed`.
+
+    Defaulted so nothing that builds a :class:`JoinStatus` for a page or a test
+    has to care; ``0`` is the id no window ever has.
+    """
 
 
 @dataclass
@@ -237,6 +277,8 @@ class _PendingJoin:
     """Monotonic deadline. Monotonic, not wall clock: a window must not be
     extended or closed early by an NTP correction or a daylight-saving jump."""
     opened_at: dt.datetime
+    join_id: int
+    """This window's identity -- see :attr:`JoinStatus.join_id`."""
     attempts: int = 0
 
 
@@ -284,6 +326,13 @@ class EnrolmentReceiver:
         # note there for why single use needs it to be a property of this code
         # rather than of how asyncio happens to schedule.
         self._lock = asyncio.Lock()
+        # Windows are numbered from 1 so that ``0`` can mean "no window", and
+        # the id of the one that was *completed by an accepted push* outlives
+        # the window itself. Keeping the id rather than a bare "something
+        # completed" flag is what makes :meth:`completed` unable to answer for
+        # a Join other than the one it was asked about.
+        self._join_seq = 0
+        self._completed_join_id: int | None = None
 
     @property
     def path(self) -> str:
@@ -339,17 +388,24 @@ class EnrolmentReceiver:
             raise EnrolmentError(msg) from exc
 
         ttl = min(max(float(ttl_seconds), 1.0), MAX_JOIN_TTL)
+        self._join_seq += 1
         pending = _PendingJoin(
             # The digest, not the code. The plaintext does not outlive this call.
             code_digest=_digest(code_bytes),
             expires_at=self._clock() + ttl,
             opened_at=dt.datetime.now(dt.UTC),
+            join_id=self._join_seq,
         )
         self._pending = pending
         # No code, no length, no prefix. A log line is a file on a machine that
         # runs arbitrary commands.
         log.info("network MCP enrolment window opened for %.0f seconds", ttl)
-        return JoinStatus(expires_in=ttl, opened_at=pending.opened_at, attempts=0)
+        return JoinStatus(
+            expires_in=ttl,
+            opened_at=pending.opened_at,
+            attempts=0,
+            join_id=pending.join_id,
+        )
 
     def cancel_join(self) -> None:
         """Close any pending Join. Safe to call when there is none."""
@@ -366,6 +422,7 @@ class EnrolmentReceiver:
             expires_in=max(pending.expires_at - self._clock(), 0.0),
             opened_at=pending.opened_at,
             attempts=pending.attempts,
+            join_id=pending.join_id,
         )
 
     # -- the core's side -------------------------------------------------
@@ -443,10 +500,41 @@ class EnrolmentReceiver:
             # is exactly the kind of accident that stops being true the first
             # time someone makes the token store awaitable. Single use is a
             # property of this code, not of how the loop happens to schedule.
+            #
+            # Recorded *before* the window is cleared, because after that line
+            # there is nothing left to say which window this was. This is the
+            # only place ``_completed_join_id`` is written, and it is written
+            # only for a push that matched the code and whose token is now in
+            # force -- so :meth:`completed` speaks for an enrolment that really
+            # happened, never for one that was merely attempted.
+            self._completed_join_id = pending.join_id
             self._pending = None
 
         log.info("network MCP enrolment completed; the endpoint now requires the pushed token")
         return True
+
+    def completed(self, join_id: int) -> bool:
+        """True if the window *join_id* was closed by an **accepted push**.
+
+        The question ``join.join_core`` asks when its own outbound POST fails
+        without an answer. The core's order is push-then-persist, so a token
+        that reached this receiver means the core got at least as far as minting
+        one and handing it over -- and this Agent is, from its own side,
+        enrolled: the token is stored and in force. That is knowable here and
+        nowhere else, and it is the difference between telling the owner a Join
+        failed and telling them it worked.
+
+        Deliberately **not** "is a window open?". That would answer ``False`` for
+        the very case this exists for (a completed push clears the window) and
+        would answer about the wrong thing in two others: a window closed by
+        :meth:`cancel_join` or by expiry looks identical from outside, and a
+        *later* Join's window would be reported as this one's. Asking by id
+        answers about one window and no other.
+
+        Never resets. A caller asks once, immediately, about a Join it has just
+        opened; there is no state machine here to get out of step with.
+        """
+        return join_id > 0 and self._completed_join_id == join_id
 
     # -- internals -------------------------------------------------------
 
