@@ -1,4 +1,4 @@
-# PersonaCore-Agent installer builder (SPEC-10).
+﻿# PersonaCore-Agent installer builder (SPEC-10).
 #
 # Runs the full pipeline:
 #   1) PyInstaller  ->  dist\Agent\
@@ -36,7 +36,7 @@ Write-Host "==> [1/3] PyInstaller"
 # copy_metadata("webrtcvad"). We ship the module via `webrtcvad-wheels`
 # (drop-in binary distribution with a different distribution name), so the
 # metadata lookup fails with PackageNotFoundError. Delete the offending
-# hook file (and its .pyc) before PyInstaller runs — the module still
+# hook file (and its .pyc) before PyInstaller runs -- the module still
 # imports fine and workstation_agent.spec hiddenimports webrtcvad explicitly.
 try {
     $stdhooksDirRaw = & $Python -c "import os, _pyinstaller_hooks_contrib.stdhooks as m; print(os.path.dirname(m.__file__))" 2>&1
@@ -62,7 +62,7 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 # ---------------------------------------------------------------------------
-# 2) Go — Updater.exe
+# 2) Go -- Updater.exe
 # ---------------------------------------------------------------------------
 Write-Host "==> [2/3] go build Updater.exe"
 $Pubkey = $env:PC_AGENT_SIGNING_PUBKEY
@@ -87,7 +87,7 @@ try {
 Write-Host "==> [3/3] Inno Setup"
 $Iscc = Get-Command iscc -ErrorAction SilentlyContinue
 if (-not $Iscc) {
-    Write-Warning "iscc not on PATH — skipping installer packaging."
+    Write-Warning "iscc not on PATH -- skipping installer packaging."
     Write-Host "  Install Inno Setup 6+ and re-run to produce the .exe installer."
     exit 0
 }
