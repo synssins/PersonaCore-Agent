@@ -223,7 +223,7 @@ def test_the_enrolled_row_appears_after_a_successful_join(tmp_path, monkeypatch)
     )
     text = client.get("/network-mcp").text
 
-    assert "workstation-front-desk" in text
+    assert "FRONT-DESK" in text
     assert CORE in text
 
 
@@ -760,7 +760,7 @@ def test_an_empty_listing_says_so_rather_than_showing_an_empty_table(tmp_path):
     assert "not enrolled with any PersonaCore yet" in client.get("/network-mcp").text
 
 
-def test_an_enrolled_row_shows_the_core_the_name_and_the_plugin(tmp_path):
+def test_an_enrolled_row_shows_the_core_and_the_name(tmp_path):
     enrol(tmp_path)
     client = make_client(tmp_path=tmp_path, network_mcp=FakeEndpoint(tmp_path))
 
@@ -768,7 +768,22 @@ def test_an_enrolled_row_shows_the_core_the_name_and_the_plugin(tmp_path):
 
     assert CORE in text
     assert "FRONT-DESK" in text
-    assert "workstation-front-desk" in text
+
+
+def test_the_enrolled_table_has_no_plugin_column(tmp_path):
+    """PersonaCore now installs one plugin, named ``workstation``, for every
+    enrolled machine -- so a "Plugin on the core" column would read the same
+    on every confirmed row and distinguish nothing. It was removed rather
+    than kept as dead space in the table the owner uses to pick a core to
+    remove.
+    """
+    enrol(tmp_path)
+    client = make_client(tmp_path=tmp_path, network_mcp=FakeEndpoint(tmp_path))
+
+    text = client.get("/network-mcp").text
+
+    assert "Plugin on the core" not in text
+    assert "workstation-front-desk" not in text
 
 
 def test_an_unconfirmed_row_says_what_is_and_is_not_known(tmp_path):
@@ -783,16 +798,17 @@ def test_an_unconfirmed_row_says_what_is_and_is_not_known(tmp_path):
     assert "Plugins screen" in text
 
 
-def test_an_unconfirmed_rows_plugin_name_is_not_invented(tmp_path):
-    """``workstation-<slug>`` is the core's rule. Applying it here would be this
-    Agent asserting a name no core ever gave it."""
+def test_an_unconfirmed_row_is_still_visibly_distinct_without_a_plugin_cell(tmp_path):
+    """The plugin column is gone, so the unconfirmed marker has to live
+    elsewhere -- and it does, on the Name cell and the full-width notice
+    below the row. Nothing here should invent a plugin name the core never
+    gave."""
     enrol(tmp_path, plugin="", confirmed=False, display_name="FRONT-DESK")
     client = make_client(tmp_path=tmp_path, network_mcp=FakeEndpoint(tmp_path))
 
     text = client.get("/network-mcp").text
 
     assert "workstation-front-desk" not in text
-    assert "Not known" in text
     assert "the name this Agent sent" in text
 
 
@@ -815,24 +831,11 @@ def test_an_enormous_display_name_cannot_make_the_table_useless(tmp_path):
     assert "N" * 40 in text, "and the readable part still gets through"
 
 
-def test_an_enormous_plugin_name_cannot_make_the_table_useless(tmp_path):
-    """``plugin`` is the core's own normalisation, so its length is the core's
-    choice and not ours."""
-    flood = "workstation-" + "P" * 64000
-    enrol(tmp_path, plugin=flood)
-    client = make_client(tmp_path=tmp_path, network_mcp=FakeEndpoint(tmp_path))
-
-    text = client.get("/network-mcp").text
-
-    assert flood not in text
-    assert "(truncated)" in text
-
-
 def test_a_name_the_core_could_really_send_is_never_cut(tmp_path):
-    """64 is the core's own ceiling on a plugin name, so nothing a working core
-    produces reaches the cap."""
-    longest = "workstation-" + "a" * 52
-    enrol(tmp_path, plugin=longest, display_name="a" * 52)
+    """64 is the core's own ceiling on a machine's display name, so nothing a
+    working core produces reaches the cap."""
+    longest = "a" * 64
+    enrol(tmp_path, display_name=longest)
     client = make_client(tmp_path=tmp_path, network_mcp=FakeEndpoint(tmp_path))
 
     text = client.get("/network-mcp").text

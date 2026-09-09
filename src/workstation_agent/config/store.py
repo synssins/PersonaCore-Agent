@@ -240,16 +240,6 @@ class _SecretInfo:
     remedy: str
 
 
-#: The re-enrolment remedy for a per-machine workstation token: unlike the
-#: LLM API key, there is no field anywhere in this product for a person to
-#: type this value into. PersonaCore mints it and pushes it to this Agent
-#: over TLS during enrolment (contract: the operator never handles it by
-#: hand), so the only real fix is to get a fresh pairing code and re-join.
-_REENROL_REMEDY = (
-    "Get a fresh pairing code from PersonaCore's Plugins screen and press "
-    "Join on this machine to re-enrol."
-)
-
 #: Logical secret names this product defines, mapped to their role and
 #: remedy. Keep this proportionate: it is a lookup table and a fallback,
 #: not a subsystem. A secret added later that is not listed here still
@@ -272,19 +262,9 @@ _SECRET_ROLES: dict[str, _SecretInfo] = {
 }
 
 
-#: PersonaCore's enrolment derives one bearer-token secret per enrolled
-#: machine rather than a single fixed name: ``auth_secret_name()`` returns
-#: ``workstation_<slug>_token``, where ``<slug>`` is the machine name the
-#: operator chose (see PersonaCore's ``enrolment/workstation.py``). A static
-#: table can never enumerate those, so this pattern is matched instead of
-#: listed -- and it is worth getting right, since a DPAPI blob tied to the
-#: Windows account is exactly what breaks on a profile change, a machine
-#: move, or a restore from backup.
-_WORKSTATION_TOKEN_RE = re.compile(r"^workstation_(.+)_token$")
-
-#: Text whose origin we do not fully control -- a machine-name slug, or an
-#: entirely unrecognised secret name -- is capped to this length before it
-#: is ever folded into operator-facing text or the audit log.
+#: Text whose origin we do not fully control -- an entirely unrecognised
+#: secret name -- is capped to this length before it is ever folded into
+#: operator-facing text or the audit log.
 _DISPLAY_MAX_LEN = 40
 
 
@@ -298,46 +278,23 @@ def _sanitize_for_display(text: str, *, max_len: int = _DISPLAY_MAX_LEN) -> str:
     return re.sub(r"[^A-Za-z0-9_-]", "", text)[:max_len]
 
 
-def _humanize_slug(slug: str) -> str:
-    """Render an untrusted machine-name *slug* as plain title-case words.
-
-    Sanitises first (see :func:`_sanitize_for_display`), so the result can
-    never carry formatting or structure into an operator-facing message --
-    it only ever reads as one or two plain words. Returns ``""`` if nothing
-    safe is left to show.
-    """
-    safe = _sanitize_for_display(slug)
-    words = [w for w in re.split(r"[_-]+", safe) if w]
-    return " ".join(words).title()
-
-
 def _secret_role(name: str) -> _SecretInfo:
     """Return the human role and remedy for the secret *name*.
 
-    Checks the fixed role table first, then the per-machine
-    ``workstation_<slug>_token`` pattern, then falls back to naming the
+    Checks the fixed role table first, then falls back to naming the
     secret plainly (its logical name, not its value) when *name* is not one
     this product defines a role for yet.
 
-    Both fallback paths sanitise before they ever embed *name* (or a piece
-    of it) in operator-facing text: *name* comes from any caller, and a
-    fallback exists precisely for names nobody anticipated. When nothing
-    safe is left after sanitising, this returns a safe static phrase
-    instead of echoing the (possibly unsafe) input -- never the reverse,
-    since a sanitised path that is merely *skipped* on failure, falling
-    through to an unsanitised default, sanitises nothing at all.
+    The fallback path sanitises before it ever embeds *name* in
+    operator-facing text: *name* comes from any caller, and the fallback
+    exists precisely for names nobody anticipated. When nothing safe is
+    left after sanitising, this returns a safe static phrase instead of
+    echoing the (possibly unsafe) input -- never the reverse, since a
+    sanitised path that is merely *skipped* on failure, falling through to
+    an unsanitised default, sanitises nothing at all.
     """
     if name in _SECRET_ROLES:
         return _SECRET_ROLES[name]
-    match = _WORKSTATION_TOKEN_RE.match(name)
-    if match:
-        slug_words = _humanize_slug(match.group(1))
-        role = (
-            f"the connection credential for the workstation {slug_words}"
-            if slug_words
-            else "the connection credential for an enrolled workstation (name unavailable)"
-        )
-        return _SecretInfo(role=role, remedy=_REENROL_REMEDY)
     safe_name = _sanitize_for_display(name)
     role = f"the '{safe_name}' credential" if safe_name else "an unrecognised credential"
     # No verified remedy for a name this product does not define a role
