@@ -15,6 +15,9 @@ Modules:
         The persisted self-signed certificate and its pinned fingerprint.
     :mod:`~workstation_agent.network_mcp.credentials`
         The persisted bearer token.
+    :mod:`~workstation_agent.network_mcp.listeners`
+        One listening socket per operator-chosen address, and why the sockets
+        are opened here rather than by uvicorn.
     :mod:`~workstation_agent.network_mcp.hardening`
         The security boundary: path, method, auth, bounds, caps, and systematic
         hostile-input rejection.
@@ -25,6 +28,7 @@ Modules:
 from workstation_agent.network_mcp.certs import CertificateInfo, ensure_certificate
 from workstation_agent.network_mcp.credentials import DEFAULT_STATE_DIR, ensure_token
 from workstation_agent.network_mcp.hardening import Hardening, validate_json_body
+from workstation_agent.network_mcp.listeners import BindFailure, BoundAddress, endpoint_url
 from workstation_agent.network_mcp.server import NetworkEndpointInfo, NetworkMCPServer
 from workstation_agent.network_mcp.tools import (
     SERVED_FAMILIES,
@@ -40,11 +44,14 @@ __all__ = [
     "SERVED_FAMILIES",
     "SERVED_TOOLS",
     "SERVED_TOOLS_BY_NAME",
+    "BindFailure",
+    "BoundAddress",
     "CertificateInfo",
     "Hardening",
     "NetworkEndpointInfo",
     "NetworkMCPServer",
     "ServedTool",
+    "endpoint_url",
     "ensure_certificate",
     "ensure_token",
     "served_tool_names",

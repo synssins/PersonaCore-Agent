@@ -4,6 +4,13 @@
 certificate; 32-byte bearer token; a static families-only tool allowlist; every
 call routed through :meth:`MCPHost.invoke`, which is the gate.
 
+The endpoint binds a **set** of operator-chosen interfaces — a machine that
+bridges two networks has to answer on both — with one of them designated the
+preferred address, because the registration carries one ``url`` and the core
+reads one ``url``. :attr:`NetworkEndpointInfo.urls` carries the whole list. See
+:mod:`~workstation_agent.network_mcp.listeners` for how several addresses are
+served by one application, and ``DECISION.md`` §4 for why that way.
+
 **Self-contained by design.** This module performs no application wiring: it does
 not touch ``app.py``, does not create an ``MCPHost``, and does not read the config
 store. It takes a config object and a host, and exposes :meth:`NetworkMCPServer.start`
@@ -50,6 +57,14 @@ from workstation_agent.network_mcp.hardening import (
     MAX_HEADER_BYTES,
     Hardening,
 )
+from workstation_agent.network_mcp.listeners import (
+    BindFailure,
+    BindOutcome,
+    BoundAddress,
+    close_listeners,
+    endpoint_url,
+    open_listeners,
+)
 from workstation_agent.network_mcp.tools import (
     SERVED_TOOLS,
     SERVED_TOOLS_BY_NAME,
@@ -58,6 +73,8 @@ from workstation_agent.network_mcp.tools import (
 
 if TYPE_CHECKING:  # pragma: no cover
     import datetime as dt
+    import socket
+    from collections.abc import Sequence
     from pathlib import Path
 
     from workstation_agent.config.schema import NetworkMcpConfig
@@ -83,8 +100,17 @@ class NetworkEndpointInfo:
     """
 
     url: str
-    """``https://<host>:<port>/mcp`` — the registration's ``url`` field."""
+    """``https://<host>:<port>/mcp`` — the registration's ``url`` field.
+
+    The **preferred** URL, kept singular and first for compatibility: the core
+    reads one ``url`` today, and everything downstream of this — the manifest,
+    the export pre-flight, the page's copy button — still means "the one to
+    connect to". It is always an element of :attr:`urls`, and while the endpoint
+    is running it always names an address that actually bound, even when that is
+    not the operator's first choice because their first choice failed.
+    """
     bind_host: str
+    """The preferred address, matching :attr:`url`."""
     port: int
     fingerprint: str
     """``sha256:<64 hex>`` — the registration's ``tls_fingerprint`` field."""
@@ -95,14 +121,42 @@ class NetworkEndpointInfo:
     tool_names: tuple[str, ...]
     """The served set. B5 asserts the exported set equals this."""
     running: bool
+    urls: tuple[str, ...] = ()
+    """One full ``https://host:port/mcp`` per address, IPv6 bracketed.
+
+    While running this is the addresses that actually **bound**; while stopped
+    it is the addresses that *would* be bound, so the page can show the operator
+    what they are choosing before they switch it on. ``urls[0]`` is
+    :attr:`url`.
+
+    This is what the enrolment payload will carry once that contract is frozen.
+    Building the outbound call is not this subtask's; answering the question is.
+    """
+    bind_hosts: tuple[str, ...] = ()
+    """The addresses behind :attr:`urls`, same order. ``bind_hosts[0]`` is
+    :attr:`bind_host`."""
+    bind_failures: tuple[BindFailure, ...] = ()
+    """Chosen addresses that are **not** answering, each with its reason.
+
+    Non-empty alongside :attr:`running` is a partial bind. See :attr:`degraded`.
+    """
+    degraded: bool = False
+    """Serving, but not on every address the operator chose.
+
+    Separate from :attr:`running` because both facts are true at once and
+    collapsing them loses the one that matters: an operator who chose three
+    addresses and got two must not be shown a green light. Every consumer that
+    renders a status reads this, and the Agent's own health check reports the
+    endpoint unhealthy while it is set.
+    """
 
 
 class NetworkMCPServer:
     """The LAN-facing MCP endpoint.
 
     Args:
-        config: The endpoint's settings. ``bind_host`` is validated by the schema
-            to be a named interface, never a wildcard.
+        config: The endpoint's settings. Every entry of ``bind_hosts`` is
+            validated by the schema to be a named interface, never a wildcard.
         mcp_host: The :class:`~workstation_agent.mcp_host.host.MCPHost` every call
             is routed through. Passing ``None`` serves ``tools/list`` and answers
             every ``tools/call`` with the §5.2 ``error`` envelope, which is what
@@ -130,6 +184,12 @@ class NetworkMCPServer:
         self._task: asyncio.Task[None] | None = None
         self._port: int = config.port
         self._hardening: Hardening | None = None
+        #: The sockets this endpoint opened, handed to uvicorn as a set. Held so
+        #: :meth:`stop` can close them itself rather than trusting uvicorn to
+        #: have reached its own shutdown path.
+        self._sockets: tuple[socket.socket, ...] = ()
+        self._bound: tuple[BoundAddress, ...] = ()
+        self._bind_failures: tuple[BindFailure, ...] = ()
         #: The enrolment window and the receiver for the token PersonaCore
         #: pushes into it. Built here rather than in :meth:`_build_app` so a Join
         #: is not silently dropped by a stop/start, and held only in memory so
@@ -139,14 +199,27 @@ class NetworkMCPServer:
     # -- lifecycle -------------------------------------------------------
 
     async def start(self) -> NetworkEndpointInfo:
-        """Generate/load credentials, bind the interface over TLS, and serve.
+        """Generate/load credentials, bind every chosen address over TLS, serve.
+
+        Every address in ``config.bind_hosts`` gets its own listening socket,
+        opened here (see :mod:`~workstation_agent.network_mcp.listeners` for why
+        here and not by uvicorn), and the whole set is handed to **one**
+        ``uvicorn.Server`` over **one** ASGI app: one lifespan, one MCP session
+        manager, one bearer gate, one enrolment window, and — because
+        ``Server.shutdown`` closes the sockets it was given — one release.
 
         Returns:
-            The bound endpoint's :class:`NetworkEndpointInfo`.
+            The bound endpoint's :class:`NetworkEndpointInfo`. A *partial* bind
+            returns normally with :attr:`~NetworkEndpointInfo.degraded` set and
+            :attr:`~NetworkEndpointInfo.bind_failures` naming what did not bind;
+            it does not raise, because refusing to serve on the two addresses
+            that worked would be a worse answer to "one of your three is busy"
+            than serving and saying so.
 
         Raises:
             RuntimeError: if the endpoint is already running, if the served-tool
-                table violates contract §2, or if uvicorn cannot bind.
+                table violates contract §2, or if **no** chosen address could be
+                bound — the message names every address and its reason.
         """
         if self._task is not None and not self._task.done():
             msg = "network MCP endpoint is already running"
@@ -169,18 +242,101 @@ class NetworkMCPServer:
         import uvicorn
 
         self._token = ensure_token(self._state_dir)
-        self._cert = ensure_certificate(self._state_dir, bind_host=self._config.bind_host)
+        cert, outcome = self._open_listeners()
 
-        app = self._build_app(self._token)
+        # From here to `create_task` the sockets are bound and nothing owns them
+        # yet. Anything that raises in between -- a certificate file that
+        # disappeared between `ensure_certificate` and `uvicorn.Config`, an SDK
+        # that builds an app it cannot serve -- would otherwise leave every
+        # chosen address held by a process that is not listening on it, and the
+        # operator's next attempt would fail on an address nothing appears to be
+        # using.
+        try:
+            app = self._build_app(self._token)
+            config = self._uvicorn_config(uvicorn, app, outcome.bound[0], cert)
+            server = uvicorn.Server(config)
+            self._uvicorn = server
+            self._task = asyncio.create_task(
+                _guarded_serve(server, list(outcome.sockets)), name="network-mcp-serve",
+            )
+        except BaseException:
+            self._release_sockets()
+            self._bound = ()
+            self._uvicorn = None
+            raise
 
-        config = uvicorn.Config(
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _BIND_TIMEOUT
+        while loop.time() < deadline:
+            if self._task.done():
+                # serve() failed (a bad certificate, a lifespan refusal, ...).
+                # The sockets are ours: uvicorn only closes them from its own
+                # shutdown path, which a failure before `started` never reaches.
+                self._release_sockets()
+                self._bound = ()
+                self._task.result()
+                msg = "network MCP endpoint exited during startup"
+                raise RuntimeError(msg)
+            if getattr(server, "started", False) and server.servers:
+                break
+            await asyncio.sleep(0.02)
+        else:  # pragma: no cover — only on a wedged bind
+            await self.stop()
+            msg = f"network MCP endpoint did not bind within {_BIND_TIMEOUT}s"
+            raise RuntimeError(msg)
+
+        info = self.info()
+        log.info(
+            "network MCP endpoint listening on %s (fingerprint %s, %d tools)",
+            ", ".join(info.urls) or info.url, info.fingerprint, len(info.tool_names),
+        )
+        return info
+
+    def _open_listeners(self) -> tuple[CertificateInfo, BindOutcome]:
+        """Bind one socket per chosen address. Raises if none of them bind.
+
+        Done before the app is built and before uvicorn exists, because that is
+        the only place the answer to "which address?" is available: each one
+        fails on its own ``bind()`` with its own errno. uvicorn's own bind path
+        answers with ``sys.exit(3)`` and cannot name an address — it only ever
+        had one.
+        """
+        hosts = self._config.bind_hosts
+        cert = self._cert = ensure_certificate(self._state_dir, bind_hosts=hosts)
+
+        outcome = open_listeners(hosts, self._config.port, cert_path=cert.cert_path)
+        self._bind_failures = outcome.failures
+        if not outcome.bound:
+            detail = "; ".join(str(f) for f in outcome.failures) or "no address was chosen"
+            msg = f"the network MCP endpoint could not bind any chosen address: {detail}"
+            raise RuntimeError(msg)
+        if outcome.failures:
+            log.warning(
+                "network MCP endpoint bound %d of %d chosen addresses; not answering on: %s",
+                len(outcome.bound), len(hosts),
+                "; ".join(str(f) for f in outcome.failures),
+            )
+
+        self._sockets = outcome.sockets
+        self._bound = outcome.bound
+        self._port = outcome.bound[0].port
+        return cert, outcome
+
+    def _uvicorn_config(
+        self, uvicorn: Any, app: Any, preferred: BoundAddress, cert: CertificateInfo,
+    ) -> Any:
+        """The one ``uvicorn.Config`` every listening socket is served under."""
+        return uvicorn.Config(
             app,
-            host=self._config.bind_host,
-            port=self._config.port,
+            # Only reached by uvicorn's own start-up log line, which it skips
+            # entirely when it is handed sockets. The addresses that matter are
+            # the ones already bound above.
+            host=preferred.host,
+            port=preferred.port,
             # TLS is structural: there is no code path in this module that
             # serves plain HTTP, and no setting that turns it off.
-            ssl_certfile=str(self._cert.cert_path),
-            ssl_keyfile=str(self._cert.key_path),
+            ssl_certfile=str(cert.cert_path),
+            ssl_keyfile=str(cert.key_path),
             ssl_version=ssl.PROTOCOL_TLS_SERVER,
             log_level="warning",
             lifespan="on",  # the SDK's session manager runs in the app's lifespan
@@ -197,36 +353,16 @@ class NetworkMCPServer:
             server_header=False,  # do not advertise the stack to the LAN
             date_header=True,
         )
-        server = uvicorn.Server(config)
-        self._uvicorn = server
-        self._task = asyncio.create_task(_guarded_serve(server), name="network-mcp-serve")
-
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + _BIND_TIMEOUT
-        while loop.time() < deadline:
-            if self._task.done():
-                # serve() failed (port in use, bad certificate, ...). Surface it.
-                self._task.result()
-                msg = "network MCP endpoint exited during startup"
-                raise RuntimeError(msg)
-            if getattr(server, "started", False) and server.servers:
-                break
-            await asyncio.sleep(0.02)
-        else:  # pragma: no cover — only on a wedged bind
-            await self.stop()
-            msg = f"network MCP endpoint did not bind within {_BIND_TIMEOUT}s"
-            raise RuntimeError(msg)
-
-        self._port = _assigned_port(server, self._config.port)
-        info = self.info()
-        log.info(
-            "network MCP endpoint listening on %s (fingerprint %s, %d tools)",
-            info.url, info.fingerprint, len(info.tool_names),
-        )
-        return info
 
     async def stop(self) -> None:
-        """Stop serving. Safe to call when not running, and safe to call twice."""
+        """Stop serving. Safe to call when not running, and safe to call twice.
+
+        Every socket opened by :meth:`start` is closed, whether or not uvicorn
+        got as far as its own shutdown: a stop that released two of three
+        listeners would leave the third bound with nothing behind it, and the
+        next start would then fail on an address the operator can see nothing
+        wrong with.
+        """
         server, task = self._uvicorn, self._task
         self._uvicorn = self._task = None
         if server is not None:
@@ -238,7 +374,14 @@ class NetworkMCPServer:
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await task
+        self._release_sockets()
+        self._bound = ()
         log.info("network MCP endpoint stopped")
+
+    def _release_sockets(self) -> None:
+        """Close every listening socket this endpoint opened. Idempotent."""
+        sockets, self._sockets = self._sockets, ()
+        close_listeners(sockets)
 
     @property
     def running(self) -> bool:
@@ -253,24 +396,45 @@ class NetworkMCPServer:
         Works before :meth:`start`, generating the certificate and token if they
         do not exist yet, so the UI can show the operator what to paste into
         PersonaCore without the endpoint being up.
+
+        ``urls`` carries one entry per address. While the endpoint is running
+        those are the addresses that **bound**, so a URL in this list is a URL
+        something is answering on; while it is stopped they are the addresses
+        configured, so the page can show what switching it on would produce.
+        ``url`` is ``urls[0]`` — the preferred address — kept singular for the
+        core, which reads one ``url``.
         """
         if self._token is None:
             self._token = ensure_token(self._state_dir)
         if self._cert is None:
-            self._cert = ensure_certificate(self._state_dir, bind_host=self._config.bind_host)
-        host = self._config.bind_host
-        if ":" in host:  # IPv6 literal
-            host = f"[{host}]"
+            self._cert = ensure_certificate(
+                self._state_dir, bind_hosts=self._config.bind_hosts,
+            )
+
+        running = self.running
+        if running and self._bound:
+            hosts = tuple(b.host for b in self._bound)
+            urls = tuple(b.url for b in self._bound)
+            port = self._bound[0].port
+        else:
+            hosts = self._config.bind_hosts or (self._config.bind_host,)
+            port = self._port
+            urls = tuple(endpoint_url(h, port) for h in hosts)
+
         return NetworkEndpointInfo(
-            url=f"https://{host}:{self._port}/mcp",
-            bind_host=self._config.bind_host,
-            port=self._port,
+            url=urls[0],
+            bind_host=hosts[0],
+            port=port,
             fingerprint=self._cert.fingerprint,
             token=self._token,
             certificate_sans=self._cert.sans,
             certificate_expires=self._cert.not_valid_after,
             tool_names=tuple(t.name for t in SERVED_TOOLS),
-            running=self.running,
+            running=running,
+            urls=urls,
+            bind_hosts=hosts,
+            bind_failures=self._bind_failures if running else (),
+            degraded=bool(running and self._bind_failures),
         )
 
     def rotate_token(self) -> str:
@@ -282,14 +446,26 @@ class NetworkMCPServer:
         self._token = ensure_token(self._state_dir, rotate=True)
         return self._token
 
-    def regenerate_certificate(self) -> CertificateInfo:
+    def regenerate_certificate(
+        self, *, for_hosts: Sequence[str] | None = None,
+    ) -> CertificateInfo:
         """Generate a fresh certificate. Takes effect on the next :meth:`start`.
 
         **Changes the fingerprint**, so the registration must be regenerated and
         reinstalled on PersonaCore's Plugins page or the core's pin will fail.
+
+        Args:
+            for_hosts: The addresses the new certificate must cover. Defaults to
+                the addresses currently configured. The UI passes the operator's
+                *pending* selection instead, because that is the whole point of
+                the offer: regenerating for the addresses already saved would
+                produce a certificate that still does not cover the address they
+                are trying to add, and the second attempt would fail exactly as
+                the first did.
         """
+        hosts = tuple(for_hosts) if for_hosts else self._config.bind_hosts
         self._cert = ensure_certificate(
-            self._state_dir, bind_host=self._config.bind_host, regenerate=True,
+            self._state_dir, bind_hosts=hosts, regenerate=True,
         )
         return self._cert
 
@@ -335,10 +511,15 @@ class NetworkMCPServer:
 
         from workstation_agent.registration_export import is_loopback_host
 
-        host = self._config.bind_host
-        if is_loopback_host(host):
+        # Every address, not just the preferred one: a machine bound to
+        # loopback *and* a LAN address is perfectly reachable, and refusing the
+        # Join because the first entry happens to be 127.0.0.1 would be a
+        # refusal the owner cannot act on.
+        hosts = tuple(b.host for b in self._bound) or self._config.bind_hosts
+        if all(is_loopback_host(h) for h in hosts):
+            listed = ", ".join(hosts)
             msg = (
-                f"The endpoint is bound to {host}, which is this machine only. "
+                f"The endpoint is bound to {listed}, which is this machine only. "
                 f"PersonaCore runs elsewhere and cannot reach it to push the token. "
                 f"Bind a LAN address first, then join."
             )
@@ -447,7 +628,7 @@ class NetworkMCPServer:
             on_call_tool=_on_call_tool,
         )
 
-        host = self._config.bind_host
+        host = self._config.bind_host  # the preferred one; the SDK takes a scalar
         # Only keyword arguments that exist in *every* version this project
         # declares. `max_sessions` and `session_idle_timeout` are 2.2 additions to
         # this signature and passing either raises TypeError on 2.1.1 — the
@@ -508,11 +689,15 @@ class NetworkMCPServer:
         """Host-header allowlist for the SDK's DNS-rebinding protection.
 
         The core connects by whatever ``url`` the registration carries, which is
-        the bind address or a name that resolves to it, so the certificate's SAN
-        entries are exactly the right allowlist — they are the names this
-        endpoint claims to be.
+        one of the bind addresses or a name that resolves to one, so the
+        certificate's SAN entries are exactly the right allowlist — they are the
+        names this endpoint claims to be. Every chosen address is added too:
+        with a set of addresses, a Host header naming any of them is legitimate,
+        and the SAN already covers all of them because
+        :func:`~...listeners.open_listeners` refuses to bind one it does not.
         """
-        names: list[str] = [self._config.bind_host]
+        names: list[str] = list(self._config.bind_hosts)
+        names.extend(b.host for b in self._bound)
         if self._cert is not None:
             names.extend(self._cert.sans)
         allowed: list[str] = []
@@ -657,24 +842,31 @@ def _require_mcp_api() -> None:
         raise RuntimeError(msg)
 
 
-async def _guarded_serve(server: Any) -> None:
+async def _guarded_serve(server: Any, sockets: list[socket.socket]) -> None:
     """Run ``uvicorn.Server.serve()`` without letting it kill the event loop.
 
-    uvicorn answers a failed bind — a port already in use, an unreadable key
-    file — with ``sys.exit(3)`` (``uvicorn/server.py:183``). ``SystemExit`` is a
+    uvicorn answers a failed start — an unreadable key file, a lifespan that
+    refuses — with ``sys.exit(3)`` (``uvicorn/server.py``). ``SystemExit`` is a
     ``BaseException``, and asyncio deliberately re-raises those straight out of
     ``Task.__step`` into the running loop rather than storing them on the task.
     In a standalone ``uvicorn`` process that is exactly right; inside the Agent,
     where this endpoint is one subsystem among many, it would tear down the whole
-    application loop because a port was busy. Translating it here keeps a bind
-    failure a reportable error on :meth:`NetworkMCPServer.start`.
+    application loop. Translating it here keeps a startup failure a reportable
+    error on :meth:`NetworkMCPServer.start`.
+
+    *sockets* are already bound (see
+    :func:`~workstation_agent.network_mcp.listeners.open_listeners`), so the
+    address-in-use case never reaches uvicorn at all; it was reported per
+    address before this task was created. Handing the list here is what makes
+    uvicorn serve all of them from one server and close all of them from one
+    shutdown.
     """
     try:
-        await server.serve()
+        await server.serve(sockets=sockets)
     except SystemExit as exc:
         msg = (
             "the network MCP endpoint could not bind "
-            f"(uvicorn exited with status {exc.code}); the port may already be in use"
+            f"(uvicorn exited with status {exc.code})"
         )
         raise RuntimeError(msg) from exc
 
@@ -745,15 +937,6 @@ def _envelope_from_result(result: Any) -> dict[str, Any]:
     if is_error:
         return _fail("error", text or "The tool reported a failure with no message.")
     return {"ok": True, "text": text}
-
-
-def _assigned_port(server: Any, requested: int) -> int:
-    """Read the port uvicorn actually bound (``port=0`` means the OS picks)."""
-    for sock in getattr(server, "servers", []) or []:
-        for raw in getattr(sock, "sockets", []) or []:
-            with contextlib.suppress(OSError, IndexError, TypeError):
-                return int(raw.getsockname()[1])
-    return requested
 
 
 def _agent_version() -> str:

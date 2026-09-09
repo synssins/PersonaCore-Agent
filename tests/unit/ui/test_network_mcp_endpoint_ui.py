@@ -52,22 +52,53 @@ class FakeEndpoint:
     """
 
     #: Set on the class by a test to make every constructed endpoint fail.
-    def __init__(
+    def __init__(  # noqa: PLR0913 — one knob per behaviour a test needs to stage
         self,
         config,
         *,
         start_error: Exception | None = None,
         sans: tuple[str, ...] = ("workstation", "192.168.1.50", "127.0.0.1"),
+        bind_failures: tuple[object, ...] = (),
+        regenerate_sans: tuple[str, ...] | None = None,
+        shared: dict | None = None,
     ) -> None:
         self.config = config
+        self.bind_failures = bind_failures
+        #: What a regeneration is *able* to cover. ``None`` means "whatever was
+        #: asked for", which is the normal case; a fixed tuple models a machine
+        #: that cannot certify an address it does not have -- no certificate
+        #: this machine generates will ever cover 203.0.113.9.
+        self.regenerate_sans = regenerate_sans
         self._running = False
         self.start_calls = 0
         self.stop_calls = 0
         self.start_error = start_error
-        self.sans = sans
+        # The certificate is a file on the machine, not a property of a server
+        # object: a rebind builds a fresh NetworkMCPServer and it reads back the
+        # same certificate. Sharing this dict across everything one Factory
+        # builds is what makes the fake behave that way; without it, rotating
+        # the certificate and then rebinding would silently un-rotate it.
+        self._cert = shared if shared is not None else {}
+        self._cert.setdefault("sans", sans)
+        self._cert.setdefault("fingerprint", "sha256:" + "ab" * 32)
         self.token = "t" * 64
-        self.fingerprint = "sha256:" + "ab" * 32
         self.assigned_port = config.port or 49152
+
+    @property
+    def sans(self) -> tuple[str, ...]:
+        return self._cert["sans"]
+
+    @sans.setter
+    def sans(self, value) -> None:
+        self._cert["sans"] = value
+
+    @property
+    def fingerprint(self) -> str:
+        return self._cert["fingerprint"]
+
+    @fingerprint.setter
+    def fingerprint(self, value: str) -> None:
+        self._cert["fingerprint"] = value
 
     @property
     def running(self) -> bool:
@@ -85,10 +116,20 @@ class FakeEndpoint:
         self._running = False
 
     def info(self):
-        host = self.config.bind_host
+        hosts = tuple(self.config.bind_hosts)
+        host = hosts[0]
+        urls = tuple(
+            f"https://[{h}]:{self.assigned_port}/mcp" if ":" in h
+            else f"https://{h}:{self.assigned_port}/mcp"
+            for h in hosts
+        )
         return _Info(
-            url=f"https://{host}:{self.assigned_port}/mcp",
+            url=urls[0],
+            urls=urls,
             bind_host=host,
+            bind_hosts=hosts,
+            bind_failures=tuple(self.bind_failures) if self._running else (),
+            degraded=bool(self._running and self.bind_failures),
             port=self.assigned_port,
             fingerprint=self.fingerprint,
             token=self.token,
@@ -106,11 +147,15 @@ class FakeEndpoint:
         self.token = "r" * 64
         return self.token
 
-    def regenerate_certificate(self):
+    def regenerate_certificate(self, *, for_hosts=None):
         self.fingerprint = "sha256:" + "cd" * 32
-        # A regenerated certificate is built for the host currently configured,
-        # which is the whole point of offering the button on a SAN mismatch.
-        self.sans = (self.config.bind_host,)
+        # A regenerated certificate covers the hosts asked for -- the operator's
+        # *pending* selection when the router passes one, which is the whole
+        # point of offering the button on a SAN mismatch.
+        if self.regenerate_sans is not None:
+            self.sans = self.regenerate_sans
+        else:
+            self.sans = tuple(for_hosts) if for_hosts else tuple(self.config.bind_hosts)
         return self.fingerprint
 
 
@@ -120,9 +165,11 @@ class Factory:
     def __init__(self, **kwargs) -> None:
         self.kwargs = kwargs
         self.built: list[FakeEndpoint] = []
+        #: The one certificate on this "machine", shared by everything built.
+        self.cert: dict = {}
 
     def __call__(self, config) -> FakeEndpoint:
-        endpoint = FakeEndpoint(config, **self.kwargs)
+        endpoint = FakeEndpoint(config, shared=self.cert, **self.kwargs)
         self.built.append(endpoint)
         return endpoint
 
@@ -496,7 +543,10 @@ def test_the_page_offers_this_machines_addresses_and_marks_loopback(tmp_path):
     resp = client.get("/network-mcp")
 
     assert resp.status_code == 200
-    assert 'name="bind_host_choice"' in resp.text
+    # A multi-select: a machine that bridges networks has to answer on more
+    # than one address, and which ones is the operator's choice from a list.
+    assert 'name="bind_hosts"' in resp.text
+    assert "multiple" in resp.text
     assert 'name="port"' in resp.text
     assert 'name="enabled"' in resp.text
     assert "NOT reachable from PersonaCore" in resp.text
@@ -572,29 +622,52 @@ def test_the_certificate_is_never_regenerated_behind_the_operators_back(tmp_path
     assert factory.last.fingerprint == original
 
 
-def test_the_warning_persists_on_reload_until_it_is_resolved(tmp_path):
-    """Shown once and forgotten would leave a wrong certificate standing."""
+def test_the_refusal_stands_on_a_second_attempt_too(tmp_path):
+    """Refused is refused, not "warned once and then allowed through".
+
+    The superseded behaviour saved the address and left a standing warning,
+    which is the shape the owner ruled out: the failure has to be impossible to
+    reach by clicking, not documented next to the click that reaches it.
+    """
+    store = FakeConfigStore()
     factory = Factory(sans=("192.168.1.50",))
     client = make_client(
-        config_store=FakeConfigStore(), tmp_path=tmp_path, network_mcp_factory=factory,
+        config_store=store, tmp_path=tmp_path, network_mcp_factory=factory,
     )
-    client.post("/network-mcp/settings", data=_form(bind_host_choice="10.0.0.7"))
 
-    assert "does not cover 10.0.0.7" in client.get("/network-mcp").text
-    assert "does not cover 10.0.0.7" in client.get("/network-mcp").text
+    for _ in range(2):
+        resp = client.post("/network-mcp/settings", data=_form(bind_host_choice="10.0.0.7"))
+        assert "does not cover 10.0.0.7" in resp.text
+        assert store.load().network_mcp.bind_hosts == ("127.0.0.1",)
+        assert store.load().network_mcp.enabled is False
+    assert factory.built[-1].start_calls == 0
 
 
-def test_regenerating_clears_the_warning(tmp_path):
+def test_taking_the_regenerate_offer_covers_the_address_and_saves(tmp_path):
+    """The one sanctioned way through, and it goes all the way through.
+
+    Regenerating for the *pending* selection is the point: rotating for what is
+    already stored would produce a certificate that still does not cover the
+    address being added, and the operator's next click would fail identically.
+    """
+    store = FakeConfigStore()
     factory = Factory(sans=("192.168.1.50",))
     client = make_client(
-        config_store=FakeConfigStore(), tmp_path=tmp_path, network_mcp_factory=factory,
+        config_store=store, tmp_path=tmp_path, network_mcp_factory=factory,
     )
     client.post("/network-mcp/settings", data=_form(bind_host_choice="10.0.0.7"))
-    assert "does not cover" in client.get("/network-mcp").text
+    before = factory.built[-1].fingerprint
 
-    client.post("/network-mcp/regenerate-certificate", follow_redirects=True)
+    resp = client.post(
+        "/network-mcp/settings",
+        data={"enabled": "true", "bind_hosts": ["10.0.0.7"], "port": "8765",
+              "regenerate": "true"},
+    )
 
-    assert "does not cover" not in client.get("/network-mcp").text
+    assert "does not cover" not in resp.text
+    assert store.load().network_mcp.bind_hosts == ("10.0.0.7",)
+    assert factory.built[-1].fingerprint != before
+    assert "10.0.0.7" in factory.built[-1].sans
 
 
 def test_moving_from_loopback_to_a_covered_lan_address_needs_no_regeneration(tmp_path):

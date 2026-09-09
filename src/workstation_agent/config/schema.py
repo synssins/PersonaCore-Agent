@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 from typing import Final, Literal
 
 from pydantic import AnyHttpUrl, BaseModel, Field, field_validator
@@ -207,24 +208,107 @@ class ConfirmationPolicyConfig(BaseModel):
     remember_for_session: list[str] = Field(default_factory=list)
 
 
+#: Every spelling of "listen on everything". Refused as a *value*, not merely
+#: as a default — see :meth:`NetworkMcpConfig._reject_wildcard_bind`.
+_WILDCARD_BINDS: Final[frozenset[str]] = frozenset({
+    "", "0.0.0.0", "::", "[::]", "*", "0", "::0",  # noqa: S104
+})
+
+
+def _is_unspecified_address(host: str) -> bool:
+    """True if *host* parses as "every interface", in any spelling.
+
+    The literal set above catches what an operator types. This catches what an
+    operator pastes: ``0:0:0:0:0:0:0:0``, ``::0.0.0.0``, ``[::]%0`` and — the
+    one that looks least like a wildcard — ``::ffff:0.0.0.0``, whose
+    ``is_unspecified`` is ``False`` because it is not ``::``, and which binds
+    every IPv4 interface on the machine regardless.
+
+    Names are not addresses and cannot be judged here at all; the resolved
+    address is checked immediately before ``bind()``, in
+    :func:`~workstation_agent.network_mcp.listeners._bind_one`. This is the
+    early, legible half of that rule, so an operator who pastes one is told at
+    the moment they save rather than by a bind failure afterwards.
+    """
+    bare = host.strip().strip("[]").split("%", 1)[0]
+    try:
+        ip = ipaddress.ip_address(bare)
+    except ValueError:
+        return False
+    if ip.is_unspecified:
+        return True
+    mapped = getattr(ip, "ipv4_mapped", None)
+    return bool(mapped is not None and mapped.is_unspecified)
+
+
+def _reject_wildcard(value: str, *, sentence: str) -> str:
+    """Return *value* stripped, or raise if it is any spelling of a wildcard.
+
+    One implementation, shared by the single preferred address and by every
+    entry of the additional set, so selecting three addresses can never become
+    a back door to the thing naming one address is refused for. *sentence* is
+    the field-specific opening clause; the rest of the message — and therefore
+    the sentence the UI shows the operator — is identical either way.
+    """
+    host = value.strip()
+    if host.lower() in _WILDCARD_BINDS or _is_unspecified_address(host):
+        msg = f"{sentence}; {value!r} binds every interface on this machine"
+        raise ValueError(msg)
+    return host
+
+
+def _host_key(host: str) -> str:
+    """A comparison key for de-duplicating bind addresses.
+
+    Addresses are compared *as addresses*, so ``::1`` and ``0:0:0:0:0:0:0:1``
+    and ``[::1]`` are one entry rather than three sockets fighting over one
+    port; names are compared case-insensitively, because DNS is.
+    """
+    cleaned = host.strip().strip("[]")
+    try:
+        return str(ipaddress.ip_address(cleaned))
+    except ValueError:
+        return cleaned.lower()
+
+
 class NetworkMcpConfig(BaseModel):
     """The LAN-facing MCP endpoint PersonaCore connects to (contract §1-§3).
 
     Off by default. Turning it on puts this workstation's capability families on
     the network, so it is an explicit operator decision, not a default.
+
+    The endpoint binds a **chosen set** of addresses — a machine that bridges
+    two networks has to answer on both — expressed as one preferred address
+    (:attr:`bind_host`) plus :attr:`additional_bind_hosts`. That shape rather
+    than a single list because exactly one of them has to be *the* address: the
+    registration carries one ``url``, and the core reads one ``url``. See
+    :attr:`bind_hosts` for the resolved set.
+
+    Choosing three addresses is emphatically not the same as choosing "all", and
+    the wildcard refusal below applies to every entry of the set.
     """
 
     enabled: bool = False
     """Serve the endpoint. Default off: the operator opts in."""
 
     bind_host: str = "127.0.0.1"
-    """The interface to bind.
+    """The **preferred** interface to bind — the one the registration names.
 
     Contract §3: **never 0.0.0.0 by default**. This goes further and refuses a
     wildcard outright — see :meth:`_reject_wildcard_bind`. The default is
     loopback, which is useless to PersonaCore on purpose: the operator has to
     name the interface they mean, and naming it is the moment they decide to
     expose the machine.
+    """
+
+    additional_bind_hosts: list[str] = Field(default_factory=list, max_length=32)
+    """Further interfaces to bind, beyond :attr:`bind_host`.
+
+    Empty by default, so an existing configuration keeps binding exactly the one
+    address it always did. Every entry is held to the same wildcard refusal as
+    :attr:`bind_host` — see :meth:`_reject_wildcard_binds` — because the point
+    of the set is that the operator picks which addresses, not that they get a
+    longer way to spell "every interface this machine has".
     """
 
     port: int = Field(default=8765, ge=0, le=65535)
@@ -260,6 +344,30 @@ class NetworkMcpConfig(BaseModel):
     session_idle_seconds: float = Field(default=300.0, gt=0)
     """Idle MCP session lifetime before the SDK reclaims it."""
 
+    @property
+    def bind_hosts(self) -> tuple[str, ...]:
+        """The complete set of addresses to bind, preferred one first.
+
+        De-duplicated by :func:`_host_key`, so an operator who selects both
+        ``::1`` and ``[::1]`` gets one socket rather than a bind failure on the
+        second. Never empty: :attr:`bind_host` cannot validate as empty.
+
+        A property rather than a field on purpose — there is no second place to
+        keep in step, nothing to drift, and ``config.bind_host = "10.0.0.5"``
+        (which pydantic allows: this model does not set ``validate_assignment``)
+        cannot leave a stale set behind it.
+        """
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for raw in (self.bind_host, *self.additional_bind_hosts):
+            host = raw.strip()
+            key = _host_key(host)
+            if not host or key in seen:
+                continue
+            seen.add(key)
+            ordered.append(host)
+        return tuple(ordered)
+
     @field_validator("bind_host")
     @classmethod
     def _reject_wildcard_bind(cls, v: str) -> str:
@@ -271,14 +379,31 @@ class NetworkMcpConfig(BaseModel):
         reading, and costs an operator who really wants every interface only the
         effort of naming the one they mean.
         """
-        host = v.strip()
-        if host.lower() in {"", "0.0.0.0", "::", "[::]", "*", "0", "::0"}:  # noqa: S104
-            msg = (
-                "network_mcp.bind_host must name one interface (a LAN IP or a "
-                f"hostname); {v!r} binds every interface on this machine"
+        return _reject_wildcard(
+            v,
+            sentence=(
+                "network_mcp.bind_host must name one interface (a LAN IP or a hostname)"
+            ),
+        )
+
+    @field_validator("additional_bind_hosts")
+    @classmethod
+    def _reject_wildcard_binds(cls, v: list[str]) -> list[str]:
+        """Hold every additional address to the same refusal as the first.
+
+        Without this, ``additional_bind_hosts = ["0.0.0.0"]`` would be the
+        wildcard bind the field above refuses, reached by a different door.
+        """
+        return [
+            _reject_wildcard(
+                entry,
+                sentence=(
+                    "network_mcp.additional_bind_hosts must name one interface each "
+                    "(a LAN IP or a hostname)"
+                ),
             )
-            raise ValueError(msg)
-        return host
+            for entry in v
+        ]
 
 
 class AgentConfig(BaseModel):

@@ -227,3 +227,54 @@ a keep-alive connection against the concurrency cap.
 Rejection logging is itself rate-limited (first occurrence at WARNING, then every 50th, carrying
 the running total). Unbounded logging on an unauthenticated LAN endpoint is a disk-exhaustion
 lever, and the pattern is the same class of mistake as an unbounded read buffer.
+---
+
+## 4. Binding several addresses — **our own sockets, one uvicorn server** (subtask P13)
+
+### The problem
+
+The endpoint binds a set of operator-chosen addresses, because a machine that bridges two
+networks has to answer on both. `uvicorn` binds **one** host per `uvicorn.Server`.
+
+### What was chosen
+
+`listeners.open_listeners()` creates one bound `socket` per chosen address, and the whole list
+is handed to a single `uvicorn.Server.serve(sockets=[...])`, over a single ASGI app.
+
+### Why, and what the alternative would have cost
+
+The alternative is N `uvicorn.Server` instances. Each has its own lifespan, its own
+`should_exit` flag and its own graceful-shutdown clock — and the MCP SDK's
+`StreamableHTTPSessionManager` is started *by the lifespan* and is not re-entrant. Sharing one
+app across N lifespans starts N session managers over one server object: two views of "live
+session", two idle reapers, and a shutdown that has to be choreographed across N servers that
+can each fail independently. Building one app per address instead gives N bearer gates and N
+enrolment windows, so a Join opened on one address would be invisible on the others.
+
+`Server.serve(sockets=...)` calls `loop.create_server(sock=...)` once per socket and
+`Server.shutdown` closes every socket it was given, so all of them start and stop as one.
+`NetworkMCPServer.stop` closes them again itself, because "stopping released every socket" must
+not depend on uvicorn having reached its shutdown path.
+
+### What binding here (rather than in uvicorn) buys
+
+- **A partial bind is reportable.** Each address fails on its own `bind()` with its own errno,
+  so `info().bind_failures` can say *which* address and *why*. uvicorn's own bind path answers
+  with `sys.exit(3)` and could never name an address — it only ever had one.
+- **`SO_REUSEADDR` is not set on Windows.** There it lets a second process bind an
+  address:port another process is already listening on, which would turn the one failure this
+  needs to report into a silent success. It is set on POSIX, where it means TIME_WAIT reuse.
+- **`IPV6_V6ONLY` is set.** An IPv6 socket that also accepts IPv4 is a wildcard the operator
+  did not choose.
+- **`port = 0` picks one port for the whole set.** The first socket to bind fixes it and the
+  rest are bound to that port explicitly; one endpoint answering on three different ports is
+  not one endpoint.
+
+### The SAN rule lives here too
+
+`open_listeners` refuses to bind an address the endpoint certificate does not cover. That is
+the invariant that does not depend on the UI: whatever reaches the config — a crafted POST, a
+hand-edited file, a stale page — nothing puts a listener on an address it cannot present a
+matching certificate for. The refusal is reported as an ordinary bind failure, so the operator
+is told which address and offered the regeneration, rather than the endpoint refusing to serve
+at all.
