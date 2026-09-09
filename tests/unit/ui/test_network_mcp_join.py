@@ -38,6 +38,7 @@ from workstation_agent.network_mcp import join as join_module
 from workstation_agent.network_mcp.credentials import ensure_token
 from workstation_agent.network_mcp.enrolment import EnrolmentError, JoinStatus
 from workstation_agent.network_mcp.join import CoreRefusedError
+from workstation_agent.network_mcp.listeners import endpoint_url
 
 CODE = "PAIR-4417"
 CORE = "192.168.1.150:8053"
@@ -80,8 +81,11 @@ class FakeEndpoint:
 
     def info(self):
         return _Info(
-            url=f"https://{self.bind_hosts[0]}:8765/mcp",
-            urls=tuple(f"https://{h}:8765/mcp" for h in self.bind_hosts),
+            # ``endpoint_url``, not an f-string of our own: the real endpoint
+            # brackets an IPv6 literal, and a fake that does not would show the
+            # picker a label the product never produces.
+            url=endpoint_url(self.bind_hosts[0], 8765),
+            urls=tuple(endpoint_url(h, 8765) for h in self.bind_hosts),
             bind_host=self.bind_hosts[0],
             bind_hosts=self.bind_hosts,
             port=8765,
