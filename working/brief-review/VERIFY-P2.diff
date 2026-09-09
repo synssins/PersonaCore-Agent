@@ -1,0 +1,1493 @@
+diff --git a/.gitattributes b/.gitattributes
+new file mode 100644
+index 0000000..59361a3
+--- /dev/null
++++ b/.gitattributes
+@@ -0,0 +1,26 @@
++# Plugin signatures are raw Ed25519 bytes, not text.  Git's own guess ("is
++# this binary?") is a heuristic over the printable-byte ratio, and a signature
++# that happened to guess "text" would have its 0x0A bytes rewritten to 0x0D0A
++# on checkout under core.autocrlf=true — silently producing a 66-byte file that
++# can never verify.  Say it explicitly instead of relying on the guess.
++src/workstation_agent/plugins/**/signature.sig binary
++
++# Deliberately NOT pinning the plugins' *.py or *.toml here.  Both are safe, but
++# for different reasons, and the plugin.toml one is easy to misread:
++#
++#   *.py    — hashed after CRLF and lone CR are normalised to LF (see
++#             workstation_agent.mcp_host.loader), so the bytes on disk verify
++#             identically under core.autocrlf true, false and input.
++#
++#   *.toml  — never hashed as bytes at all.  The signature covers
++#             canonical_json(_manifest_dict(manifest)), i.e. the *parsed* fields;
++#             _parse_toml reads the file with Path.read_text, whose universal
++#             newline handling has already collapsed CRLF to LF before tomlkit
++#             ever sees it.  A manifest's line endings cannot reach the digest.
++#
++# Pinning either would buy nothing while rewriting the working tree of every
++# existing checkout on the next `git checkout`.
++#
++# If a non-Python file is ever added to a plugin's *signed* set — an extension
++# module, a sourceless .pyc, a data file — it is hashed byte-for-byte and MUST
++# be pinned here.
+diff --git a/scripts/sign_plugin.py b/scripts/sign_plugin.py
+new file mode 100644
+index 0000000..a725c1a
+--- /dev/null
++++ b/scripts/sign_plugin.py
+@@ -0,0 +1,152 @@
++"""Sign a plugin's ``signature.sig`` with the first-party Ed25519 key.
++
++Copyright (c) 2024 PersonaCore-Agent contributors. See LICENSE for details.
++
++Usage::
++
++    # key from the environment (preferred: nothing touches the shell history)
++    PC_AGENT_SIGNING_PRIVATE_KEY=<hex> \\
++        python scripts/sign_plugin.py src/workstation_agent/plugins/browser ...
++
++    # or point at the hex file directly (the file itself is never committed)
++    python scripts/sign_plugin.py --key-file working/signing/first_party.priv.hex \\
++        src/workstation_agent/plugins/browser ...
++
++    # re-sign every bundled plugin that already carries a real signature
++    python scripts/sign_plugin.py --all-bundled
++
++The message signed is produced by
++:func:`workstation_agent.mcp_host.loader.signing_message` — the very function
++the loader verifies against — so the signer cannot drift from the verifier.  In
++particular the hash is newline-normalised for ``*.py`` files, which is what
++makes a signature valid under every ``core.autocrlf`` setting rather than only
++in the checkout that produced it.
++
++Safety rails:
++
++* A plugin whose ``signature.sig`` currently holds the ``UNSIGNED`` sentinel (or
++  is empty) is **skipped**, so the deliberately-unsigned canaries
++  (``hello_world``, ``claude_code_bridge``) cannot be signed by accident.  Pass
++  ``--replace-sentinel`` to override for a specific directory.
++* The private key is never echoed.  The derived *public* key is printed so the
++  operator can confirm which identity signed.
++* Every signature written is verified before the script exits non-zero/zero.
++"""
++
++from __future__ import annotations
++
++import argparse
++import os
++import sys
++from pathlib import Path
++
++from nacl.signing import SigningKey
++
++from workstation_agent.mcp_host import loader as _loader
++
++_ENV_VAR = "PC_AGENT_SIGNING_PRIVATE_KEY"
++_KEY_BYTES = 32
++_SENTINELS = (b"", b"UNSIGNED")
++_BUNDLED_DIR = Path(__file__).resolve().parents[1] / "src" / "workstation_agent" / "plugins"
++
++
++def _load_signing_key(key_file: Path | None) -> SigningKey:
++    """Return the Ed25519 signing key from *key_file* or the environment."""
++    if key_file is not None:
++        raw = key_file.read_text(encoding="utf-8").strip()
++        origin = str(key_file)
++    else:
++        raw = os.environ.get(_ENV_VAR, "").strip()
++        origin = f"env {_ENV_VAR}"
++    if not raw:
++        msg = f"no private key: set {_ENV_VAR} or pass --key-file"
++        raise SystemExit(msg)
++    try:
++        key_bytes = bytes.fromhex(raw)
++    except ValueError as exc:
++        msg = f"{origin} is not valid hex: {exc}"
++        raise SystemExit(msg) from exc
++    if len(key_bytes) != _KEY_BYTES:
++        msg = f"{origin} must decode to {_KEY_BYTES} bytes; got {len(key_bytes)}"
++        raise SystemExit(msg)
++    return SigningKey(key_bytes)
++
++
++def sign_plugin(
++    plugin_dir: Path,
++    signing_key: SigningKey,
++    *,
++    replace_sentinel: bool = False,
++) -> str:
++    """Sign the plugin at *plugin_dir*; return a one-line status for the caller."""
++    toml_path = plugin_dir / "plugin.toml"
++    if not toml_path.is_file():
++        return f"SKIP  {plugin_dir.name}: no plugin.toml"
++
++    sig_path = plugin_dir / "signature.sig"
++    if sig_path.exists() and sig_path.read_bytes() in _SENTINELS and not replace_sentinel:
++        return f"SKIP  {plugin_dir.name}: sentinel-unsigned (use --replace-sentinel to force)"
++
++    manifest = _loader._parse_toml(toml_path, source="signing")  # noqa: SLF001
++    if manifest is None:
++        return f"FAIL  {plugin_dir.name}: plugin.toml did not parse"
++
++    message = _loader.signing_message(manifest)
++    signature = signing_key.sign(message).signature
++    sig_path.write_bytes(signature)
++
++    pubkey = bytes(signing_key.verify_key)
++    result = _loader.verify(manifest, [pubkey], allow_unsigned=False)
++    if result.status != "valid":
++        return f"FAIL  {plugin_dir.name}: wrote signature but verify said {result.status}"
++    covered = _loader._covered_files(manifest.entry, manifest.plugin_dir)  # noqa: SLF001
++    names = ", ".join(label for label, _path in covered)
++    return f"OK    {plugin_dir.name}: signed over {len(covered)} file(s) [{names}]"
++
++
++def main() -> int:
++    p = argparse.ArgumentParser(prog="sign_plugin")
++    p.add_argument("plugin_dir", type=Path, nargs="*", help="plugin directories to sign")
++    p.add_argument(
++        "--all-bundled",
++        action="store_true",
++        help="sign every bundled plugin that is not sentinel-unsigned",
++    )
++    p.add_argument(
++        "--key-file",
++        type=Path,
++        default=None,
++        help=f"hex-encoded Ed25519 private key file (default: ${_ENV_VAR})",
++    )
++    p.add_argument(
++        "--replace-sentinel",
++        action="store_true",
++        help="also sign plugins whose signature.sig currently holds the UNSIGNED sentinel",
++    )
++    args = p.parse_args()
++
++    targets: list[Path] = list(args.plugin_dir)
++    if args.all_bundled:
++        targets.extend(sorted(d for d in _BUNDLED_DIR.iterdir() if (d / "plugin.toml").is_file()))
++    if not targets:
++        p.error("nothing to sign: pass plugin directories or --all-bundled")
++
++    signing_key = _load_signing_key(args.key_file)
++    print(f"signing identity (public key): {bytes(signing_key.verify_key).hex()}")
++
++    failed = False
++    for target in targets:
++        try:
++            line = sign_plugin(
++                target.resolve(), signing_key, replace_sentinel=args.replace_sentinel,
++            )
++        except Exception as exc:  # noqa: BLE001
++            line = f"FAIL  {target.name}: {exc}"
++        print(line)
++        failed = failed or line.startswith("FAIL")
++
++    return 1 if failed else 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/src/workstation_agent/mcp_host/loader.py b/src/workstation_agent/mcp_host/loader.py
+index e6a76ad..b84f0f8 100644
+--- a/src/workstation_agent/mcp_host/loader.py
++++ b/src/workstation_agent/mcp_host/loader.py
+@@ -12,15 +12,62 @@ Discovery sources (in precedence order — bundled first, then user-installed):
+ Each source yields :class:`PluginManifest` instances.  Duplicates (same
+ ``plugin_id``) are resolved by keeping the first occurrence (bundled wins).
+ 
+-Signature verification computes::
++Signature verification computes (see :func:`signing_message`)::
+ 
+-    message = canonical_json(manifest_dict) + b"\\n" + sha256(entry_bytes[0]) + ...
++    canonical_json(manifest) || b"\\n" || SCHEME || b"\\n"
++        || sha256(label_i) || digest(file_i)   for each covered file, in order
+ 
+ and tries each supplied public key against the ``signature.sig`` file next to
+ ``plugin.toml``.  If ``allow_unsigned`` is ``True`` a missing / zero-byte sig
+ file returns ``VerifyResult(status='unsigned')`` instead of ``'quarantined'``.
++
++Four properties of that message matter enough to spell out:
++
++**Line endings are normalised out of the hash for Python source.**
++``digest()`` translates ``CRLF`` and lone ``CR`` to ``LF`` before hashing a
++``*.py`` file (:func:`_file_digest`).  Without this, signature validity is a
++property of the *checkout*, not of the plugin: git's ``core.autocrlf`` decides
++what lands on disk, so a plugin signed in an ``autocrlf=false`` clone is
++``invalid`` in an ``autocrlf=true`` one and vice versa — and since
++``allow_unsigned`` defaults to false, the wrong clone ships with no working
++plugins and an error message that never mentions line endings.
++
++The normalisation is deliberately scoped to ``*.py``.  It makes the hash
++non-injective — a CRLF file and its LF twin share one signature — so it is only
++sound where the two byte sequences are *the same program*.  For Python source
++they are: CPython's tokenizer performs exactly this translation before
++compiling, so every member of a collision class produces an identical code
++object.  Any other file type is hashed byte-for-byte, because for, say, a
++``.ps1`` here-string or a data file the two forms are *not* equivalent and
++collapsing them would be a real weakening of the signature.
++
++The boundary of that guarantee, stated exactly: it covers the *compiled code
++object*.  Code that reads its own raw source at runtime — ``inspect.getsource``,
++``traceback`` rendering a source line, ``doctest``, ``Path(__file__).read_bytes()``
++— sees the un-normalised bytes, so two members of a collision class can differ
++there.  Nothing in the signature stops that, and a plugin that derives security
++decisions from its own source text is outside what this scheme promises.
++
++**Every importable file in a package plugin is covered.**
++:func:`_resolve_module_files` walks the whole package tree, not just
++``__init__.py`` / ``__main__.py``, and "importable" means every format CPython's
++import machinery loads — source, sourceless bytecode, and extension modules
++(``.pyd`` / ``.so`` / ``.dylib``), not merely ``*.py``.  Covering only the two
++dunder sources left every other submodule outside the signature; covering only
++``*.py`` left a native ``submodule.pyd`` outside it, which is the same hole one
++file extension over.  Because the covered set is "all of them", adding,
++renaming, moving, or editing any of them changes the message and the plugin
++fails loudly as ``invalid``; there is no quiet path where a file is ignored.
++
++**Each digest is bound to the file's name.**  The message pairs
++``sha256(label)`` with each content digest.  Without that binding the message
++was a bare concatenation of digests, so any rename or directory move that
++preserved the sort order left the signed bytes byte-identical — and since the
++sort key is the relative path, renaming ``a.py``/``b.py`` to
++``a_evil.py``/``b_evil.py`` preserves it.  Deciding which module a given body of
++code is imported as is a capability worth signing.
+ """
+-# ruff: noqa: C901, PLR0912
++# ruff: noqa: C901
+ 
+ from __future__ import annotations
+ 
+@@ -76,6 +123,40 @@ class VerifyResult:
+ 
+ _SENTINEL_UNSIGNED = b"UNSIGNED"
+ 
++# Files CPython's import machinery will load from inside a package.  Fixed and
++# platform-independent on purpose: ``importlib.machinery.EXTENSION_SUFFIXES`` is
++# whatever the *running* interpreter accepts, so keying off it would make the
++# covered set depend on the signing host — a ``.so`` covered on Linux and
++# invisible on Windows.  Matching is on the final suffix, lowercased, which is
++# what ``Path.suffix`` yields for the decorated forms too
++# (``m.cp312-win_amd64.pyd`` → ``.pyd``, ``m.abi3.so`` → ``.so``).
++# ``test_importable_suffixes_cover_this_interpreter`` fails if CPython grows a
++# suffix this set does not contain.
++_IMPORTABLE_SUFFIXES = frozenset(
++    {".py", ".pyw", ".pyc", ".pyo", ".pyd", ".so", ".dll", ".dylib"},
++)
++
++# The subset of the above that CPython compiles from text.  ``.pyw`` is in
++# ``importlib.machinery.SOURCE_SUFFIXES`` on Windows and is imported exactly
++# like ``.py``, so it gets the same newline normalisation; treating it as opaque
++# bytes would make a ``.pyw`` submodule checkout-dependent all over again.
++_SOURCE_SUFFIXES = frozenset({".py", ".pyw"})
++
++# ``__pycache__`` is excluded from the covered set.  It is a derived cache that
++# CPython rewrites on first import with the source's mtime and size baked in, so
++# hashing it would invalidate every signature the moment the plugin ran once.
++# The dangerous form of bytecode — a sourceless ``pkg/mod.pyc``, which the import
++# machinery loads directly — does NOT live in ``__pycache__`` and IS covered.
++# What remains uncovered is cache poisoning of an already-covered source file,
++# which no file-set policy can catch; the mitigation for that is to launch
++# plugins with bytecode writing disabled and hash-based .pyc checking forced,
++# which belongs to the supervisor, not to the signature.
++_BYTECODE_CACHE_DIR = "__pycache__"
++
++# Domain separator for the signed message.  Bumping it makes a signature from an
++# older scheme fail cleanly rather than being reinterpreted under the new rules.
++_SIGNING_SCHEME = b"workstation-agent/plugin-signature/2"
++
+ 
+ def _parse_toml(path: Path, source: str = "unknown") -> PluginManifest | None:
+     """Parse *path* and return a :class:`PluginManifest`, or ``None`` on error."""
+@@ -232,74 +313,218 @@ def _manifest_dict(manifest: PluginManifest) -> dict[str, Any]:
+     }
+ 
+ 
+-def _resolve_module_paths(module_name: str) -> list[Path]:
+-    """Return the .py files backing *module_name* (single file or package)."""
++def normalise_newlines(data: bytes) -> bytes:
++    """Translate ``CRLF`` and lone ``CR`` to ``LF``.
++
++    This is byte-for-byte what CPython's tokenizer does to a source file before
++    compiling it, which is why applying it inside the signature hash is safe for
++    Python source: the byte sequences it collapses together compile to the same
++    code object.
++    """
++    return data.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
++
++
++def _is_python_source(path: Path) -> bool:
++    """Whether *path* is Python source, matched case-insensitively.
++
++    Case folding is not cosmetic.  ``rglob`` matches ``EVIL.PY`` on a
++    case-insensitive filesystem and not on a case-sensitive one, so a
++    case-sensitive ``== ".py"`` test gave one file three different treatments
++    depending on the host: normalised on Linux, hashed raw on Windows, invisible
++    to discovery elsewhere.  The covered set and the way each file is hashed
++    must both be properties of the plugin, not of the filesystem it sits on.
++    """
++    return path.suffix.lower() in _SOURCE_SUFFIXES
++
++
++def _file_digest(path: Path) -> bytes:
++    """SHA-256 of *path*, newline-normalised for Python source only.
++
++    Python source is hashed after :func:`normalise_newlines` so the signature
++    survives any ``core.autocrlf`` setting, any platform, and any archive that
++    rewrites text.  Everything else — extension modules, bytecode, data — is
++    hashed raw: for those the CRLF and LF forms are genuinely different content
++    and must not share a signature.
++    """
++    data = path.read_bytes()
++    if _is_python_source(path):
++        data = normalise_newlines(data)
++    return hashlib.sha256(data).digest()
++
++
++def _sorted_importable_files(root: Path) -> list[Path]:
++    """Every file under *root* that CPython can import, in an OS-independent order.
++
++    "Importable" is not "``*.py``".  Python's import machinery loads extension
++    modules (``.pyd`` on Windows, ``.so``/``.dylib`` on POSIX) and sourceless
++    bytecode (``.pyc``) natively, so a set restricted to source leaves a
++    ``submodule.pyd`` dropped beside the covered files hashed by nothing at all
++    — arbitrary native code executing under a ``valid`` signature.
++
++    The sort key is the ``/``-joined path relative to *root*.  Sorting
++    :class:`~pathlib.Path` objects directly would not do: on Windows their
++    comparison is case-insensitive and on POSIX it is not, so a package with
++    files differing only in case would hash in a different order on each OS and
++    the signature would again depend on where it was made.
++    """
++    files = [
++        p
++        for p in root.rglob("*")
++        if p.suffix.lower() in _IMPORTABLE_SUFFIXES
++        and _BYTECODE_CACHE_DIR not in p.relative_to(root).parts
++        and p.is_file()
++    ]
++    return sorted(files, key=lambda p: p.relative_to(root).as_posix())
++
++
++def _resolve_module_files(module_name: str) -> list[tuple[str, Path]]:
++    """Return ``(label, path)`` for every importable file backing *module_name*.
++
++    For a package this is the **whole tree**, recursively.  Covering only
++    ``__init__.py`` and ``__main__.py`` (as this once did) left every other
++    submodule unsigned while :func:`verify` still answered ``valid``.
++
++    The label is the module-relative name of the file, e.g.
++    ``workstation_agent.plugins.browser/deep/tool.py``.  It is deliberately not
++    the absolute path, which varies per install, and deliberately not omitted,
++    which is what let a file be renamed inside a signed package for free.
++    """
+     try:
+         spec = importlib.util.find_spec(module_name)
+     except (ImportError, ValueError):
+         return []
+     if spec is None:
+         return []
+-    paths: list[Path] = []
+-    if spec.origin and spec.origin != "built-in":
+-        paths.append(Path(spec.origin))
++
+     if spec.submodule_search_locations:  # it's a package
++        out: list[tuple[str, Path]] = []
+         for loc in spec.submodule_search_locations:
+-            pkg_dir = Path(loc)
+-            for name in ("__init__.py", "__main__.py"):
+-                p = pkg_dir / name
+-                if p.exists() and p not in paths:
+-                    paths.append(p)
+-    return paths
++            root = Path(loc)
++            out.extend(
++                (f"{module_name}/{p.relative_to(root).as_posix()}", p)
++                for p in _sorted_importable_files(root)
++            )
++        return out
+ 
++    if spec.origin and spec.origin != "built-in":
++        origin = Path(spec.origin)
++        if origin.is_file():
++            return [(f"{module_name}{origin.suffix}", origin)]
++    return []
++
++
++def _resolve_module_paths(module_name: str) -> list[Path]:
++    """Paths only, for callers that do not need the signing labels."""
++    return [p for _label, p in _resolve_module_files(module_name)]
+ 
+-def _entry_file_paths(entry: list[str], plugin_dir: Path) -> list[Path]:
+-    """Resolve entry command to the set of code files whose hash is signed.
++
++def _plugin_dir_files(plugin_dir: Path) -> list[tuple[str, Path]]:
++    """Labelled fallback set: every importable file under *plugin_dir*."""
++    return [
++        (p.relative_to(plugin_dir).as_posix(), p) for p in _sorted_importable_files(plugin_dir)
++    ]
++
++
++def _covered_files(entry: list[str], plugin_dir: Path) -> list[tuple[str, Path]]:
++    """Resolve entry command to the ``(label, path)`` pairs the signature covers.
++
++    The *label* is the name the file is signed under.  It is what stops a file
++    inside a signed package from being renamed or moved for free: the message
++    used to be a bare concatenation of content digests, so any rename that
++    preserved the sort order — and the sort key *is* the relative path — left
++    the signed bytes identical.  Changing which module a given body of code is
++    imported as is a real capability, so each digest is now bound to its name.
++
++    Labels are location-independent: module-relative for a ``-m`` entry,
++    plugin-dir-relative for the fallback scan, and the literal manifest argument
++    for a positional file.  An absolute install path would differ per machine
++    and reintroduce exactly the class of fragility this module exists to avoid.
+ 
+     For ``-m <module>`` entries, uses :func:`importlib.util.find_spec` to
+-    resolve the module.  For plain module files, hashes the single file.
+-    For packages, hashes ``__init__.py`` and ``__main__.py`` (both if present).
+-    Also collects any positional argument that resolves to an existing file
+-    on disk (either absolute or relative to *plugin_dir*).
++    resolve the module.  For a package this covers every importable file in the
++    tree; for a plain module file, that one file.  Also collects any positional
++    argument that resolves to an existing file on disk (either absolute or
++    relative to *plugin_dir*).
+ 
+     When a ``-m <module>`` entry cannot be resolved via ``sys.path`` (typical
+     for external user-installed plugins under ``%APPDATA%\\WorkstationAgent
+-    \\plugins\\``), falls back to hashing every ``*.py`` file under
+-    *plugin_dir* (recursively, deterministic order) so the signature always
+-    covers the plugin's code.  Likewise, if the entry produces zero paths
+-    (e.g. entry is just ``["python"]``), falls back to hashing every ``*.py``
+-    under *plugin_dir* so the signature is never trivially empty.
++    \\plugins\\``), falls back to every importable file under *plugin_dir*
++    (recursively, deterministic order) so the signature always covers the
++    plugin's code.  Likewise, if the entry produces zero paths (e.g. entry is
++    just ``["python"]``), falls back to the same scan so the signature is never
++    trivially empty.
+     """
+-    paths: list[Path] = []
++    covered: list[tuple[str, Path]] = []
++    seen: set[Path] = set()
++
++    def _add(label: str, path: Path) -> None:
++        if path not in seen:
++            seen.add(path)
++            covered.append((label, path))
++
+     it = iter(entry)
+     for arg in it:
+         if arg == "-m":
+             module_name = next(it, None)
+             if module_name is None:
+                 break
+-            resolved = _resolve_module_paths(module_name)
+-            if resolved:
+-                for p in resolved:
+-                    if p not in paths:
+-                        paths.append(p)
+-            else:
++            resolved = _resolve_module_files(module_name)
++            if not resolved:
+                 # External plugin whose module isn't on sys.path.
+-                # Hash every .py file under plugin_dir (recursive, deterministic).
+-                for py_path in sorted(plugin_dir.rglob("*.py")):
+-                    if py_path not in paths:
+-                        paths.append(py_path)
++                resolved = _plugin_dir_files(plugin_dir)
++            for label, path in resolved:
++                _add(label, path)
+         else:
+             candidate = Path(arg)
+             if not candidate.is_absolute():
+                 candidate = plugin_dir / arg
+             if candidate.is_file():
+-                paths.append(candidate)
+-    # Fallback: if entry produced ZERO paths (e.g. entry is ["python"] with
+-    # no -m and no positional file), hash every .py in plugin_dir so the
+-    # signature is never trivially empty.
+-    if not paths:
+-        paths = sorted(plugin_dir.rglob("*.py"))
+-    return paths
++                _add(arg, candidate)
++
++    if not covered:
++        for label, path in _plugin_dir_files(plugin_dir):
++            _add(label, path)
++    return covered
++
++
++def _entry_file_paths(entry: list[str], plugin_dir: Path) -> list[Path]:
++    """Paths only, for callers that do not need the signing labels."""
++    return [p for _label, p in _covered_files(entry, plugin_dir)]
++
++
++def signing_message(manifest: PluginManifest) -> bytes:
++    """Return the exact bytes a plugin signature is made over.
++
++    Single source of truth for :func:`verify`, ``scripts/sign_plugin.py`` and
++    the test fixtures, so the signer and the verifier cannot drift apart.
++
++    Layout::
++
++        canonical_json(manifest) || b"\\n" || SCHEME || b"\\n"
++            || sha256(label_0) || digest(file_0)
++            || sha256(label_1) || digest(file_1)
++            || ...
++
++    Each covered file contributes a fixed 64 bytes — 32 for its name, 32 for its
++    content — so the encoding is unambiguous without a separator: no arrangement
++    of labels can be reparsed as a different one, and ``a/b.py`` cannot collide
++    with ``a`` plus ``/b.py``.
++
++    Raises:
++        OSError: if a file the signature must cover cannot be read.  Callers in
++            :func:`verify` turn this into ``status='invalid'`` — a plugin whose
++            covered code is unreadable is not a plugin we will run.
++    """
++    parts = [
++        _sig.canonical_json(_manifest_dict(manifest)),
++        b"\n",
++        _SIGNING_SCHEME,
++        b"\n",
++    ]
++    for label, path in _covered_files(manifest.entry, manifest.plugin_dir):
++        parts.append(hashlib.sha256(label.encode("utf-8")).digest())
++        parts.append(_file_digest(path))
++    return b"".join(parts)
+ 
+ 
+ def _verify_inner(
+@@ -311,11 +536,11 @@ def _verify_inner(
+     if len(raw_sig) != 64:  # noqa: PLR2004
+         return VerifyResult(status="invalid", reason=f"bad signature length: {len(raw_sig)}")
+ 
+-    manifest_bytes = _sig.canonical_json(_manifest_dict(manifest))
+-    entry_paths = _entry_file_paths(manifest.entry, manifest.plugin_dir)
+-    entry_hash_parts = [hashlib.sha256(p.read_bytes()).digest() for p in entry_paths]
+-
+-    message = manifest_bytes + b"\n" + b"".join(entry_hash_parts)
++    try:
++        message = signing_message(manifest)
++    except OSError as exc:
++        log.warning("plugin %s: cannot hash covered file: %s", manifest.id, exc)
++        return VerifyResult(status="invalid", reason=f"unreadable signed file: {exc}")
+ 
+     for pubkey in pubkeys:
+         if _sig.verify(pubkey, message, raw_sig):
+diff --git a/src/workstation_agent/plugins/browser/signature.sig b/src/workstation_agent/plugins/browser/signature.sig
+index f8b2390b90539583ff6281239b432b5334dab595..190f286c1e01ada1df4dd80df0fc9819883ca152 100644
+GIT binary patch
+literal 64
+zcmV-G0KfmK6Dy6K>lE9l$^87kO$_7Q@2&nWxOu%Q?7*W&H;)j&)XpC>OVP8iC$P~Q
+WMm2)hp(fAK)rtA(@%i~?PM8g`@g*bx
+
+literal 64
+zcmV-G0Kfk?2zmCTAg653Xn5>tj9~WOhBbFM6bVwQJWa|1v7CAAT>xfSn$M|pE~QFp
+WC8-gi^3xcMkns@tj=Yg9kl_K_jvnU#
+
+diff --git a/src/workstation_agent/plugins/clipboard/signature.sig b/src/workstation_agent/plugins/clipboard/signature.sig
+index bf4afde19ebc39ccaceb3a733d01bf282f36f350..7a7bb05af00cd3022dd276a8463d3cfeea33c225 100644
+GIT binary patch
+literal 64
+zcmV-G0Kfkl-)vo$ILjTY8$fG~n%;NPc8u~)#N~#8*=0b%2#g8LfaSs{nEDI&?qb7|
+W5ak?Z{JA(GU7YedTQ@TY;=lzn@*sEs
+
+literal 64
+zcmV-G0KflFb<{6xynrsH(!o|vN4|^9NnJzOvf1aIsiZ)JFK*!94m@B0LB^U{*}n-&
+WV@1nBVJzqtVCmKVQ}|?YRS^y$h98jt
+
+diff --git a/src/workstation_agent/plugins/desktop_control/signature.sig b/src/workstation_agent/plugins/desktop_control/signature.sig
+index 3e9deb69da321780e2338aecd20f059d387af950..70df3db086f82c777748e264e45f6621aac3d2b7 100644
+GIT binary patch
+literal 64
+zcmV-G0Kfk~7R<Y7n%DP1-jrtM2_JJ$2>6b6Lj5B-lK!H~PZZasmQD1EK;k-M)n@WB
+Wfezo!c+yeo%~h+e1f^A7OeqgOvmmJe
+
+literal 64
+zcmV-G0Kfm)xLe0*VPh&@tN~d#77;K){o;fE!9w7Lf**Qb5Tdv9`yOsG1;z{eKFTsv
+W_{FH`sN|9%EHUe+0Hx%gu{a9p^B;-;
+
+diff --git a/src/workstation_agent/plugins/filesystem/signature.sig b/src/workstation_agent/plugins/filesystem/signature.sig
+index ccfa548fd5660333767157665ab5e395abfb95a1..565e5faf1cbb0bd5a1b9cdf019ba7b160eb3527c 100644
+GIT binary patch
+literal 64
+zcmV-G0KfluHrZufXx_8RHk-#Xrqll|k1=fkYE!MZQX7>1n@5r$O>dnKWafczK=B`|
+WUs8e194c2L`yRHt{*6P0#nJ))=pQct
+
+literal 64
+zcmV-G0KflCsIxyfj)QF%+Ccd*3tsEPIS#w-K5IrG6N{<C-+|nuw1;pT3C#q=o0DZ$
+WulF;ea(nGhkSm*i&&?9T{D=<X4<Ek(
+
+diff --git a/src/workstation_agent/plugins/powershell/signature.sig b/src/workstation_agent/plugins/powershell/signature.sig
+index 28fed1f8421d8519bc039a1ef79cf6a0e01e5115..0dae87665ee5a3d4ce91daae05b30756dc57ef30 100644
+GIT binary patch
+literal 64
+zcmV-G0Kfm?-W6Wbe&>)KbhU|LNuF~bC|lMD!gdi6E2KL`LBZ=LyY_*xA|cf+&#P8q
+WGjyxu;1L(y$Du$pm;q>=q9F#{`yF@y
+
+literal 64
+zcmV-G0KfnIZHH;z^-p_r+bnr&P~22EhIHS6b2d>?vSpzA|58TFD06Q`WwJ<D@S2v>
+W`H*xWcsF>U^wr}tJY7m2&T$1!8z9C2
+
+diff --git a/src/workstation_agent/plugins/screen_vision/signature.sig b/src/workstation_agent/plugins/screen_vision/signature.sig
+index db6aa0079b6230c8be7ea35525221ac38e9b52b5..8f7ab73e5106e90de18ef88b32dfee46c9af0f58 100644
+GIT binary patch
+literal 64
+zcmV-G0KfkSmHI(6+Ya6ti(z3^Eo;HZ6^id2Jts90py($)T#}WTU8=^54H|-HoZ_pK
+Wr<wv-wipP2NyqJ0p$S@)lH?7I<Q$Ix
+
+literal 64
+zcmV-G0KfmpD3};PRk*t|#{1bm3fUby^~LWpPLcXJV4G}?r4^$q-Od4BQ<P;25X>2)
+WVN1c()p!iMzxn^Wh>U=sB@_Y$TOWl0
+
+diff --git a/tests/fakes/gen_test_keypair.py b/tests/fakes/gen_test_keypair.py
+index a20bb54..c98b9cb 100644
+--- a/tests/fakes/gen_test_keypair.py
++++ b/tests/fakes/gen_test_keypair.py
+@@ -23,14 +23,12 @@ The fixture:
+ from __future__ import annotations
+ 
+ import contextlib
+-import hashlib
+ from pathlib import Path
+ 
+ import pytest
+ from nacl.signing import SigningKey
+ 
+ import workstation_agent.mcp_host.loader as _loader
+-import workstation_agent.security.signature as _sig
+ 
+ _HELLO_WORLD_DIR = (
+     Path(__file__).resolve().parents[2]
+@@ -42,16 +40,41 @@ _HELLO_WORLD_DIR = (
+ _SIG_FILE = _HELLO_WORLD_DIR / "signature.sig"
+ 
+ 
+-def _build_message(manifest_dict: dict, plugin_dir: Path, entry: list[str]) -> bytes:
++def _hello_world_manifest() -> _loader.PluginManifest:
++    """The bundled hello_world manifest, or an equivalent built from scratch.
++
++    The fallback exists for the case where bundled discovery finds nothing (a
++    stripped install); it must describe the same plugin so the signature the
++    fixture writes is one the loader would accept.
++    """
++    discovered = next(
++        (m for m in _loader._discover_bundled() if m.id == "hello_world"), None,
++    )
++    if discovered is not None:
++        return discovered
++    return _loader.PluginManifest(
++        id="hello_world",
++        name="Hello World",
++        version="0.1.0",
++        runtime="python",
++        entry=["-m", "workstation_agent.plugins.hello_world"],
++        plugin_dir=_HELLO_WORLD_DIR,
++        signature_file=_SIG_FILE,
++        compat={"min_host_version": "0.1.0"},
++    )
++
++
++def _build_message(manifest: _loader.PluginManifest) -> bytes:
+     """Reproduce the exact message that loader.verify() checks.
+ 
+-    Delegates to :func:`loader._entry_file_paths` so any change to the loader's
+-    hash-set is picked up automatically.
++    Delegates wholesale to :func:`loader.signing_message` rather than
++    reassembling the format here.  Reimplementing it is how this fixture went
++    stale the last two times the message changed — first when file hashing
++    gained newline normalisation, then when each digest gained its path binding
++    and the scheme tag.  There is one definition of the message and this is not
++    a second copy of it.
+     """
+-    manifest_bytes = _sig.canonical_json(manifest_dict)
+-    entry_paths = _loader._entry_file_paths(entry, plugin_dir)
+-    entry_hash_parts = [hashlib.sha256(p.read_bytes()).digest() for p in entry_paths]
+-    return manifest_bytes + b"\n" + b"".join(entry_hash_parts)
++    return _loader.signing_message(manifest)
+ 
+ 
+ @pytest.fixture(scope="session")
+@@ -61,29 +84,10 @@ def signed_hello_world_keypair():
+     Yields:
+         Tuple of (public_key_bytes: bytes, signing_key: nacl.signing.SigningKey).
+     """
+-    manifest_list = _loader._discover_bundled()
+-    hello_manifest = next((m for m in manifest_list if m.id == "hello_world"), None)
+-
+     signing_key = SigningKey.generate()
+     pubkey_bytes = bytes(signing_key.verify_key)
+ 
+-    if hello_manifest is not None:
+-        manifest_dict = _loader._manifest_dict(hello_manifest)
+-        message = _build_message(manifest_dict, hello_manifest.plugin_dir, hello_manifest.entry)
+-    else:
+-        manifest_dict = {
+-            "id": "hello_world",
+-            "name": "Hello World",
+-            "version": "0.1.0",
+-            "runtime": "python",
+-            "entry": ["-m", "workstation_agent.plugins.hello_world"],
+-            "declared_permissions": [],
+-            "confirmable_conditions": [],
+-            "compat": {"min_host_version": "0.1.0"},
+-        }
+-        message = _build_message(manifest_dict, _HELLO_WORLD_DIR, [])
+-
+-    signed = signing_key.sign(message)
++    signed = signing_key.sign(_build_message(_hello_world_manifest()))
+     signature = signed.signature
+ 
+     original_sig = _SIG_FILE.read_bytes() if _SIG_FILE.exists() else b"UNSIGNED"
+diff --git a/tests/unit/mcp_host/test_loader.py b/tests/unit/mcp_host/test_loader.py
+index 0051029..08270be 100644
+--- a/tests/unit/mcp_host/test_loader.py
++++ b/tests/unit/mcp_host/test_loader.py
+@@ -9,7 +9,6 @@ from pathlib import Path
+ 
+ from nacl.signing import SigningKey
+ 
+-import workstation_agent.security.signature as _sig
+ from workstation_agent.mcp_host import loader
+ 
+ _HELLO_WORLD_DIR = (
+@@ -181,10 +180,7 @@ def test_verify_valid_signature(tmp_path):
+     m = loader._parse_toml(toml_path)
+     assert m is not None
+ 
+-    manifest_dict = loader._manifest_dict(m)
+-    msg = _sig.canonical_json(manifest_dict) + b"\n"
+-    signed = signing_key.sign(msg)
+-
++    signed = signing_key.sign(loader.signing_message(m))
+     m.signature_file.write_bytes(signed.signature)
+ 
+     result = loader.verify(m, [pubkey], allow_unsigned=False)
+@@ -206,9 +202,7 @@ def test_verify_wrong_key(tmp_path):
+     m = loader._parse_toml(toml_path)
+     assert m is not None
+ 
+-    manifest_dict = loader._manifest_dict(m)
+-    msg = _sig.canonical_json(manifest_dict) + b"\n"
+-    signed = signing_key1.sign(msg)
++    signed = signing_key1.sign(loader.signing_message(m))
+     m.signature_file.write_bytes(signed.signature)
+ 
+     result = loader.verify(m, [pubkey2])
+@@ -260,14 +254,7 @@ def _sign_hello_world_bundle(pubkey_bytes: bytes, signing_key: SigningKey) -> No
+     """Re-sign the bundled hello_world plugin with *signing_key* and register pubkey."""
+     manifests = loader._discover_bundled()
+     hw = next(m for m in manifests if m.id == "hello_world")
+-    manifest_dict = loader._manifest_dict(hw)
+-    manifest_bytes = _sig.canonical_json(manifest_dict)
+-    entry_paths = loader._entry_file_paths(hw.entry, hw.plugin_dir)
+-    entry_hash_parts = [
+-        hashlib.sha256(p.read_bytes()).digest() for p in entry_paths
+-    ]
+-    message = manifest_bytes + b"\n" + b"".join(entry_hash_parts)
+-    signed = signing_key.sign(message)
++    signed = signing_key.sign(loader.signing_message(hw))
+     hw.signature_file.write_bytes(signed.signature)
+     if pubkey_bytes not in loader.TRUSTED_PUBKEYS:
+         loader.TRUSTED_PUBKEYS.append(pubkey_bytes)
+@@ -332,12 +319,7 @@ def test_entry_file_paths_hashes_external_plugin_dir_when_module_not_on_syspath(
+     pubkey = bytes(signing_key.verify_key)
+     m = loader._parse_toml(plugin_dir / "plugin.toml")
+     assert m is not None
+-    manifest_dict = loader._manifest_dict(m)
+-    manifest_bytes = _sig.canonical_json(manifest_dict)
+-    entry_paths = loader._entry_file_paths(m.entry, m.plugin_dir)
+-    entry_hash_parts = [hashlib.sha256(p.read_bytes()).digest() for p in entry_paths]
+-    message = manifest_bytes + b"\n" + b"".join(entry_hash_parts)
+-    signed = signing_key.sign(message)
++    signed = signing_key.sign(loader.signing_message(m))
+     m.signature_file.write_bytes(signed.signature)
+ 
+     # Unmodified: valid.
+diff --git a/tests/unit/mcp_host/test_signature_portability.py b/tests/unit/mcp_host/test_signature_portability.py
+new file mode 100644
+index 0000000..0bd7cd0
+--- /dev/null
++++ b/tests/unit/mcp_host/test_signature_portability.py
+@@ -0,0 +1,680 @@
++"""Plugin signatures must not depend on how the repo was checked out.
++
++Two defects are pinned here.
++
++**1. Line endings.**  The hash used to run over the raw bytes of each ``*.py``
++file.  This repo has ``core.autocrlf=true`` and no ``.gitattributes``, so the
++bundled plugins land on disk as CRLF and were signed over CRLF bytes — but the
++blobs in git are LF, so a clone made with ``core.autocrlf=false`` (or ``input``)
++gets LF on disk and every one of those signatures becomes ``invalid``.  Since
++``allow_unsigned`` defaults to false, that clone ships with no working plugins
++and an error that never mentions line endings.  The tests below construct the
++byte-form each ``core.autocrlf`` setting actually produces and verify the real
++shipped ``signature.sig`` against every one of them.
++
++**2. Submodule coverage.**  ``_resolve_module_files`` used to hash only
++``__init__.py`` and ``__main__.py`` of a package plugin, so any other submodule
++ran unsigned while ``verify()`` still answered ``valid``.  The tests below build
++a real multi-module package, sign it, and prove that touching *or adding* any
++submodule anywhere in the tree flips the result to ``invalid``.
++
++**3. Importable-but-not-source.**  Covering ``*.py`` still left ``.pyd`` /
++``.so`` / sourceless ``.pyc`` — all of which CPython imports natively — hashed
++by nothing, which is defect 2 one file extension over.
++
++**4. Unnamed digests.**  The message was a bare concatenation of content
++digests, so any rename or move preserving the sort order left it byte-identical
++and the signature valid.  Each digest is now bound to the file's name.
++
++**5. Case-sensitive suffix matching.**  ``rglob("*.py")`` matches ``EVIL.PY`` on
++a case-insensitive filesystem while ``suffix == ".py"`` does not, so one file
++got three different treatments depending on the host.
++"""
++
++from __future__ import annotations
++
++import importlib
++import importlib.machinery
++import shutil
++import subprocess
++from pathlib import Path
++
++import pytest
++from nacl.signing import SigningKey
++
++from workstation_agent.mcp_host import loader
++from workstation_agent.security.first_party_pubkey import FIRST_PARTY_PUBKEY
++
++_REPO_ROOT = Path(__file__).resolve().parents[3]
++_PLUGINS_DIR = _REPO_ROOT / "src" / "workstation_agent" / "plugins"
++
++# Bundled plugins carrying a real first-party signature.
++SIGNED_PLUGINS = [
++    "browser",
++    "clipboard",
++    "desktop_control",
++    "filesystem",
++    "powershell",
++    "screen_vision",
++]
++
++# Bundled plugins that must stay on the b"UNSIGNED" sentinel.
++SENTINEL_PLUGINS = ["hello_world", "claude_code_bridge"]
++
++_SENTINEL = b"UNSIGNED"
++
++# Snapshot taken at import (i.e. during collection, before any test body runs)
++# because other modules in this suite legitimately overwrite hello_world's
++# signature.sig for the duration of a test and restore it afterwards.
++_SENTINEL_SIG_AT_IMPORT = {
++    pid: (_PLUGINS_DIR / pid / "signature.sig").read_bytes() for pid in SENTINEL_PLUGINS
++}
++
++
++# --------------------------------------------------------------------------
++# The three byte-forms `git checkout` can put on disk.
++#
++#   core.autocrlf=true   text blobs (LF in the index) are expanded to CRLF
++#   core.autocrlf=false  no conversion — the working tree is the blob, i.e. LF
++#   core.autocrlf=input  no conversion on checkout — also LF
++#
++# "cr_only" is not a git setting; it is the pathological classic-Mac form,
++# included because CPython's tokenizer accepts a lone CR as a line terminator
++# and therefore so must the hash.
++# --------------------------------------------------------------------------
++
++
++def _to_lf(data: bytes) -> bytes:
++    return data.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
++
++
++def _to_crlf(data: bytes) -> bytes:
++    return _to_lf(data).replace(b"\n", b"\r\n")
++
++
++def _to_cr(data: bytes) -> bytes:
++    return _to_lf(data).replace(b"\n", b"\r")
++
++
++CHECKOUT_FORMS = {
++    "autocrlf=true": _to_crlf,
++    "autocrlf=false": _to_lf,
++    "autocrlf=input": _to_lf,
++    "cr_only": _to_cr,
++}
++
++
++def _materialise(plugin_id: str, dest: Path, transform) -> Path:
++    """Copy a bundled plugin into *dest*, rewriting text files to one EOL form.
++
++    ``signature.sig`` is copied byte-for-byte: it is the shipped signature and
++    the whole point of the exercise is that it still verifies.
++    """
++    src = _PLUGINS_DIR / plugin_id
++    out = dest / plugin_id
++    out.mkdir(parents=True)
++    for f in sorted(src.iterdir()):
++        if not f.is_file():
++            continue
++        if f.suffix in {".py", ".toml"}:
++            (out / f.name).write_bytes(transform(f.read_bytes()))
++        else:
++            shutil.copy2(f, out / f.name)
++    return out
++
++
++def _relocated_resolver(root: Path):
++    """Stand-in for ``loader._resolve_module_files`` pointing at a copied tree.
++
++    Reproduces the real labels exactly (``<module>/<relpath>``), so the message
++    under test is the one the shipped signature was made over — the *only*
++    difference being the bytes on disk.
++    """
++
++    def _resolve(module_name: str) -> list[tuple[str, Path]]:
++        return [
++            (f"{module_name}/{p.relative_to(root).as_posix()}", p)
++            for p in loader._sorted_importable_files(root)
++        ]
++
++    return _resolve
++
++
++@pytest.mark.parametrize("plugin_id", SIGNED_PLUGINS)
++@pytest.mark.parametrize("form", sorted(CHECKOUT_FORMS))
++def test_bundled_plugin_verifies_under_every_checkout_form(
++    plugin_id, form, tmp_path, monkeypatch,
++):
++    """The shipped signature.sig verifies against every on-disk line-ending form.
++
++    This is the regression that matters: a fresh clone on a machine with
++    ``core.autocrlf=false`` must not turn every first-party plugin invalid.
++    """
++    out = _materialise(plugin_id, tmp_path / form.replace("=", "_"), CHECKOUT_FORMS[form])
++
++    manifest = loader._parse_toml(out / "plugin.toml", source="test")
++    assert manifest is not None
++
++    # The entry is `-m workstation_agent.plugins.<id>`, which find_spec would
++    # resolve back to the real (CRLF) source tree.  Point it at the copy so the
++    # bytes under test are the ones we just wrote.
++    monkeypatch.setattr(loader, "_resolve_module_files", _relocated_resolver(out))
++
++    result = loader.verify(manifest, [FIRST_PARTY_PUBKEY], allow_unsigned=False)
++    assert result.status == "valid", (
++        f"{plugin_id} failed to verify with {form} line endings: {result.reason}"
++    )
++
++
++@pytest.mark.parametrize("plugin_id", SIGNED_PLUGINS)
++def test_bundled_plugin_message_is_identical_across_checkout_forms(
++    plugin_id, tmp_path, monkeypatch,
++):
++    """Stronger than 'all forms verify': all forms produce the same signed bytes.
++
++    If this holds, signature validity cannot depend on the checkout at all —
++    there is only one message to sign, whatever git wrote to disk.
++    """
++    messages = {}
++    for form, transform in CHECKOUT_FORMS.items():
++        out = _materialise(plugin_id, tmp_path / form.replace("=", "_"), transform)
++        manifest = loader._parse_toml(out / "plugin.toml", source="test")
++        assert manifest is not None
++        monkeypatch.setattr(loader, "_resolve_module_files", _relocated_resolver(out))
++        messages[form] = loader.signing_message(manifest)
++
++    distinct = set(messages.values())
++    assert len(distinct) == 1, f"{plugin_id} hashes differently per checkout form: {list(messages)}"
++
++
++@pytest.mark.parametrize("plugin_id", SIGNED_PLUGINS)
++def test_bundled_plugin_verifies_as_checked_out_here(plugin_id):
++    """The plugins verify in this worktree exactly as they sit on disk."""
++    manifest = next(m for m in loader._discover_bundled() if m.id == plugin_id)
++    result = loader.verify(manifest, [FIRST_PARTY_PUBKEY], allow_unsigned=False)
++    assert result.status == "valid", result.reason
++
++
++@pytest.mark.parametrize("plugin_id", SIGNED_PLUGINS)
++def test_bundled_plugin_verifies_against_the_committed_blob_bytes(
++    plugin_id, tmp_path, monkeypatch,
++):
++    """Same check, but using the bytes git *actually stores*, read out of the object DB.
++
++    ``autocrlf=false`` and ``autocrlf=input`` write the blob to disk verbatim,
++    so this is not a reconstruction of that checkout — it is that checkout.
++    """
++    src = _PLUGINS_DIR / plugin_id
++    out = tmp_path / plugin_id
++    out.mkdir(parents=True)
++    for f in sorted(src.iterdir()):
++        if not f.is_file():
++            continue
++        rel = f.relative_to(_REPO_ROOT).as_posix()
++        try:
++            blob = subprocess.run(  # noqa: S603
++                ["git", "cat-file", "-p", f"HEAD:{rel}"],  # noqa: S607
++                cwd=_REPO_ROOT,
++                capture_output=True,
++                check=True,
++            ).stdout
++        except (OSError, subprocess.CalledProcessError) as exc:
++            pytest.skip(f"git object for {rel} unavailable: {exc}")
++        (out / f.name).write_bytes(blob)
++
++    # signature.sig was rewritten in this change and its blob is only in the
++    # working tree until commit; use the on-disk signature with the blob code.
++    shutil.copy2(src / "signature.sig", out / "signature.sig")
++
++    manifest = loader._parse_toml(out / "plugin.toml", source="test")
++    assert manifest is not None
++    monkeypatch.setattr(loader, "_resolve_module_files", _relocated_resolver(out))
++
++    result = loader.verify(manifest, [FIRST_PARTY_PUBKEY], allow_unsigned=False)
++    assert result.status == "valid", (
++        f"{plugin_id} does not verify against its committed blob bytes: {result.reason}"
++    )
++
++
++@pytest.mark.parametrize("plugin_id", SENTINEL_PLUGINS)
++def test_sentinel_plugins_were_not_accidentally_signed(plugin_id, tmp_path):
++    """hello_world and claude_code_bridge stay on the UNSIGNED sentinel.
++
++    Asserted against ``_SENTINEL_SIG_AT_IMPORT`` rather than the live file:
++    ``tests/unit/mcp_host/test_loader.py`` and the ``signed_hello_world_keypair``
++    fixture temporarily overwrite ``hello_world/signature.sig`` with a real
++    test-key signature and restore it on teardown, so reading it mid-run says
++    nothing about what is committed.  Collection completes before any test body
++    executes, so the import-time snapshot is the checked-out state.
++    """
++    sig = _SENTINEL_SIG_AT_IMPORT[plugin_id]
++    assert sig == _SENTINEL, f"{plugin_id} signature.sig is no longer the sentinel"
++
++    # …and the sentinel still means "unsigned", not "valid".
++    out = _materialise(plugin_id, tmp_path, _to_lf)
++    (out / "signature.sig").write_bytes(sig)
++    manifest = loader._parse_toml(out / "plugin.toml", source="test")
++    assert manifest is not None
++    assert loader.verify(manifest, allow_unsigned=True).status == "unsigned"
++    assert loader.verify(manifest, allow_unsigned=False).status == "quarantined"
++
++
++# --------------------------------------------------------------------------
++# The normalisation itself, and its deliberate limits.
++# --------------------------------------------------------------------------
++
++
++def test_file_digest_is_line_ending_independent_for_python(tmp_path):
++    """A .py file hashes the same as CRLF, LF and CR."""
++    body = b"import sys\n\n\ndef go():\n    return 'x'\n"
++    digests = set()
++    for name, transform in (("lf", _to_lf), ("crlf", _to_crlf), ("cr", _to_cr)):
++        p = tmp_path / f"{name}.py"
++        p.write_bytes(transform(body))
++        digests.add(loader._file_digest(p))
++    assert len(digests) == 1, "a .py file's digest still depends on its line endings"
++
++
++def test_file_digest_is_byte_exact_for_non_python(tmp_path):
++    """Normalisation stays scoped to Python source.
++
++    The CRLF/LF collision is only sound because CPython's tokenizer collapses
++    the same pairs, so the colliding byte strings are literally the same
++    program.  That argument does not carry to a .ps1 here-string, a .json blob
++    or an executable, so those must still be hashed byte-for-byte.  If someone
++    widens the normalisation, this fails.
++    """
++    body = b"line one\nline two\n"
++    lf = tmp_path / "data.json"
++    crlf = tmp_path / "other.json"
++    lf.write_bytes(body)
++    crlf.write_bytes(_to_crlf(body))
++    assert loader._file_digest(lf) != loader._file_digest(crlf)
++
++
++def test_normalise_newlines_matches_cpython_tokenizer():
++    """The three forms of a source file compile to the same code object.
++
++    This is the security argument for hashing normalised bytes, executed rather
++    than asserted: the byte strings that now share a signature are exactly the
++    ones CPython cannot tell apart.
++    """
++    body = b"X = 1\nY = '''a\nb'''\n\n\ndef f():\n    return X, Y\n"
++    codes = {
++        compile(transform(body), "<t>", "exec").co_consts
++        for transform in (_to_lf, _to_crlf, _to_cr)
++    }
++    assert len(codes) == 1
++    normalised = {loader.normalise_newlines(t(body)) for t in (_to_lf, _to_crlf, _to_cr)}
++    assert normalised == {_to_lf(body)}
++
++
++def test_gitattributes_pins_signature_files_as_binary():
++    """signature.sig must never be run through git's text conversion.
++
++    Git currently guesses "binary" for a 64-byte Ed25519 signature from its
++    non-printable byte ratio.  That is a guess, not a contract; if it ever went
++    the other way, an autocrlf=true checkout would expand the 0x0A bytes and
++    produce a signature that cannot verify anywhere.
++    """
++    attrs = (_REPO_ROOT / ".gitattributes").read_text(encoding="utf-8")
++    rules = [
++        line.split("#", 1)[0].split()
++        for line in attrs.splitlines()
++        if line.strip() and not line.strip().startswith("#")
++    ]
++    assert any(
++        parts and parts[0].endswith("signature.sig") and "binary" in parts[1:] for parts in rules
++    ), ".gitattributes no longer pins plugin signature.sig as binary"
++
++
++# --------------------------------------------------------------------------
++# Submodule coverage: nothing in a package plugin escapes the signature.
++# --------------------------------------------------------------------------
++
++
++_PKG_NAME = "sig_coverage_probe_pkg"
++
++
++@pytest.fixture
++def signed_package_plugin(tmp_path, monkeypatch):
++    """A real importable package plugin with submodules, signed with a test key.
++
++    Yields ``(manifest, pubkey, pkg_dir)``.
++    """
++    root = tmp_path / "syspath_root"
++    pkg = root / _PKG_NAME
++    (pkg / "deep").mkdir(parents=True)
++    (pkg / "__init__.py").write_bytes(b"VERSION = '1'\n")
++    (pkg / "__main__.py").write_bytes(b"from . import helper\n\nhelper.go()\n")
++    (pkg / "helper.py").write_bytes(b"def go():\n    return 'safe'\n")
++    (pkg / "deep" / "__init__.py").write_bytes(b"")
++    (pkg / "deep" / "tool.py").write_bytes(b"LIMIT = 1\n")
++
++    monkeypatch.syspath_prepend(str(root))
++    importlib.invalidate_caches()
++
++    plugin_dir = tmp_path / "plugin"
++    plugin_dir.mkdir()
++    (plugin_dir / "plugin.toml").write_text(
++        'id = "probe"\nname = "Probe"\nversion = "0.0.1"\n'
++        f'runtime = "python"\nentry = ["-m", "{_PKG_NAME}"]\n'
++        "declared_permissions = []\nconfirmable_conditions = []\n",
++        encoding="utf-8",
++    )
++
++    manifest = loader._parse_toml(plugin_dir / "plugin.toml", source="test")
++    assert manifest is not None
++
++    signing_key = SigningKey.generate()
++    pubkey = bytes(signing_key.verify_key)
++    manifest.signature_file.write_bytes(signing_key.sign(loader.signing_message(manifest)).signature)
++
++    assert loader.verify(manifest, [pubkey], allow_unsigned=False).status == "valid"
++    return manifest, pubkey, pkg
++
++
++def test_package_signature_covers_every_submodule(signed_package_plugin):
++    """Every .py in the package tree is in the hash set, not just __init__/__main__."""
++    manifest, _pubkey, pkg = signed_package_plugin
++    covered = {
++        p.relative_to(pkg).as_posix()
++        for p in loader._entry_file_paths(manifest.entry, manifest.plugin_dir)
++    }
++    assert covered == {
++        "__init__.py",
++        "__main__.py",
++        "helper.py",
++        "deep/__init__.py",
++        "deep/tool.py",
++    }, covered
++
++
++@pytest.mark.parametrize("victim", ["helper.py", "deep/tool.py", "deep/__init__.py"])
++def test_tampering_with_a_submodule_invalidates_the_signature(signed_package_plugin, victim):
++    """Editing a submodule the old code ignored now fails loudly."""
++    manifest, pubkey, pkg = signed_package_plugin
++    target = pkg.joinpath(*victim.split("/"))
++    target.write_bytes(target.read_bytes() + b"\nBACKDOOR = True\n")
++
++    result = loader.verify(manifest, [pubkey], allow_unsigned=False)
++    assert result.status == "invalid", (
++        f"tampering with {victim} left the plugin verifying as {result.status}"
++    )
++
++
++def test_adding_a_submodule_invalidates_the_signature(signed_package_plugin):
++    """A file smuggled into a signed package cannot be silently ignored."""
++    manifest, pubkey, pkg = signed_package_plugin
++    (pkg / "smuggled.py").write_bytes(b"import os\n\nos.environ['PWNED'] = '1'\n")
++
++    result = loader.verify(manifest, [pubkey], allow_unsigned=False)
++    assert result.status == "invalid", (
++        f"an unsigned file added to the package left the plugin {result.status}"
++    )
++
++
++def test_removing_a_submodule_invalidates_the_signature(signed_package_plugin):
++    """Deleting covered code is a change too."""
++    manifest, pubkey, pkg = signed_package_plugin
++    (pkg / "helper.py").unlink()
++
++    result = loader.verify(manifest, [pubkey], allow_unsigned=False)
++    assert result.status == "invalid", result.status
++
++
++def test_package_signature_survives_line_ending_change_in_a_submodule(signed_package_plugin):
++    """…but a pure line-ending change is not a change to the program."""
++    manifest, pubkey, pkg = signed_package_plugin
++    for py in loader._sorted_importable_files(pkg):
++        py.write_bytes(_to_crlf(py.read_bytes()))
++
++    result = loader.verify(manifest, [pubkey], allow_unsigned=False)
++    assert result.status == "valid", result.reason
++
++
++def test_sorted_importable_files_order_by_relative_posix_path(tmp_path):
++    """Hash order is a pure function of the relative paths, not of OS collation."""
++    root = tmp_path / "pkg"
++    (root / "b").mkdir(parents=True)
++    for rel in ("z.py", "a.py", "b/c.py", "b/A.py"):
++        root.joinpath(*rel.split("/")).write_bytes(b"x = 1\n")
++
++    order = [p.relative_to(root).as_posix() for p in loader._sorted_importable_files(root)]
++    assert order == sorted(order), order
++    assert order == ["a.py", "b/A.py", "b/c.py", "z.py"]
++
++
++def test_unreadable_covered_file_fails_closed(tmp_path, monkeypatch):
++    """A covered file that cannot be read yields 'invalid', not an exception."""
++    plugin_dir = tmp_path / "plugin"
++    plugin_dir.mkdir()
++    (plugin_dir / "plugin.toml").write_text(
++        'id = "gone"\nname = "Gone"\nversion = "0.0.1"\n'
++        'runtime = "python"\nentry = ["python"]\n',
++        encoding="utf-8",
++    )
++    (plugin_dir / "code.py").write_bytes(b"x = 1\n")
++    manifest = loader._parse_toml(plugin_dir / "plugin.toml", source="test")
++    assert manifest is not None
++    manifest.signature_file.write_bytes(b"\x01" * 64)
++
++    def _boom(path):
++        # Stands in for the file being deleted between listing and hashing.
++        msg = f"vanished: {path}"
++        raise OSError(msg)
++
++    monkeypatch.setattr(loader, "_file_digest", _boom)
++    result = loader.verify(manifest, [b"\x00" * 32], allow_unsigned=False)
++    assert result.status == "invalid"
++    assert "unreadable" in result.reason
++
++
++# --------------------------------------------------------------------------
++# Rework cycle 1, finding 1: the covered set must be everything CPython
++# imports, not everything that ends in .py.
++# --------------------------------------------------------------------------
++
++
++@pytest.mark.parametrize(
++    "planted",
++    [
++        "native.pyd",  # Windows extension module
++        "native.so",  # POSIX extension module
++        "native.dylib",  # macOS extension module
++        "native.dll",  # ctypes / legacy extension
++        "sourceless.pyc",  # SourcelessFileLoader imports this directly
++        "deep/native.pyd",  # ...at any depth
++        "native.cp312-win_amd64.pyd",  # the decorated form Path.suffix trims
++        "native.abi3.so",
++    ],
++)
++def test_planted_importable_binary_invalidates_the_signature(signed_package_plugin, planted):
++    """A native module dropped beside covered sources must not ride a valid signature.
++
++    This is the original defect one file extension over: hashing ``*.py`` only
++    leaves ``submodule.pyd`` covered by nothing, and Python's import machinery
++    loads it natively -- arbitrary native code execution under ``status='valid'``.
++    """
++    manifest, pubkey, pkg = signed_package_plugin
++    target = pkg.joinpath(*planted.split("/"))
++    target.parent.mkdir(parents=True, exist_ok=True)
++    target.write_bytes(b"MZ\x90\x00" + b"\x00" * 64)  # PE-shaped; contents irrelevant
++
++    result = loader.verify(manifest, [pubkey], allow_unsigned=False)
++    assert result.status == "invalid", (
++        f"planting {planted} left the plugin verifying as {result.status}"
++    )
++
++
++def test_importable_suffixes_cover_this_interpreter():
++    """The fixed suffix set is a superset of what the running CPython will import.
++
++    ``_IMPORTABLE_SUFFIXES`` is hard-coded rather than read from
++    ``importlib.machinery`` so the covered set does not depend on the signing
++    host.  That trade only holds while the constant is complete, so check it
++    against the interpreter actually running.
++    """
++    machinery = importlib.machinery
++    live = (
++        list(machinery.SOURCE_SUFFIXES)
++        + list(machinery.BYTECODE_SUFFIXES)
++        + list(machinery.EXTENSION_SUFFIXES)
++    )
++    missing = [s for s in live if Path(f"m{s}").suffix.lower() not in loader._IMPORTABLE_SUFFIXES]
++    assert not missing, f"CPython imports suffixes the signed set ignores: {missing}"
++
++
++def test_bytecode_cache_is_excluded_so_signatures_survive_first_import(signed_package_plugin):
++    """__pycache__ is derived state; hashing it would break every plugin on first run."""
++    manifest, pubkey, pkg = signed_package_plugin
++    cache = pkg / "__pycache__"
++    cache.mkdir()
++    (cache / "helper.cpython-312.pyc").write_bytes(b"\x00" * 32)
++
++    covered = loader._entry_file_paths(manifest.entry, manifest.plugin_dir)
++    assert all("__pycache__" not in p.parts for p in covered)
++    assert loader.verify(manifest, [pubkey], allow_unsigned=False).status == "valid"
++
++
++def test_sourceless_bytecode_beside_sources_is_covered(signed_package_plugin):
++    """...but a .pyc OUTSIDE __pycache__ is a directly-importable module, so it counts."""
++    manifest, _pubkey, pkg = signed_package_plugin
++    (pkg / "standalone.pyc").write_bytes(b"\x00" * 32)
++
++    covered = {p.name for p in loader._entry_file_paths(manifest.entry, manifest.plugin_dir)}
++    assert "standalone.pyc" in covered
++
++
++# --------------------------------------------------------------------------
++# Rework cycle 1, finding 2: digests must be bound to file names.
++# --------------------------------------------------------------------------
++
++
++def _digests_only(manifest) -> bytes:
++    """The pre-fix message shape: content digests concatenated, no names."""
++    return b"".join(
++        loader._file_digest(p)
++        for p in loader._entry_file_paths(manifest.entry, manifest.plugin_dir)
++    )
++
++
++def test_rename_preserving_sort_order_invalidates_the_signature(signed_package_plugin):
++    """Renaming a module inside a signed package is a change to what is signed.
++
++    ``helper.py`` -> ``helper_shim.py`` keeps the sort position (it still falls
++    after ``deep/``), so the old digests-only message was byte-identical and the
++    signature stayed valid.  The test proves both halves: that the old shape
++    really was blind to this, and that the current one is not.
++    """
++    manifest, pubkey, pkg = signed_package_plugin
++    before = _digests_only(manifest)
++
++    (pkg / "helper.py").rename(pkg / "helper_shim.py")
++    importlib.invalidate_caches()
++
++    after = _digests_only(manifest)
++    assert before == after, (
++        "precondition failed: this rename was supposed to preserve the old message"
++    )
++
++    result = loader.verify(manifest, [pubkey], allow_unsigned=False)
++    assert result.status == "invalid", (
++        f"a rename the old scheme could not see left the plugin {result.status}"
++    )
++
++
++def test_moving_a_module_between_directories_invalidates_the_signature(signed_package_plugin):
++    """Same argument for a directory move rather than a rename.
++
++    ``deep/tool.py`` → ``deep2/aaa.py`` is chosen so it keeps its sort position
++    (``deep/`` < ``deep2/`` < ``helper``), which again leaves the old
++    digests-only message byte-identical.  A move that reordered the set would
++    have been caught by the old scheme too and would prove nothing.
++    """
++    manifest, pubkey, pkg = signed_package_plugin
++    before = _digests_only(manifest)
++
++    (pkg / "deep2").mkdir()
++    (pkg / "deep" / "tool.py").rename(pkg / "deep2" / "aaa.py")
++    importlib.invalidate_caches()
++
++    assert _digests_only(manifest) == before, (
++        "precondition failed: this move was supposed to preserve the old message"
++    )
++    assert loader.verify(manifest, [pubkey], allow_unsigned=False).status == "invalid"
++
++
++def test_label_framing_is_unambiguous(tmp_path):
++    """Identical content at different names produces different signed bytes.
++
++    Each covered file contributes exactly 32 bytes of name digest and 32 of
++    content digest, so ``a/b.py`` cannot be reparsed as ``a`` plus ``/b.py``.
++    """
++    messages = []
++    for layout in (("a/b.py",), ("ab.py",), ("a.py", "b.py")):
++        plugin_dir = tmp_path / f"p{len(messages)}"
++        plugin_dir.mkdir()
++        (plugin_dir / "plugin.toml").write_text(
++            'id = "lbl"\nname = "Lbl"\nversion = "0.0.1"\n'
++            'runtime = "python"\nentry = ["python"]\n',
++            encoding="utf-8",
++        )
++        for rel in layout:
++            target = plugin_dir.joinpath(*rel.split("/"))
++            target.parent.mkdir(parents=True, exist_ok=True)
++            target.write_bytes(b"SAME = 1\n")
++        manifest = loader._parse_toml(plugin_dir / "plugin.toml", source="test")
++        assert manifest is not None
++        messages.append(loader.signing_message(manifest))
++
++    assert len(set(messages)) == len(messages), "different layouts share a signed message"
++
++
++def test_covered_labels_are_location_independent(signed_package_plugin):
++    """Labels name the module, not the install path, so they survive relocation."""
++    manifest, _pubkey, _pkg = signed_package_plugin
++    labels = [label for label, _p in loader._covered_files(manifest.entry, manifest.plugin_dir)]
++    assert labels == [
++        f"{_PKG_NAME}/__init__.py",
++        f"{_PKG_NAME}/__main__.py",
++        f"{_PKG_NAME}/deep/__init__.py",
++        f"{_PKG_NAME}/deep/tool.py",
++        f"{_PKG_NAME}/helper.py",
++    ], labels
++    assert not any(sep in label for label in labels for sep in ("\\", ":"))
++
++
++# --------------------------------------------------------------------------
++# Rework cycle 1, finding 3: suffix matching must not inherit the filesystem's
++# casing rules.
++# --------------------------------------------------------------------------
++
++
++def test_uppercase_source_extension_is_discovered_and_normalised(tmp_path):
++    """EVIL.PY is found, and is treated as Python source, on every filesystem.
++
++    ``rglob("*.py")`` matched it on Windows and not on Linux, while
++    ``suffix == ".py"`` was False everywhere -- one file, three treatments.
++    """
++    root = tmp_path / "pkg"
++    root.mkdir()
++    upper = root / "EVIL.PY"
++    upper.write_bytes(b"x = 1\r\ny = 2\r\n")
++
++    found = [p.name for p in loader._sorted_importable_files(root)]
++    assert "EVIL.PY" in found
++
++    lower = tmp_path / "evil_lower.py"
++    lower.write_bytes(b"x = 1\ny = 2\n")
++    assert loader._file_digest(upper) == loader._file_digest(lower), (
++        "an uppercase .PY was hashed raw instead of newline-normalised"
++    )
++
++
++def test_planted_uppercase_source_invalidates_the_signature(signed_package_plugin):
++    """...and it cannot be smuggled into a signed package either."""
++    manifest, pubkey, pkg = signed_package_plugin
++    (pkg / "SMUGGLED.PY").write_bytes(b"import os\n")
++
++    assert loader.verify(manifest, [pubkey], allow_unsigned=False).status == "invalid"

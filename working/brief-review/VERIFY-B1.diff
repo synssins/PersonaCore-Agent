@@ -1,0 +1,1777 @@
+diff --git a/src/workstation_agent/app.py b/src/workstation_agent/app.py
+index 4afa16d..7cedcf3 100644
+--- a/src/workstation_agent/app.py
++++ b/src/workstation_agent/app.py
+@@ -75,9 +75,9 @@ _HTTP_OK = 200
+ def _pkg_version() -> str:
+     """Return the installed package version, falling back to a sentinel."""
+     try:
+-        from importlib.metadata import version as _v  # noqa: PLC0415
++        from importlib.metadata import version as _v
+         return _v("workstation-agent")
+-    except Exception:  # noqa: BLE001
++    except Exception:
+         return "0.1.0"
+ 
+ 
+@@ -131,6 +131,7 @@ class _Subsystems:
+     llm_client: Any = None
+     llm_session_id: Any = None
+     toast: Any = None
++    confirm_presenter: Any = None
+     tray: Any = None
+     update_poller: Any = None
+     claude_code: Any = None
+@@ -433,12 +434,57 @@ class Application:
+         self._subs.started["session_store"] = Health(ok=True, detail=str(db_path))
+         return store
+ 
++    def _build_confirm_presenter(self) -> Any:
++        """Build the awaitable confirm primitive for confirmable conditions.
++
++        Both providers resolve **lazily**: the MCP host starts at step 3 but
++        the ``ToastPresenter`` is not built until step 8 and the TTS client
++        not until step 4, so anything captured eagerly here would be
++        ``None`` forever.  A provider that still returns ``None`` at prompt
++        time is a denial, not an allow.
++        """
++        from workstation_agent.confirm import ConfirmPresenter
++
++        presenter = ConfirmPresenter(
++            toast_provider=lambda: self._subs.toast,
++            config_provider=lambda: self._subs.config,
++        )
++        self._subs.confirm_presenter = presenter
++        return presenter
++
++    def _confirm_voice(self) -> Any:
++        """Voice channel for confirmation prompts (``tts_speak``).
++
++        Wraps the Wyoming TTS client so ``await voice.speak(text)`` actually
++        emits audio: ``WyomingTTSClient.speak`` only returns a task that has
++        to be drained into the speaker.
++        """
++        subs = self._subs
++
++        class _ConfirmVoice:
++            async def speak(self, text: str) -> None:
++                tts = subs.tts
++                if tts is None:
++                    log.warning("confirm: no TTS client — prompt not spoken")
++                    return
++                task = await tts.speak(text)
++                async for chunk in tts.audio_chunks(task):
++                    speaker = subs.speaker
++                    if speaker is not None:
++                        speaker.enqueue(chunk)
++
++        return _ConfirmVoice()
++
+     async def _start_mcp_host(self, cfg: Any) -> Any:
+         from workstation_agent.mcp_host.host import MCPHost
+ 
+         host = MCPHost()
+         try:
+-            await host.start(cfg)
++            await host.start(
++                cfg,
++                confirm_cb=self._build_confirm_presenter(),
++                tts_speak=self._confirm_voice(),
++            )
+         except Exception as exc:
+             log.warning("MCPHost start reported error: %s", exc)
+             self._subs.started["mcp_host"] = Health(ok=False, detail=repr(exc))
+@@ -606,9 +652,9 @@ class Application:
+ 
+     async def _start_fastapi_backend(self) -> None:
+         """Bind FastAPI on an ephemeral port; write ``ui-port`` for pywebview."""
+-        import workstation_agent.config.store as _config_store  # noqa: PLC0415
+-        from workstation_agent.mcp_host import audit as _audit  # noqa: PLC0415
+-        from workstation_agent.ui.backend.app import (  # noqa: PLC0415
++        import workstation_agent.config.store as _config_store
++        from workstation_agent.mcp_host import audit as _audit
++        from workstation_agent.ui.backend.app import (
+             BackendContext,
+             create_app,
+             write_port_file,
+diff --git a/src/workstation_agent/confirm.py b/src/workstation_agent/confirm.py
+new file mode 100644
+index 0000000..834c492
+--- /dev/null
++++ b/src/workstation_agent/confirm.py
+@@ -0,0 +1,406 @@
++"""Awaitable confirmation primitive for confirmable conditions (contract §7).
++
++``MCPHost.start`` takes ``confirm_cb: Callable[[ConfirmationRequest], Awaitable[bool]]``
++but the only presentation surface the agent owns is
++:meth:`workstation_agent.ui.notifications.toast.ToastPresenter.show`, which is
++**synchronous, returns ``None``, and is callback-based** (``actions`` maps
++``action_id -> (label, callback)``).  This module is the adapter between the two.
++
++:class:`ConfirmPresenter` turns one toast into one awaitable ``bool``:
++
++* it shows a toast with **Allow** / **Deny** buttons and speaks the §7 line,
++* it resolves ``True`` on Allow and ``False`` on Deny,
++* it gives up after :data:`CONFIRM_TIMEOUT_S` seconds with the ``unconfirmed``
++  outcome — a value, not an exception,
++* it carries a **correlation id** so the prompt can be tied to an audit row,
++* and it **fails closed**: every path that is not an explicit Allow click
++  denies.
++
++Fail-closed paths — each one denies, none of them raises out of
++:meth:`ConfirmPresenter.confirm`:
++
++===================================== ===========================
++Failure                               ``ConfirmDecision.reason``
++===================================== ===========================
++the toast provider raised             ``presenter_error``
++no presenter configured (``None``)    ``no_presenter``
++presenter has no usable ``show()``    ``presenter_unusable``
++``_WINRT_AVAILABLE`` is false, or the
++real presenter has no notifier — the
++buttons could never be clicked        ``toast_unavailable``
++``show()`` raised                     ``toast_failed``
++nobody answered within the timeout    ``timeout`` (``unconfirmed``)
++anything else raised                  ``internal_error``
++===================================== ===========================
++
++The ``_WINRT_AVAILABLE`` row is the important one: ``show()`` merely logs and
++returns when winrt is missing (``toast.py:115-121``), so without an explicit
++check an absent toast stack would sit out the full timeout and — with any
++less careful design — read as an auto-allow.
++
++Usage::
++
++    presenter = ConfirmPresenter(
++        toast_provider=lambda: subsystems.toast,
++        config_provider=lambda: subsystems.config,
++    )
++    await host.start(cfg, confirm_cb=presenter, tts_speak=voice)
++"""
++
++from __future__ import annotations
++
++import asyncio
++import contextlib
++import inspect
++import logging
++import uuid
++from dataclasses import dataclass
++from typing import TYPE_CHECKING, Any, Final
++
++if TYPE_CHECKING:
++    from collections.abc import Callable
++
++log = logging.getLogger(__name__)
++
++# --------------------------------------------------------------------------
++# Contract constants
++# --------------------------------------------------------------------------
++
++#: Confirmation window, contract §7.  An unanswered prompt resolves to
++#: :data:`OUTCOME_UNCONFIRMED` once this elapses.
++CONFIRM_TIMEOUT_S: Final = 20.0
++
++#: Upper bound on the spoken line.  The toast is already on screen and the
++#: button callbacks are already armed before this is awaited, so a wedged TTS
++#: backend delays the answer but can never lose it or hang the confirm.
++SPEAK_TIMEOUT_S: Final = 10.0
++
++OUTCOME_ALLOWED: Final = "allowed"
++OUTCOME_DENIED: Final = "denied"
++OUTCOME_UNCONFIRMED: Final = "unconfirmed"
++
++ACTION_ALLOW: Final = "confirm_allow"
++ACTION_DENY: Final = "confirm_deny"
++
++TOAST_TITLE: Final = "PersonaCore-Agent"
++
++#: Longest command string echoed back into the prompt.  A tool argument is
++#: attacker-influenced text; it is not pasted verbatim into a toast at length.
++_MAX_COMMAND_CHARS: Final = 120
++
++
++# --------------------------------------------------------------------------
++# Decision record
++# --------------------------------------------------------------------------
++
++
++@dataclass(frozen=True)
++class ConfirmDecision:
++    """Outcome of one confirmation prompt.
++
++    ``outcome`` is one of :data:`OUTCOME_ALLOWED`, :data:`OUTCOME_DENIED` or
++    :data:`OUTCOME_UNCONFIRMED`.  Only :data:`OUTCOME_ALLOWED` permits the
++    call to proceed; ``unconfirmed`` is reported separately from ``denied``
++    so the audit row can tell "the user said no" from "nobody answered".
++    """
++
++    outcome: str
++    correlation_id: str
++    reason: str = ""
++    spoken: bool = False
++
++    @property
++    def allowed(self) -> bool:
++        """True only for an explicit Allow."""
++        return self.outcome == OUTCOME_ALLOWED
++
++
++# --------------------------------------------------------------------------
++# Helpers
++# --------------------------------------------------------------------------
++
++
++def command_text(req: Any) -> str:  # noqa: ANN401 — duck-typed ConfirmationRequest
++    """Return the ``<command>`` fragment for the §7 prompt.
++
++    Prefers a ``command`` argument when the tool has one, otherwise the tool
++    id.  Always returns a short, single-line, non-empty string.
++    """
++    candidate = ""
++    with contextlib.suppress(Exception):
++        args = getattr(req, "args", None)
++        if isinstance(args, dict):
++            raw = args.get("command")
++            if isinstance(raw, str) and raw.strip():
++                candidate = raw.strip()
++    if not candidate:
++        with contextlib.suppress(Exception):
++            tool_id = getattr(req, "tool_id", "")
++            if isinstance(tool_id, str):
++                candidate = tool_id.strip()
++    if not candidate:
++        candidate = "an unnamed command"
++
++    candidate = " ".join(candidate.split())
++    if len(candidate) > _MAX_COMMAND_CHARS:
++        candidate = candidate[: _MAX_COMMAND_CHARS - 1] + "…"
++    return candidate
++
++
++def prompt_line(req: Any) -> str:  # noqa: ANN401 — duck-typed ConfirmationRequest
++    """The exact §7 prompt: spoken aloud and used as the toast body."""
++    return f"PersonaCore wants to run {command_text(req)} on this machine. Allow?"
++
++
++def toast_stack_available(presenter: Any) -> bool:  # noqa: ANN401 — duck-typed
++    """False when a toast could be shown but its buttons can never be clicked.
++
++    ``ToastPresenter.show`` logs and returns when winrt is unavailable, which
++    would otherwise leave the confirm waiting on a future nothing can ever
++    resolve.  Non-``ToastPresenter`` objects (fakes, future presenters) are
++    trusted to honour their own contract.
++    """
++    try:
++        from workstation_agent.ui.notifications import toast as toast_mod  # noqa: PLC0415
++    except Exception:  # pragma: no cover — the module is import-guarded
++        log.exception("confirm: toast module failed to import — denying")
++        return False
++
++    presenter_cls = getattr(toast_mod, "ToastPresenter", None)
++    if presenter_cls is None or not isinstance(presenter, presenter_cls):
++        return True
++
++    # Read through the module object so tests can monkeypatch the flag.
++    if not getattr(toast_mod, "_WINRT_AVAILABLE", False):
++        return False
++    return getattr(presenter, "_notifier", None) is not None
++
++
++async def _call_speak(voice: Any, text: str) -> None:  # noqa: ANN401 — duck-typed
++    """Speak *text* through *voice*, which may be an object or a callable."""
++    speak = getattr(voice, "speak", None)
++    if speak is None and callable(voice):
++        speak = voice
++    if speak is None:
++        return
++    result = speak(text)
++    if inspect.isawaitable(result):
++        await result
++
++
++# --------------------------------------------------------------------------
++# ConfirmPresenter
++# --------------------------------------------------------------------------
++
++
++class ConfirmPresenter:
++    """Toast + voice confirmation prompt exposed as an awaitable ``bool``.
++
++    The instance is itself the ``confirm_cb``: ``await presenter(req)``
++    returns ``True`` only for an explicit Allow.
++
++    Parameters
++    ----------
++    toast_provider:
++        Called at prompt time (not construction time) for the shared
++        ``ToastPresenter``.  ``app.py`` builds the presenter at step 8, well
++        after the MCP host starts at step 3, so this must stay lazy.
++    speak:
++        Optional voice channel — an object with an ``async speak(text)`` or a
++        plain callable.  Usually supplied later by
++        :meth:`attach_voice`, which ``MCPHost.start`` calls with its
++        ``tts_speak``.
++    config_provider:
++        Called at prompt time for the :class:`~workstation_agent.config.schema.AgentConfig`
++        whose ``notifications.voice_announce_confirmations_enabled`` gates the
++        spoken line.  When it is absent, unreadable or false, the toast is
++        still shown and nothing is spoken.
++    timeout_s:
++        Confirmation window; defaults to the §7 value.  Injectable so tests
++        do not wait 20 seconds.
++    speak_timeout_s:
++        Upper bound on the spoken line.
++
++    """
++
++    def __init__(
++        self,
++        *,
++        toast_provider: Callable[[], Any] | None = None,
++        speak: Any = None,  # noqa: ANN401 — duck-typed voice channel
++        config_provider: Callable[[], Any] | None = None,
++        timeout_s: float = CONFIRM_TIMEOUT_S,
++        speak_timeout_s: float = SPEAK_TIMEOUT_S,
++    ) -> None:
++        """Build a presenter; nothing is resolved until a prompt is raised."""
++        self._toast_provider = toast_provider
++        self._voice = speak
++        self._config_provider = config_provider
++        self._timeout_s = timeout_s
++        self._speak_timeout_s = speak_timeout_s
++
++    # -- wiring ---------------------------------------------------------
++
++    def attach_voice(self, voice: Any) -> None:  # noqa: ANN401 — duck-typed
++        """Adopt *voice* as the spoken channel for confirmations.
++
++        ``MCPHost.start`` calls this with the ``tts_speak`` it was handed, so
++        the voice the application configures reaches the prompt without
++        ``app.py`` having to wire the same object into two places.
++        """
++        self._voice = voice
++
++    # -- the confirm_cb -------------------------------------------------
++
++    async def __call__(self, req: Any) -> bool:  # noqa: ANN401 — duck-typed
++        """Alias for :meth:`confirm` so the instance *is* the callback."""
++        return await self.confirm(req)
++
++    async def confirm(self, req: Any) -> bool:  # noqa: ANN401 — duck-typed
++        """Return ``True`` only if the operator explicitly allowed *req*."""
++        decision = await self.request(req)
++        return decision.allowed
++
++    async def request(self, req: Any) -> ConfirmDecision:  # noqa: ANN401 — duck-typed
++        """Prompt for *req* and return the full :class:`ConfirmDecision`.
++
++        Never raises except :class:`asyncio.CancelledError`, which is
++        re-raised so shutdown still works — and which cannot produce an
++        allow either, since the caller is being torn down.
++        """
++        correlation_id = ""
++        with contextlib.suppress(Exception):
++            existing = getattr(req, "correlation_id", "")
++            if isinstance(existing, str):
++                correlation_id = existing
++        if not correlation_id:
++            correlation_id = uuid.uuid4().hex
++
++        try:
++            return await self._request(req, correlation_id)
++        except asyncio.CancelledError:
++            log.warning("confirm[%s]: cancelled — not allowed", correlation_id)
++            raise
++        except Exception:
++            # Nothing below is allowed to turn into an allow.
++            log.exception("confirm[%s]: unexpected failure — denying", correlation_id)
++            return ConfirmDecision(OUTCOME_DENIED, correlation_id, "internal_error")
++
++    # -- internals ------------------------------------------------------
++
++    async def _request(self, req: Any, correlation_id: str) -> ConfirmDecision:  # noqa: ANN401
++        presenter, reason = self._resolve_presenter()
++        if presenter is None:
++            log.warning(
++                "confirm[%s]: denying %s — %s",
++                correlation_id,
++                getattr(req, "tool_id", "<unknown>"),
++                reason,
++            )
++            return ConfirmDecision(OUTCOME_DENIED, correlation_id, reason)
++
++        line = prompt_line(req)
++        loop = asyncio.get_running_loop()
++        future: asyncio.Future[bool] = loop.create_future()
++
++        def _resolve(*, answer: bool) -> None:
++            """Called from the toast/WinRT thread; hop back onto the loop."""
++            def _set() -> None:
++                if not future.done():
++                    future.set_result(answer)
++
++            try:
++                loop.call_soon_threadsafe(_set)
++            except RuntimeError:
++                # Loop already closed — a click that arrived after the
++                # prompt was abandoned.  Dropping it is the safe outcome.
++                log.warning("confirm[%s]: late answer dropped", correlation_id)
++
++        def _on_allow() -> None:
++            _resolve(answer=True)
++
++        def _on_deny() -> None:
++            _resolve(answer=False)
++
++        actions: dict[str, tuple[str, Callable[[], None]]] = {
++            ACTION_ALLOW: ("Allow", _on_allow),
++            ACTION_DENY: ("Deny", _on_deny),
++        }
++
++        try:
++            presenter.show(title=TOAST_TITLE, body=line, actions=actions)
++        except Exception:
++            log.exception("confirm[%s]: toast failed — denying", correlation_id)
++            return ConfirmDecision(OUTCOME_DENIED, correlation_id, "toast_failed")
++
++        spoken = await self._announce(line, correlation_id)
++
++        try:
++            answer = await asyncio.wait_for(future, self._timeout_s)
++        except TimeoutError:
++            log.warning(
++                "confirm[%s]: no answer in %.1fs — unconfirmed",
++                correlation_id,
++                self._timeout_s,
++            )
++            return ConfirmDecision(
++                OUTCOME_UNCONFIRMED, correlation_id, "timeout", spoken=spoken,
++            )
++        finally:
++            # wait_for already cancels on timeout; this covers the paths
++            # where the caller is cancelled, so a later click is a no-op.
++            future.cancel()
++
++        outcome = OUTCOME_ALLOWED if answer is True else OUTCOME_DENIED
++        log.info("confirm[%s]: %s", correlation_id, outcome)
++        return ConfirmDecision(outcome, correlation_id, "user", spoken=spoken)
++
++    def _resolve_presenter(self) -> tuple[Any, str]:
++        """Return ``(presenter, "")`` or ``(None, reason)`` — never raises."""
++        if self._toast_provider is None:
++            return None, "no_presenter"
++        try:
++            presenter = self._toast_provider()
++        except Exception:
++            log.exception("confirm: toast provider raised — denying")
++            return None, "presenter_error"
++
++        if presenter is None:
++            return None, "no_presenter"
++        if not callable(getattr(presenter, "show", None)):
++            return None, "presenter_unusable"
++        if not toast_stack_available(presenter):
++            return None, "toast_unavailable"
++        return presenter, ""
++
++    def _voice_enabled(self) -> bool:
++        """Read ``notifications.voice_announce_confirmations_enabled``.
++
++        Defaults to *off* whenever the setting cannot be read: an
++        unreadable config must not start talking to the room.
++        """
++        if self._config_provider is None:
++            return False
++        try:
++            cfg = self._config_provider()
++        except Exception:
++            log.exception("confirm: config provider raised — voice suppressed")
++            return False
++        notifications = getattr(cfg, "notifications", None)
++        return bool(getattr(notifications, "voice_announce_confirmations_enabled", False))
++
++    async def _announce(self, line: str, correlation_id: str) -> bool:
++        """Speak *line* when enabled.  Never raises, never blocks forever."""
++        if self._voice is None or not self._voice_enabled():
++            return False
++        try:
++            await asyncio.wait_for(_call_speak(self._voice, line), self._speak_timeout_s)
++        except asyncio.CancelledError:
++            raise
++        except TimeoutError:
++            log.warning("confirm[%s]: spoken line timed out", correlation_id)
++            return False
++        except Exception:
++            log.exception("confirm[%s]: spoken line failed", correlation_id)
++            return False
++        return True
+diff --git a/src/workstation_agent/mcp_host/host.py b/src/workstation_agent/mcp_host/host.py
+index 5bf9b2f..e61bbb8 100644
+--- a/src/workstation_agent/mcp_host/host.py
++++ b/src/workstation_agent/mcp_host/host.py
+@@ -19,6 +19,7 @@ import asyncio
+ import contextlib
+ import logging
+ import sys
++import uuid
+ from dataclasses import dataclass, field
+ from pathlib import Path
+ from typing import TYPE_CHECKING, Any
+@@ -66,12 +67,18 @@ class ToolResultImpl:
+ 
+ @dataclass
+ class ConfirmationRequestImpl:
+-    """Concrete :class:`workstation_agent.protocols.ConfirmationRequest`."""
++    """Concrete :class:`workstation_agent.protocols.ConfirmationRequest`.
++
++    ``correlation_id`` is minted by the host for every prompt and echoed by
++    the confirm adapter, so the prompt, its outcome and the audit rows that
++    follow can be tied together after the fact.
++    """
+ 
+     plugin_id: str
+     tool_id: str
+     args: dict[str, Any]
+     condition: str = ""
++    correlation_id: str = ""
+ 
+ 
+ @dataclass
+@@ -120,10 +127,23 @@ class MCPHost:
+         confirm_cb: Callable[[ConfirmationRequestImpl], Awaitable[bool]] | None = None,
+         tts_speak: Any | None = None,
+     ) -> None:
+-        """Discover, verify, and spawn every enabled plugin."""
++        """Discover, verify, and spawn every enabled plugin.
++
++        ``confirm_cb`` is the awaitable confirmation primitive (see
++        :mod:`workstation_agent.confirm`).  When it is ``None`` every
++        confirmable condition is denied — the host never falls through to
++        an implicit allow.
++
++        ``tts_speak`` is the voice channel for confirmation prompts.  The
++        prompt is presented by ``confirm_cb`` — toast and spoken line have
++        to share one timeout and one answer — so the host hands the voice
++        to the callback via its ``attach_voice`` hook rather than speaking
++        over it.
++        """
+         self._config = config
+         self._confirm_cb = confirm_cb
+         self._tts_speak = tts_speak
++        self._attach_voice()
+ 
+         manifests = discover()
+         allow_unsigned = config.plugins.allow_unsigned
+@@ -317,8 +337,9 @@ class MCPHost:
+             msg = f"tool {tool_id!r} denied by permissions model"
+             raise PermissionError(msg)
+ 
++        correlation_id = ""
+         if decision == "confirm":
+-            confirmed = await self._do_confirm(runtime, tool_id, args)
++            confirmed, correlation_id = await self._do_confirm(runtime, tool_id, args)
+             if not confirmed:
+                 audit_log(AuditEvent(
+                     event="tool_denied",
+@@ -326,13 +347,23 @@ class MCPHost:
+                     tool_id=tool_id,
+                     args=args,
+                     decision="confirm_rejected",
++                    detail=f"correlation_id={correlation_id}",
+                 ))
+                 msg = f"tool {tool_id!r} rejected by user confirmation"
+                 raise PermissionError(msg)
++            audit_log(AuditEvent(
++                event="tool_confirmed",
++                plugin_id=runtime.manifest.id,
++                tool_id=tool_id,
++                args=args,
++                decision="confirm_allowed",
++                detail=f"correlation_id={correlation_id}",
++            ))
+ 
+         if runtime.client is None:  # pragma: no cover — invariant
+             msg = f"plugin {runtime.manifest.id!r} has no client"
+             raise RuntimeError(msg)
++        detail = f"correlation_id={correlation_id}" if correlation_id else None
+         try:
+             raw = await runtime.client.tools_call(tool_id, args)
+         except Exception:
+@@ -342,6 +373,7 @@ class MCPHost:
+                 tool_id=tool_id,
+                 args=args,
+                 decision=decision,
++                detail=detail,
+             ))
+             raise
+ 
+@@ -358,6 +390,7 @@ class MCPHost:
+             args=args,
+             result="ok" if not result.is_error else "error",
+             decision=decision,
++            detail=detail,
+         ))
+ 
+         return result
+@@ -372,27 +405,68 @@ class MCPHost:
+                     return runtime
+         return None
+ 
++    def _attach_voice(self) -> None:
++        """Hand ``tts_speak`` to the confirm callback if it accepts one.
++
++        Presentation lives in one place (the confirm adapter) so the toast
++        and the spoken line share a single timeout and a single answer.
++        A callback without the hook simply does not get a voice; that is
++        never an error and never changes a decision.
++        """
++        cb = self._confirm_cb
++        if cb is None or self._tts_speak is None:
++            return
++        attach = getattr(cb, "attach_voice", None)
++        if not callable(attach):
++            log.debug("confirm callback has no attach_voice hook; prompts stay silent")
++            return
++        try:
++            attach(self._tts_speak)
++        except Exception:
++            log.exception("failed to attach voice to confirm callback")
++
+     async def _do_confirm(
+         self,
+         runtime: _PluginRuntime,
+         tool_id: str,
+         args: dict[str, Any],
+-    ) -> bool:
+-        """Present a confirmation prompt to the user."""
++    ) -> tuple[bool, str]:
++        """Present a confirmation prompt.  Returns ``(allowed, correlation_id)``.
++
++        **Fail-closed.**  No confirm callback, a callback that raises, or a
++        callback that returns anything other than ``True`` all deny.  The
++        only path to ``True`` is an explicit affirmative answer.
++        """
++        correlation_id = uuid.uuid4().hex
+         req = ConfirmationRequestImpl(
+             plugin_id=runtime.manifest.id,
+             tool_id=tool_id,
+             args=args,
++            correlation_id=correlation_id,
+         )
+ 
+-        if self._tts_speak is not None:
+-            with contextlib.suppress(Exception):
+-                msg = f"Plugin {runtime.manifest.name} wants to call {tool_id}. Allow?"
+-                await self._tts_speak.speak(msg)
++        cb = self._confirm_cb
++        if cb is None:
++            log.warning(
++                "confirm[%s]: no confirmation callback wired — denying %s",
++                correlation_id,
++                tool_id,
++            )
++            return False, correlation_id
++
++        try:
++            answer = await cb(req)
++        except asyncio.CancelledError:
++            raise
++        except Exception:
++            log.exception(
++                "confirm[%s]: confirmation callback raised — denying %s",
++                correlation_id,
++                tool_id,
++            )
++            return False, correlation_id
+ 
+-        if self._confirm_cb is not None:
+-            return await self._confirm_cb(req)
+-        return False
++        return answer is True, correlation_id
+ 
+     async def plugins(self) -> list[PluginInfoImpl]:
+         """Return status for every known plugin."""
+diff --git a/tests/integration/test_confirm_wiring.py b/tests/integration/test_confirm_wiring.py
+new file mode 100644
+index 0000000..bf1992b
+--- /dev/null
++++ b/tests/integration/test_confirm_wiring.py
+@@ -0,0 +1,268 @@
++"""The composition root actually wires the confirm path (review finding §1).
++
++Before this, ``app.py`` called ``await host.start(cfg)`` with neither
++``confirm_cb`` nor ``tts_speak``, so every confirmable condition was silently
++denied and no voice ever played.  These tests pin the wiring end to end:
++``Application`` -> ``MCPHost.start`` -> ``ConfirmPresenter`` -> ``ToastPresenter``.
++"""
++# ruff: noqa: FBT001
++
++from __future__ import annotations
++
++import asyncio
++
++import pytest
++
++from workstation_agent.app import Application
++from workstation_agent.config.schema import AgentConfig
++from workstation_agent.confirm import ACTION_ALLOW, ACTION_DENY, ConfirmPresenter
++from workstation_agent.mcp_host import host as host_mod
++from workstation_agent.mcp_host.host import ConfirmationRequestImpl, MCPHost
++from workstation_agent.mcp_host.loader import PluginManifest, VerifyResult
++
++
++class CapturingToast:
++    def __init__(self, answer: bool | None) -> None:
++        self.answer = answer
++        self.calls: list[dict] = []
++
++    def show(self, *, title, body, actions=None):
++        self.calls.append({"title": title, "body": body, "actions": actions})
++        if self.answer is None or not actions:
++            return
++        actions[ACTION_ALLOW if self.answer else ACTION_DENY][1]()
++
++
++class CapturingTTS:
++    """Stands in for WyomingTTSClient: speak() returns a drainable task."""
++
++    def __init__(self) -> None:
++        self.spoken: list[str] = []
++
++    async def speak(self, text: str):
++        self.spoken.append(text)
++        return object()
++
++    async def audio_chunks(self, _task):
++        yield b"\x00\x01"
++
++
++class CapturingSpeaker:
++    def __init__(self) -> None:
++        self.chunks: list[bytes] = []
++
++    def enqueue(self, chunk: bytes) -> None:
++        self.chunks.append(chunk)
++
++
++@pytest.fixture
++def app_with_stub_host(monkeypatch):
++    """An Application whose MCPHost.start records what it was handed."""
++    captured: dict = {}
++
++    class StubHost:
++        async def start(self, config, confirm_cb=None, tts_speak=None):
++            captured["config"] = config
++            captured["confirm_cb"] = confirm_cb
++            captured["tts_speak"] = tts_speak
++
++    monkeypatch.setattr(host_mod, "MCPHost", StubHost)
++    return Application(fake_backends=True, headless=True), captured
++
++
++@pytest.mark.asyncio
++async def test_start_mcp_host_passes_confirm_cb_and_tts_speak(app_with_stub_host):
++    app, captured = app_with_stub_host
++    cfg = AgentConfig()
++    app._subs.config = cfg
++
++    await app._start_mcp_host(cfg)
++
++    assert isinstance(captured["confirm_cb"], ConfirmPresenter)
++    assert captured["tts_speak"] is not None
++    assert app._subs.started["mcp_host"].ok
++
++
++@pytest.mark.asyncio
++async def test_wired_presenter_resolves_lazily(app_with_stub_host):
++    """The presenter is built at step 3 but the toast only exists at step 8."""
++    app, captured = app_with_stub_host
++    cfg = AgentConfig()
++    cfg.notifications.voice_announce_confirmations_enabled = True
++    app._subs.config = cfg
++
++    await app._start_mcp_host(cfg)
++    presenter: ConfirmPresenter = captured["confirm_cb"]
++    presenter._timeout_s = 0.05
++
++    req = ConfirmationRequestImpl(plugin_id="shell", tool_id="shell.exec", args={})
++
++    # Step 3..7: no ToastPresenter yet -> deny, do not wait, do not allow.
++    early = await presenter.request(req)
++    assert not early.allowed
++    assert early.reason == "no_presenter"
++
++    # Step 8: the toast presenter appears; the same object now works.
++    toast = CapturingToast(answer=True)
++    app._subs.toast = toast
++    assert await presenter.confirm(req) is True
++    assert toast.calls[0]["body"] == (
++        "PersonaCore wants to run shell.exec on this machine. Allow?"
++    )
++
++
++@pytest.mark.asyncio
++async def test_wired_voice_speaks_through_tts_and_speaker(app_with_stub_host):
++    """host.start hands tts_speak to the presenter; audio reaches the speaker."""
++    app, captured = app_with_stub_host
++    cfg = AgentConfig()
++    cfg.notifications.voice_announce_confirmations_enabled = True
++    app._subs.config = cfg
++
++    await app._start_mcp_host(cfg)
++    presenter: ConfirmPresenter = captured["confirm_cb"]
++    presenter._timeout_s = 0.05
++
++    # MCPHost.start would normally do this; the stub host does not.
++    presenter.attach_voice(captured["tts_speak"])
++
++    tts = CapturingTTS()
++    speaker = CapturingSpeaker()
++    app._subs.tts = tts
++    app._subs.speaker = speaker
++    app._subs.toast = CapturingToast(answer=True)
++
++    req = ConfirmationRequestImpl(plugin_id="shell", tool_id="shell.exec", args={})
++    assert await presenter.confirm(req) is True
++    assert tts.spoken == [
++        "PersonaCore wants to run shell.exec on this machine. Allow?",
++    ]
++    assert speaker.chunks == [b"\x00\x01"]
++
++
++@pytest.mark.asyncio
++async def test_wired_voice_is_silent_before_the_tts_exists(app_with_stub_host):
++    app, captured = app_with_stub_host
++    cfg = AgentConfig()
++    cfg.notifications.voice_announce_confirmations_enabled = True
++    app._subs.config = cfg
++
++    await app._start_mcp_host(cfg)
++    presenter: ConfirmPresenter = captured["confirm_cb"]
++    presenter._timeout_s = 0.05
++    presenter.attach_voice(captured["tts_speak"])
++
++    toast = CapturingToast(answer=True)
++    app._subs.toast = toast
++
++    req = ConfirmationRequestImpl(plugin_id="shell", tool_id="shell.exec", args={})
++    assert await presenter.confirm(req) is True
++    assert len(toast.calls) == 1
++
++
++# ---------------------------------------------------------------------------
++# Full host path: MCPHost.invoke -> confirm adapter -> toast
++# ---------------------------------------------------------------------------
++
++
++def _confirm_runtime(plugin_id: str, client):
++    manifest = PluginManifest(
++        id=plugin_id,
++        name="Confirmable Plugin",
++        version="0.0.1",
++        runtime="python",
++        entry=[],
++        plugin_dir=__import__("pathlib").Path(),
++        signature_file=__import__("pathlib").Path("signature.sig"),
++        declared_permissions=[f"tool:{plugin_id}.write", "path:/safe/"],
++        confirmable_conditions=["outside_declared_paths"],
++    )
++    return host_mod._PluginRuntime(
++        manifest=manifest,
++        verify_result=VerifyResult(status="unsigned"),
++        status="running",
++        tools=[{"name": f"{plugin_id}.write"}],
++        granted_permissions={f"tool:{plugin_id}.write"},
++        client=client,
++    )
++
++
++@pytest.fixture(autouse=True)
++def isolated_audit_db(tmp_path):
++    import workstation_agent.mcp_host.audit as audit_mod
++
++    audit_mod.set_db_path(tmp_path / "audit.db")
++    yield
++    audit_mod.reset_connection()
++
++
++@pytest.mark.asyncio
++async def test_host_invoke_prompts_through_the_toast_and_proceeds_on_allow():
++    from unittest.mock import AsyncMock, patch
++
++    client = AsyncMock()
++    client.tools_call = AsyncMock(
++        return_value={"content": [{"type": "text", "text": "ok"}], "isError": False},
++    )
++    toast = CapturingToast(answer=True)
++    presenter = ConfirmPresenter(toast_provider=lambda: toast, timeout_s=0.05)
++
++    host = MCPHost()
++    with patch.object(host_mod, "discover", return_value=[]):
++        await host.start(AgentConfig(), confirm_cb=presenter, tts_speak=None)
++    host._runtimes["e2e_allow"] = _confirm_runtime("e2e_allow", client)
++
++    result = await host.invoke("e2e_allow.write", {"path": "/unsafe/x.txt"})
++    await host.stop()
++
++    assert not result.is_error
++    assert len(toast.calls) == 1
++    client.tools_call.assert_awaited_once()
++
++
++@pytest.mark.asyncio
++async def test_host_invoke_denies_when_nobody_answers_the_toast():
++    from unittest.mock import AsyncMock, patch
++
++    client = AsyncMock()
++    toast = CapturingToast(answer=None)  # toast shown, never clicked
++    presenter = ConfirmPresenter(toast_provider=lambda: toast, timeout_s=0.05)
++
++    host = MCPHost()
++    with patch.object(host_mod, "discover", return_value=[]):
++        await host.start(AgentConfig(), confirm_cb=presenter, tts_speak=None)
++    host._runtimes["e2e_timeout"] = _confirm_runtime("e2e_timeout", client)
++
++    with pytest.raises(PermissionError):
++        await host.invoke("e2e_timeout.write", {"path": "/unsafe/x.txt"})
++    await host.stop()
++
++    client.tools_call.assert_not_called()
++
++
++@pytest.mark.asyncio
++async def test_host_invoke_denies_when_the_toast_stack_is_absent(monkeypatch):
++    """The confirm path with no winrt: denied, and the tool never runs."""
++    from unittest.mock import AsyncMock, patch
++
++    from workstation_agent.ui.notifications import toast as toast_mod
++
++    monkeypatch.setattr(toast_mod, "_WINRT_AVAILABLE", False, raising=False)
++    real_presenter = toast_mod.ToastPresenter(app_id="test")
++
++    client = AsyncMock()
++    presenter = ConfirmPresenter(toast_provider=lambda: real_presenter, timeout_s=30.0)
++
++    host = MCPHost()
++    with patch.object(host_mod, "discover", return_value=[]):
++        await host.start(AgentConfig(), confirm_cb=presenter, tts_speak=None)
++    host._runtimes["e2e_nowinrt"] = _confirm_runtime("e2e_nowinrt", client)
++
++    loop = asyncio.get_running_loop()
++    started = loop.time()
++    with pytest.raises(PermissionError):
++        await host.invoke("e2e_nowinrt.write", {"path": "/unsafe/x.txt"})
++    await host.stop()
++
++    assert loop.time() - started < 5.0
++    client.tools_call.assert_not_called()
+diff --git a/tests/unit/mcp_host/test_host.py b/tests/unit/mcp_host/test_host.py
+index 89747fb..9a8ba3b 100644
+--- a/tests/unit/mcp_host/test_host.py
++++ b/tests/unit/mcp_host/test_host.py
+@@ -344,13 +344,157 @@ async def test_on_plugin_died_updates_status(isolated_audit_db):
+ 
+ 
+ @pytest.mark.asyncio
+-async def test_tts_speak_called_on_confirm(isolated_audit_db):
+-    """_do_confirm calls tts_speak.speak when tts_speak is set."""
+-    manifest = _make_manifest("tts_test")
++async def test_start_hands_tts_speak_to_confirm_callback(cfg_allow_unsigned):
++    """start() attaches tts_speak to a confirm callback that accepts a voice.
++
++    Presentation (toast + spoken line) lives in the confirm adapter so the two
++    share one timeout and one answer; the host's job is to hand the adapter the
++    voice the application configured.
++    """
++    class _Cb:
++        def __init__(self) -> None:
++            self.voice = None
++
++        def attach_voice(self, voice) -> None:
++            self.voice = voice
++
++        async def __call__(self, req) -> bool:  # noqa: ARG002
++            return True
++
++    cb = _Cb()
++    mock_tts = AsyncMock()
++
++    h = MCPHost()
++    with patch.object(host_mod, "discover", return_value=[]):
++        await h.start(cfg_allow_unsigned, confirm_cb=cb, tts_speak=mock_tts)
++    await h.stop()
++
++    assert cb.voice is mock_tts
++
++
++@pytest.mark.asyncio
++async def test_start_tolerates_callback_without_attach_voice(cfg_allow_unsigned):
++    """A plain-function confirm callback simply gets no voice — not an error."""
++    async def _accept(req: ConfirmationRequestImpl) -> bool:
++        return True
++
++    h = MCPHost()
++    with patch.object(host_mod, "discover", return_value=[]):
++        await h.start(cfg_allow_unsigned, confirm_cb=_accept, tts_speak=AsyncMock())
++    await h.stop()
++
++    assert h._confirm_cb is _accept
++
++
++@pytest.mark.asyncio
++async def test_start_tolerates_attach_voice_raising(cfg_allow_unsigned):
++    """An attach_voice that raises must not take the host down."""
++    class _Cb:
++        def attach_voice(self, voice) -> None:  # noqa: ARG002
++            msg = "nope"
++            raise RuntimeError(msg)
++
++        async def __call__(self, req) -> bool:  # noqa: ARG002
++            return True
++
++    h = MCPHost()
++    with patch.object(host_mod, "discover", return_value=[]):
++        await h.start(cfg_allow_unsigned, confirm_cb=_Cb(), tts_speak=AsyncMock())
++    await h.stop()
++
++
++@pytest.mark.asyncio
++async def test_do_confirm_denies_when_no_callback(isolated_audit_db):
++    """No confirm callback wired => deny.  The 'silently denied' bug, asserted."""
++    manifest = _make_manifest("nocb")
+     manifest.confirmable_conditions = ["outside_declared_paths"]
+-    manifest.declared_permissions = ["tool:tts_test.write", "path:/safe/"]
++    manifest.declared_permissions = ["tool:nocb.write", "path:/safe/"]
++
++    fake_client = AsyncMock()
++    fake_runtime = host_mod._PluginRuntime(
++        manifest=manifest,
++        verify_result=VerifyResult(status="unsigned"),
++        status="running",
++        tools=[{"name": "nocb.write"}],
++        granted_permissions={"tool:nocb.write"},
++        client=fake_client,
++    )
++
++    h = MCPHost()
++    h._runtimes["nocb"] = fake_runtime
++
++    with pytest.raises(PermissionError):
++        await h.invoke("nocb.write", {"path": "/unsafe/x.txt"})
++    fake_client.tools_call.assert_not_called()
++
++
++@pytest.mark.asyncio
++async def test_do_confirm_denies_when_callback_raises(isolated_audit_db):
++    """An exception inside the confirm callback denies; it never allows."""
++    manifest = _make_manifest("boomcb")
++    manifest.confirmable_conditions = ["outside_declared_paths"]
++    manifest.declared_permissions = ["tool:boomcb.write", "path:/safe/"]
++
++    fake_client = AsyncMock()
++    fake_runtime = host_mod._PluginRuntime(
++        manifest=manifest,
++        verify_result=VerifyResult(status="unsigned"),
++        status="running",
++        tools=[{"name": "boomcb.write"}],
++        granted_permissions={"tool:boomcb.write"},
++        client=fake_client,
++    )
++
++    async def _boom(req: ConfirmationRequestImpl) -> bool:
++        msg = "presenter exploded"
++        raise RuntimeError(msg)
++
++    h = MCPHost()
++    h._confirm_cb = _boom
++    h._runtimes["boomcb"] = fake_runtime
++
++    with pytest.raises(PermissionError):
++        await h.invoke("boomcb.write", {"path": "/unsafe/x.txt"})
++    fake_client.tools_call.assert_not_called()
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("answer", [None, 0, "", "yes", 1, object()])
++async def test_do_confirm_requires_literal_true(isolated_audit_db, answer):
++    """Only ``True`` allows — a truthy or odd return value still denies."""
++    manifest = _make_manifest("truthy")
++    manifest.confirmable_conditions = ["outside_declared_paths"]
++    manifest.declared_permissions = ["tool:truthy.write", "path:/safe/"]
++
++    fake_client = AsyncMock()
++    fake_runtime = host_mod._PluginRuntime(
++        manifest=manifest,
++        verify_result=VerifyResult(status="unsigned"),
++        status="running",
++        tools=[{"name": "truthy.write"}],
++        granted_permissions={"tool:truthy.write"},
++        client=fake_client,
++    )
++
++    async def _weird(req: ConfirmationRequestImpl):
++        return answer
++
++    h = MCPHost()
++    h._confirm_cb = _weird
++    h._runtimes["truthy"] = fake_runtime
++
++    with pytest.raises(PermissionError):
++        await h.invoke("truthy.write", {"path": "/unsafe/x.txt"})
++    fake_client.tools_call.assert_not_called()
++
++
++@pytest.mark.asyncio
++async def test_do_confirm_passes_correlation_id(isolated_audit_db):
++    """Every prompt carries a correlation id, and it reaches the audit row."""
++    manifest = _make_manifest("corr")
++    manifest.confirmable_conditions = ["outside_declared_paths"]
++    manifest.declared_permissions = ["tool:corr.write", "path:/safe/"]
+ 
+-    vresult = VerifyResult(status="unsigned")
+     fake_client = AsyncMock()
+     fake_client.tools_call = AsyncMock(return_value={
+         "content": [{"type": "text", "text": "ok"}],
+@@ -358,27 +502,31 @@ async def test_tts_speak_called_on_confirm(isolated_audit_db):
+     })
+     fake_runtime = host_mod._PluginRuntime(
+         manifest=manifest,
+-        verify_result=vresult,
++        verify_result=VerifyResult(status="unsigned"),
+         status="running",
+-        tools=[{"name": "tts_test.write"}],
+-        granted_permissions={"tool:tts_test.write"},
++        tools=[{"name": "corr.write"}],
++        granted_permissions={"tool:corr.write"},
+         client=fake_client,
+     )
+ 
+-    mock_tts = AsyncMock()
+-    mock_tts.speak = AsyncMock()
++    seen: list[str] = []
+ 
+     async def _accept(req: ConfirmationRequestImpl) -> bool:
++        seen.append(req.correlation_id)
+         return True
+ 
+     h = MCPHost()
+-    h._tts_speak = mock_tts
+     h._confirm_cb = _accept
+-    h._runtimes["tts_test"] = fake_runtime
++    h._runtimes["corr"] = fake_runtime
+ 
+-    result = await h.invoke("tts_test.write", {"path": "/unsafe/x.txt"})
++    result = await h.invoke("corr.write", {"path": "/unsafe/x.txt"})
+     assert not result.is_error
+-    mock_tts.speak.assert_called_once()
++    assert len(seen) == 1
++    assert seen[0]
++
++    rows = audit_mod.query(audit_mod.AuditQuery(plugin_id="corr"))
++    details = [r.detail for r in rows if r.detail]
++    assert any(f"correlation_id={seen[0]}" == d for d in details)
+ 
+ 
+ @pytest.mark.asyncio
+diff --git a/tests/unit/test_confirm.py b/tests/unit/test_confirm.py
+new file mode 100644
+index 0000000..15ffacb
+--- /dev/null
++++ b/tests/unit/test_confirm.py
+@@ -0,0 +1,595 @@
++"""Unit tests for workstation_agent.confirm — the awaitable confirm primitive.
++
++The single property under test everywhere below is **fail closed**: the only
++path that produces ``True`` is an explicit Allow click.  Every other path —
++no presenter, an unusable presenter, an absent winrt toast stack, a raising
++``show()``, a raising provider, an unanswered prompt — must deny.
++"""
++# ruff: noqa: ARG002, FBT001, PLW0108, PT018
++
++from __future__ import annotations
++
++import asyncio
++
++import pytest
++
++from workstation_agent.config.schema import AgentConfig
++from workstation_agent.confirm import (
++    ACTION_ALLOW,
++    ACTION_DENY,
++    CONFIRM_TIMEOUT_S,
++    OUTCOME_ALLOWED,
++    OUTCOME_DENIED,
++    OUTCOME_UNCONFIRMED,
++    ConfirmDecision,
++    ConfirmPresenter,
++    command_text,
++    prompt_line,
++    toast_stack_available,
++)
++from workstation_agent.mcp_host.host import ConfirmationRequestImpl
++from workstation_agent.ui.notifications import toast as toast_mod
++
++# A timeout short enough that CI never waits for the real 20 s window.
++FAST = 0.05
++
++
++# ---------------------------------------------------------------------------
++# Fakes
++# ---------------------------------------------------------------------------
++
++
++class FakeToast:
++    """Records show() calls.  ``answer`` decides which button 'clicks'.
++
++    The click is fired synchronously from inside ``show()``, exactly like a
++    user who answers instantly; the resolver has to cope with being called
++    before anything awaits the future.
++    """
++
++    def __init__(self, answer: bool | None = None, *, raises: bool = False) -> None:
++        self.answer = answer
++        self.raises = raises
++        self.calls: list[dict] = []
++
++    def show(self, *, title, body, actions=None):
++        self.calls.append({"title": title, "body": body, "actions": actions})
++        if self.raises:
++            msg = "toast stack exploded"
++            raise RuntimeError(msg)
++        if self.answer is None or not actions:
++            return
++        action_id = ACTION_ALLOW if self.answer else ACTION_DENY
++        actions[action_id][1]()
++
++
++class ThreadedToast(FakeToast):
++    """Fires the button callback from a *different* thread, as WinRT does."""
++
++    def show(self, *, title, body, actions=None):
++        self.calls.append({"title": title, "body": body, "actions": actions})
++        if self.answer is None or not actions:
++            return
++        import threading
++
++        action_id = ACTION_ALLOW if self.answer else ACTION_DENY
++        threading.Thread(target=actions[action_id][1], daemon=True).start()
++
++
++class RecordingVoice:
++    def __init__(self, *, raises: bool = False, hangs: bool = False) -> None:
++        self.spoken: list[str] = []
++        self.raises = raises
++        self.hangs = hangs
++
++    async def speak(self, text: str) -> None:
++        self.spoken.append(text)
++        if self.raises:
++            msg = "tts is down"
++            raise RuntimeError(msg)
++        if self.hangs:
++            await asyncio.sleep(3600)
++
++
++def make_req(tool_id="shell.exec", args=None):
++    return ConfirmationRequestImpl(
++        plugin_id="shell",
++        tool_id=tool_id,
++        args=args if args is not None else {},
++    )
++
++
++def make_config(*, voice: bool) -> AgentConfig:
++    cfg = AgentConfig()
++    cfg.notifications.voice_announce_confirmations_enabled = voice
++    return cfg
++
++
++def make_presenter(toast, *, voice=None, config=None, timeout=FAST, speak_timeout=FAST):
++    return ConfirmPresenter(
++        toast_provider=lambda: toast,
++        speak=voice,
++        config_provider=(lambda: config) if config is not None else None,
++        timeout_s=timeout,
++        speak_timeout_s=speak_timeout,
++    )
++
++
++# ---------------------------------------------------------------------------
++# Contract surface
++# ---------------------------------------------------------------------------
++
++
++def test_timeout_is_the_contract_value():
++    """§7 fixes the confirmation window at 20 s."""
++    assert CONFIRM_TIMEOUT_S == 20.0
++    assert ConfirmPresenter()._timeout_s == 20.0
++
++
++def test_prompt_line_matches_section_7():
++    assert prompt_line(make_req("shell.exec")) == (
++        "PersonaCore wants to run shell.exec on this machine. Allow?"
++    )
++
++
++def test_prompt_line_prefers_the_command_argument():
++    req = make_req("shell.exec", {"command": "  dir  C:\\ "})
++    assert command_text(req) == "dir C:\\"
++    assert "dir C:\\" in prompt_line(req)
++
++
++def test_command_text_is_bounded_and_single_line():
++    req = make_req("shell.exec", {"command": "a" * 500 + "\nrm -rf /"})
++    text = command_text(req)
++    assert len(text) <= 120
++    assert "\n" not in text
++
++
++def test_command_text_survives_a_malformed_request():
++    class Broken:
++        @property
++        def args(self):
++            msg = "no args for you"
++            raise RuntimeError(msg)
++
++        @property
++        def tool_id(self):
++            msg = "no tool id either"
++            raise RuntimeError(msg)
++
++    assert command_text(Broken()) == "an unnamed command"
++
++
++def test_decision_allowed_only_for_allowed_outcome():
++    assert ConfirmDecision(OUTCOME_ALLOWED, "cid").allowed
++    assert not ConfirmDecision(OUTCOME_DENIED, "cid").allowed
++    assert not ConfirmDecision(OUTCOME_UNCONFIRMED, "cid").allowed
++
++
++# ---------------------------------------------------------------------------
++# Happy paths
++# ---------------------------------------------------------------------------
++
++
++@pytest.mark.asyncio
++async def test_allow_click_resolves_true():
++    toast = FakeToast(answer=True)
++    decision = await make_presenter(toast).request(make_req())
++    assert decision.outcome == OUTCOME_ALLOWED
++    assert decision.allowed
++
++
++@pytest.mark.asyncio
++async def test_deny_click_resolves_false():
++    toast = FakeToast(answer=False)
++    decision = await make_presenter(toast).request(make_req())
++    assert decision.outcome == OUTCOME_DENIED
++    assert not decision.allowed
++
++
++@pytest.mark.asyncio
++async def test_toast_carries_allow_and_deny_buttons_and_the_prompt():
++    toast = FakeToast(answer=True)
++    await make_presenter(toast).confirm(make_req())
++    call = toast.calls[0]
++    assert set(call["actions"]) == {ACTION_ALLOW, ACTION_DENY}
++    assert call["actions"][ACTION_ALLOW][0] == "Allow"
++    assert call["actions"][ACTION_DENY][0] == "Deny"
++    assert call["body"] == "PersonaCore wants to run shell.exec on this machine. Allow?"
++
++
++@pytest.mark.asyncio
++async def test_answer_from_another_thread_resolves():
++    """The real toast fires its callback off-loop; the adapter must cope."""
++    toast = ThreadedToast(answer=True)
++    presenter = make_presenter(toast, timeout=5.0)
++    assert await presenter.confirm(make_req()) is True
++
++
++@pytest.mark.asyncio
++async def test_correlation_id_is_stable_and_echoed():
++    toast = FakeToast(answer=True)
++    req = make_req()
++    req.correlation_id = "abc123"
++    decision = await make_presenter(toast).request(req)
++    assert decision.correlation_id == "abc123"
++
++
++@pytest.mark.asyncio
++async def test_correlation_id_is_minted_when_absent():
++    toast = FakeToast(answer=True)
++    d1 = await make_presenter(toast).request(make_req())
++    d2 = await make_presenter(toast).request(make_req())
++    assert d1.correlation_id
++    assert d1.correlation_id != d2.correlation_id
++
++
++@pytest.mark.asyncio
++async def test_presenter_instance_is_the_callback():
++    toast = FakeToast(answer=True)
++    presenter = make_presenter(toast)
++    assert await presenter(make_req()) is True
++
++
++# ---------------------------------------------------------------------------
++# Fail-closed: the timeout
++# ---------------------------------------------------------------------------
++
++
++@pytest.mark.asyncio
++async def test_unanswered_prompt_is_unconfirmed_not_allowed():
++    """An unanswered prompt resolves to ``unconfirmed`` — a value, not a raise."""
++    toast = FakeToast(answer=None)
++    presenter = make_presenter(toast, timeout=FAST)
++    decision = await presenter.request(make_req())
++    assert decision.outcome == OUTCOME_UNCONFIRMED
++    assert decision.reason == "timeout"
++    assert not decision.allowed
++    assert await presenter.confirm(make_req()) is False
++
++
++@pytest.mark.asyncio
++async def test_timeout_fires_at_the_configured_window():
++    """The window is honoured, and only injection keeps CI off the 20 s clock."""
++    toast = FakeToast(answer=None)
++    loop = asyncio.get_running_loop()
++    started = loop.time()
++    decision = await make_presenter(toast, timeout=0.25).request(make_req())
++    elapsed = loop.time() - started
++    assert decision.outcome == OUTCOME_UNCONFIRMED
++    assert 0.2 <= elapsed < 5.0
++
++
++@pytest.mark.asyncio
++async def test_click_after_the_timeout_is_harmless():
++    """A late Allow must not blow up, and must not retroactively allow."""
++    captured: dict = {}
++
++    class LateToast(FakeToast):
++        def show(self, *, title, body, actions=None):
++            assert actions is not None
++            captured["actions"] = actions
++
++    presenter = make_presenter(LateToast(), timeout=FAST)
++    assert await presenter.confirm(make_req()) is False
++    captured["actions"][ACTION_ALLOW][1]()  # the user clicks Allow, too late
++    await asyncio.sleep(0)
++
++
++# ---------------------------------------------------------------------------
++# Fail-closed: no presenter / unusable presenter
++# ---------------------------------------------------------------------------
++
++
++@pytest.mark.asyncio
++async def test_no_toast_provider_denies():
++    presenter = ConfirmPresenter(timeout_s=FAST)
++    decision = await presenter.request(make_req())
++    assert decision.outcome == OUTCOME_DENIED
++    assert decision.reason == "no_presenter"
++
++
++@pytest.mark.asyncio
++async def test_provider_returning_none_denies_immediately():
++    """A missing presenter denies without burning the confirmation window."""
++    presenter = ConfirmPresenter(toast_provider=lambda: None, timeout_s=30.0)
++    loop = asyncio.get_running_loop()
++    started = loop.time()
++    decision = await presenter.request(make_req())
++    assert decision.outcome == OUTCOME_DENIED
++    assert decision.reason == "no_presenter"
++    assert loop.time() - started < 1.0
++
++
++@pytest.mark.asyncio
++async def test_provider_raising_denies():
++    def _boom():
++        msg = "no subsystems yet"
++        raise RuntimeError(msg)
++
++    presenter = ConfirmPresenter(toast_provider=_boom, timeout_s=FAST)
++    decision = await presenter.request(make_req())
++    assert decision.outcome == OUTCOME_DENIED
++    assert decision.reason == "presenter_error"
++
++
++@pytest.mark.asyncio
++async def test_presenter_without_show_denies():
++    presenter = ConfirmPresenter(toast_provider=lambda: object(), timeout_s=FAST)
++    decision = await presenter.request(make_req())
++    assert decision.outcome == OUTCOME_DENIED
++    assert decision.reason == "presenter_unusable"
++
++
++@pytest.mark.asyncio
++async def test_show_raising_denies():
++    """An exception inside the presenter denies rather than propagating."""
++    toast = FakeToast(raises=True)
++    presenter = make_presenter(toast)
++    decision = await presenter.request(make_req())
++    assert decision.outcome == OUTCOME_DENIED
++    assert decision.reason == "toast_failed"
++    assert await presenter.confirm(make_req()) is False
++
++
++# ---------------------------------------------------------------------------
++# Fail-closed: the winrt toast stack is absent
++# ---------------------------------------------------------------------------
++
++
++def test_toast_stack_available_false_without_winrt(monkeypatch):
++    monkeypatch.setattr(toast_mod, "_WINRT_AVAILABLE", False, raising=False)
++    real = toast_mod.ToastPresenter(app_id="test")
++    assert toast_stack_available(real) is False
++
++
++def test_toast_stack_available_false_without_notifier(monkeypatch):
++    monkeypatch.setattr(toast_mod, "_WINRT_AVAILABLE", True, raising=False)
++    real = toast_mod.ToastPresenter(app_id="test")
++    real._notifier = None
++    assert toast_stack_available(real) is False
++
++
++def test_toast_stack_available_true_with_a_live_notifier(monkeypatch):
++    monkeypatch.setattr(toast_mod, "_WINRT_AVAILABLE", True, raising=False)
++    real = toast_mod.ToastPresenter(app_id="test")
++    real._notifier = object()
++    assert toast_stack_available(real) is True
++
++
++def test_toast_stack_available_trusts_injected_presenters():
++    assert toast_stack_available(FakeToast()) is True
++
++
++@pytest.mark.asyncio
++async def test_absent_toast_stack_denies_and_never_shows(monkeypatch):
++    """``show()`` only logs when winrt is missing, so no click can ever arrive.
++
++    Without the explicit availability check this would sit out the whole
++    confirmation window; with a less careful design it would auto-allow.
++    """
++    monkeypatch.setattr(toast_mod, "_WINRT_AVAILABLE", False, raising=False)
++    real = toast_mod.ToastPresenter(app_id="test")
++    presenter = ConfirmPresenter(toast_provider=lambda: real, timeout_s=30.0)
++
++    loop = asyncio.get_running_loop()
++    started = loop.time()
++    decision = await presenter.request(make_req())
++
++    assert decision.outcome == OUTCOME_DENIED
++    assert decision.reason == "toast_unavailable"
++    assert not decision.allowed
++    assert loop.time() - started < 1.0
++    assert await presenter.confirm(make_req()) is False
++
++
++# ---------------------------------------------------------------------------
++# Fail-closed: anything else
++# ---------------------------------------------------------------------------
++
++
++@pytest.mark.asyncio
++async def test_internal_failure_denies(monkeypatch):
++    """A defect anywhere below ``request`` still denies."""
++    def _explode(_req):
++        msg = "unexpected"
++        raise RuntimeError(msg)
++
++    monkeypatch.setattr("workstation_agent.confirm.prompt_line", _explode)
++    presenter = make_presenter(FakeToast(answer=True))
++    decision = await presenter.request(make_req())
++    assert decision.outcome == OUTCOME_DENIED
++    assert decision.reason == "internal_error"
++
++
++@pytest.mark.asyncio
++async def test_confirm_never_raises_for_a_garbage_request():
++    presenter = make_presenter(FakeToast(answer=None))
++    assert await presenter.confirm(object()) is False
++
++
++@pytest.mark.asyncio
++async def test_cancellation_propagates_and_does_not_allow():
++    presenter = make_presenter(FakeToast(answer=None), timeout=30.0)
++    task = asyncio.create_task(presenter.confirm(make_req()))
++    await asyncio.sleep(0.05)
++    task.cancel()
++    with pytest.raises(asyncio.CancelledError):
++        await task
++
++
++# ---------------------------------------------------------------------------
++# voice_announce_confirmations_enabled
++# ---------------------------------------------------------------------------
++
++
++@pytest.mark.asyncio
++async def test_voice_enabled_speaks_the_section_7_line():
++    voice = RecordingVoice()
++    toast = FakeToast(answer=True)
++    presenter = make_presenter(toast, voice=voice, config=make_config(voice=True))
++    decision = await presenter.request(make_req())
++    assert decision.spoken is True
++    assert voice.spoken == [
++        "PersonaCore wants to run shell.exec on this machine. Allow?",
++    ]
++    assert toast.calls[0]["body"] == voice.spoken[0]
++
++
++@pytest.mark.asyncio
++async def test_voice_disabled_suppresses_speech_but_still_shows_the_toast():
++    voice = RecordingVoice()
++    toast = FakeToast(answer=True)
++    presenter = make_presenter(toast, voice=voice, config=make_config(voice=False))
++    decision = await presenter.request(make_req())
++    assert voice.spoken == []
++    assert decision.spoken is False
++    assert len(toast.calls) == 1
++    assert decision.allowed
++
++
++@pytest.mark.asyncio
++async def test_voice_defaults_off_without_a_config_provider():
++    voice = RecordingVoice()
++    presenter = make_presenter(FakeToast(answer=True), voice=voice)
++    await presenter.request(make_req())
++    assert voice.spoken == []
++
++
++@pytest.mark.asyncio
++async def test_unreadable_config_suppresses_voice_but_not_the_toast():
++    def _boom():
++        msg = "config not loaded"
++        raise RuntimeError(msg)
++
++    voice = RecordingVoice()
++    toast = FakeToast(answer=True)
++    presenter = ConfirmPresenter(
++        toast_provider=lambda: toast,
++        speak=voice,
++        config_provider=_boom,
++        timeout_s=FAST,
++    )
++    decision = await presenter.request(make_req())
++    assert voice.spoken == []
++    assert len(toast.calls) == 1
++    assert decision.allowed
++
++
++@pytest.mark.asyncio
++async def test_speech_failure_does_not_allow_and_does_not_break_the_prompt():
++    voice = RecordingVoice(raises=True)
++    toast = FakeToast(answer=None)
++    presenter = make_presenter(toast, voice=voice, config=make_config(voice=True))
++    decision = await presenter.request(make_req())
++    assert decision.outcome == OUTCOME_UNCONFIRMED
++    assert decision.spoken is False
++    assert len(toast.calls) == 1
++
++
++@pytest.mark.asyncio
++async def test_wedged_tts_cannot_hang_the_confirm():
++    voice = RecordingVoice(hangs=True)
++    toast = FakeToast(answer=True)
++    presenter = make_presenter(
++        toast, voice=voice, config=make_config(voice=True), speak_timeout=FAST,
++    )
++    decision = await presenter.request(make_req())
++    assert decision.allowed  # the click landed while the TTS was wedged
++    assert decision.spoken is False
++
++
++@pytest.mark.asyncio
++async def test_attach_voice_installs_the_channel():
++    voice = RecordingVoice()
++    presenter = make_presenter(FakeToast(answer=True), config=make_config(voice=True))
++    presenter.attach_voice(voice)
++    await presenter.request(make_req())
++    assert len(voice.spoken) == 1
++
++
++@pytest.mark.asyncio
++async def test_plain_callable_voice_is_supported():
++    spoken: list[str] = []
++
++    async def _speak(text: str) -> None:
++        spoken.append(text)
++
++    presenter = make_presenter(
++        FakeToast(answer=True), voice=_speak, config=make_config(voice=True),
++    )
++    await presenter.request(make_req())
++    assert len(spoken) == 1
++
++
++@pytest.mark.asyncio
++async def test_synchronous_voice_is_supported():
++    spoken: list[str] = []
++
++    class SyncVoice:
++        def speak(self, text: str) -> None:
++            spoken.append(text)
++
++    presenter = make_presenter(
++        FakeToast(answer=True), voice=SyncVoice(), config=make_config(voice=True),
++    )
++    decision = await presenter.request(make_req())
++    assert spoken and decision.spoken is True
++
++
++# ---------------------------------------------------------------------------
++# Adversarial presenters
++# ---------------------------------------------------------------------------
++
++
++@pytest.mark.asyncio
++async def test_first_answer_wins_when_both_buttons_fire():
++    """A presenter that fires Deny then Allow must not be talked into an allow."""
++    class BothToast:
++        def show(self, *, title, body, actions):
++            actions[ACTION_DENY][1]()
++            actions[ACTION_ALLOW][1]()
++
++    presenter = ConfirmPresenter(toast_provider=BothToast, timeout_s=FAST)
++    decision = await presenter.request(make_req())
++    assert decision.outcome == OUTCOME_DENIED
++
++
++@pytest.mark.asyncio
++async def test_repeated_clicks_are_idempotent():
++    class ChattyToast:
++        def show(self, *, title, body, actions):
++            for _ in range(5):
++                actions[ACTION_ALLOW][1]()
++
++    presenter = ConfirmPresenter(toast_provider=ChattyToast, timeout_s=FAST)
++    assert await presenter.confirm(make_req()) is True
++
++
++@pytest.mark.asyncio
++async def test_concurrent_prompts_are_independent():
++    """One prompt's answer must not resolve another's."""
++    p_yes = make_presenter(FakeToast(answer=True), timeout=1.0)
++    p_no = make_presenter(FakeToast(answer=None), timeout=FAST)
++
++    yes, no = await asyncio.gather(
++        p_yes.confirm(make_req("a.one")),
++        p_no.confirm(make_req("b.two")),
++    )
++    assert yes is True
++    assert no is False
++
++
++@pytest.mark.asyncio
++async def test_show_raising_after_a_click_still_denies():
++    """Fail-closed beats a click: if show() blew up, the prompt is not trusted."""
++    class LateBoomToast:
++        def show(self, *, title, body, actions):
++            actions[ACTION_ALLOW][1]()
++            msg = "raised after firing the callback"
++            raise RuntimeError(msg)
++
++    presenter = ConfirmPresenter(toast_provider=LateBoomToast, timeout_s=FAST)
++    decision = await presenter.request(make_req())
++    assert decision.outcome == OUTCOME_DENIED
++    assert decision.reason == "toast_failed"

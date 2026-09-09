@@ -1,0 +1,303 @@
+diff --git a/src/workstation_agent/mcp_host/mcp_server.py b/src/workstation_agent/mcp_host/mcp_server.py
+index 6b29751..f7eb5ca 100644
+--- a/src/workstation_agent/mcp_host/mcp_server.py
++++ b/src/workstation_agent/mcp_host/mcp_server.py
+@@ -34,13 +34,17 @@ from __future__ import annotations
+ 
+ import asyncio
+ import contextlib
++import dataclasses
+ import json
+ import logging
+ import os
+ import secrets
+ import sys
+ from pathlib import Path
+-from typing import Any
++from typing import TYPE_CHECKING, Any
++
++if TYPE_CHECKING:
++    from collections.abc import Callable
+ 
+ log = logging.getLogger(__name__)
+ 
+@@ -95,6 +99,22 @@ def load_token() -> str | None:
+ # JSON-RPC helpers
+ # ---------------------------------------------------------------------------
+ 
++def _json_default(obj: Any) -> Any:
++    """``json.dumps(default=...)`` hook for types the stdlib can't serialise.
++
++    Tool results routed through :meth:`MCPHost.invoke` come back as
++    ``ToolResultImpl`` (and similar) plain dataclasses, not dicts — see
++    ``workstation_agent.mcp_host.host``. ``json.dumps`` has no idea how to
++    encode a dataclass instance on its own, so every successful
++    ``agent.execute_local`` call raised ``TypeError`` and was reported as
++    ``isError: True`` before this hook existed. Anything else unexpected
++    falls back to ``str()`` rather than raising.
++    """
++    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
++        return dataclasses.asdict(obj)
++    return str(obj)
++
++
+ def _reply(req_id: Any, result: Any) -> bytes:
+     payload = {"jsonrpc": _JSONRPC, "id": req_id, "result": result}
+     return (json.dumps(payload, separators=(",", ":")) + "\n").encode()
+@@ -114,6 +134,22 @@ def _notification(method: str, params: dict[str, Any]) -> bytes:
+     return (json.dumps(payload, separators=(",", ":")) + "\n").encode()
+ 
+ 
++def _toast_action_logger(action_id: str) -> Callable[[], None]:
++    """Build a ``ToastPresenter`` action callback that just logs the click.
++
++    ``agent.toast`` is invoked over the pipe and its ``tools/call`` response
++    is sent back before the user can possibly have clicked a toast button —
++    there is no MCP request left in flight to report the click through. The
++    callback exists only so the toast is well-formed and the click is
++    observable in the log, not lost silently.
++    """
++
++    def _on_click() -> None:
++        log.info("agent.toast: action %r activated (no MCP channel to report it)", action_id)
++
++    return _on_click
++
++
+ # ---------------------------------------------------------------------------
+ # Tool definitions
+ # ---------------------------------------------------------------------------
+@@ -290,8 +326,8 @@ class AgentMCPServer:
+ 
+     async def _handle_initialize(self, req_id: Any, params: dict[str, Any]) -> None:
+         """Validate token and complete the MCP handshake."""
+-        client_token = params.get("token", "")
+-        if client_token != self._token:
++        client_token = str(params.get("token", ""))
++        if not secrets.compare_digest(client_token, self._token):
+             self._writer.write(_error(req_id, -32000, "invalid token"))
+             await self._writer.drain()
+             log.warning("MCP client presented bad token; rejecting")
+@@ -312,7 +348,7 @@ class AgentMCPServer:
+ 
+         try:
+             result = await self._invoke_tool(tool_name, args)
+-            content = [{"type": "text", "text": json.dumps(result)}]
++            content = [{"type": "text", "text": json.dumps(result, default=_json_default)}]
+             self._writer.write(_reply(req_id, {"content": content, "isError": False}))
+         except Exception as exc:  # noqa: BLE001
+             content = [{"type": "text", "text": str(exc)}]
+@@ -329,12 +365,24 @@ class AgentMCPServer:
+         if tool_name == "agent.toast":
+             title = str(args.get("title", ""))
+             body = str(args.get("body", ""))
+-            actions = args.get("actions", [])
++            raw_actions = args.get("actions") or []
+             if self._toast is not None:
+-                result = await self._toast.present(
+-                    title=title, body=body, actions=actions,
+-                )
+-                return {"ok": True, "action": result}
++                toast_actions = {
++                    str(action_id): (str(action_id), _toast_action_logger(str(action_id)))
++                    for action_id in raw_actions
++                }
++                # ToastPresenter.show() is synchronous and fire-and-forget: it
++                # queues the toast with the OS and returns immediately. It has
++                # no "wait for the click" mode, and building one here would
++                # mean blocking this already-in-flight tools/call response on
++                # a user action that may come seconds later or never — the
++                # named-pipe client has no timeout budget for that. Building
++                # a real awaitable "wait for user response" primitive is
++                # SPEC B1's confirm primitive, not this tool. So we show the
++                # toast and acknowledge; any click is only logged, since
++                # there is no channel left to report it back through once
++                # this call has returned.
++                self._toast.show(title=title, body=body, actions=toast_actions or None)
+             return {"ok": True}
+ 
+         if tool_name == "agent.status":
+diff --git a/tests/unit/mcp_host/test_agent_mcp_server.py b/tests/unit/mcp_host/test_agent_mcp_server.py
+index 61ae38e..32fff31 100644
+--- a/tests/unit/mcp_host/test_agent_mcp_server.py
++++ b/tests/unit/mcp_host/test_agent_mcp_server.py
+@@ -23,6 +23,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
+ 
+ import pytest
+ 
++from workstation_agent.mcp_host.host import ToolResultImpl
+ from workstation_agent.mcp_host.mcp_server import run_tcp_server
+ 
+ # ---------------------------------------------------------------------------
+@@ -32,6 +33,31 @@ from workstation_agent.mcp_host.mcp_server import run_tcp_server
+ TOKEN = "deadbeef" * 8  # 64 hex chars, doesn't need to be real 32-byte secret
+ 
+ 
++class FakeToastPresenter:
++    """A fake matching :class:`ToastPresenter`'s ACTUAL public signature.
++
++    Deliberately NOT a ``MagicMock``: a ``MagicMock`` accepts any method
++    name (``.present(...)``, ``.pop(...)``, anything) and any signature, so
++    it would happily "succeed" against code calling a method that does not
++    exist on the real ``ToastPresenter``. This fake only has ``show()``,
++    keyword-only, matching ``toast.py``'s real signature exactly — calling
++    ``.present(...)`` on it raises ``AttributeError`` just like it would on
++    the real presenter, which is the whole point.
++    """
++
++    def __init__(self) -> None:
++        self.calls: list[dict[str, Any]] = []
++
++    def show(
++        self,
++        *,
++        title: str,
++        body: str,
++        actions: dict[str, tuple[str, Any]] | None = None,
++    ) -> None:
++        self.calls.append({"title": title, "body": body, "actions": actions})
++
++
+ async def _open_client(port: int) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+     return await asyncio.open_connection("127.0.0.1", port)
+ 
+@@ -523,11 +549,21 @@ async def test_shutdown_before_auth(mcp_server_port) -> None:
+ 
+ @pytest.mark.asyncio
+ async def test_agent_toast_with_presenter() -> None:
+-    """agent.toast with a presenter calls presenter.present()."""
++    """agent.toast with a presenter calls the real ToastPresenter.show() API.
++
++    Uses ``FakeToastPresenter``, which only implements ``show(*, title, body,
++    actions)`` — the real ``ToastPresenter`` signature. Pre-fix, the call
++    site invoked ``self._toast.present(...)``, which does not exist on this
++    fake (nor on the real presenter): this test would have raised
++    ``AttributeError`` inside ``_invoke_tool``, caught by the broad
++    ``except Exception`` in ``_handle_tools_call``, and come back as
++    ``isError: True`` with the error text mentioning ``present`` — failing
++    the ``isError is False`` assertion below. That is the regression this
++    test guards against.
++    """
+     from workstation_agent.mcp_host.mcp_server import AgentMCPServer
+ 
+-    _toast = MagicMock()
+-    _toast.present = AsyncMock(return_value="clicked")
++    _toast = FakeToastPresenter()
+ 
+     async def _handler(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+         session = AgentMCPServer(r, w, token=TOKEN, toast=_toast)
+@@ -541,14 +577,63 @@ async def test_agent_toast_with_presenter() -> None:
+     await w2.drain()
+     _ = await _read_one(r2)
+ 
+-    w2.write(_rpc("tools/call", {"name": "agent.toast", "arguments": {"title": "Hi", "body": "World"}}, req_id=2))
++    w2.write(_rpc("tools/call", {
++        "name": "agent.toast",
++        "arguments": {"title": "Hi", "body": "World", "actions": ["update_now", "later"]},
++    }, req_id=2))
+     await w2.drain()
+     resp = await _read_one(r2)
+ 
+     assert resp["result"]["isError"] is False
+     result = json.loads(resp["result"]["content"][0]["text"])
+-    assert result["ok"] is True
+-    _toast.present.assert_awaited_once()
++    assert result == {"ok": True}
++
++    # show() was actually called, with the real keyword-only signature.
++    assert len(_toast.calls) == 1
++    call = _toast.calls[0]
++    assert call["title"] == "Hi"
++    assert call["body"] == "World"
++
++    # The list-of-strings "actions" arg from the tool call was adapted into
++    # the dict-of-(label, callback) shape show() actually takes.
++    assert set(call["actions"]) == {"update_now", "later"}
++    for action_id, (label, callback) in call["actions"].items():
++        assert label == action_id
++        assert callable(callback)
++        callback()  # must not raise
++
++    w2.close()
++    mini_server.close()
++    await mini_server.wait_closed()
++
++
++@pytest.mark.asyncio
++async def test_agent_toast_with_presenter_no_actions() -> None:
++    """agent.toast with no actions passes actions=None, not an empty dict."""
++    from workstation_agent.mcp_host.mcp_server import AgentMCPServer
++
++    _toast = FakeToastPresenter()
++
++    async def _handler(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
++        session = AgentMCPServer(r, w, token=TOKEN, toast=_toast)
++        await session.serve()
++
++    mini_server = await asyncio.start_server(_handler, "127.0.0.1", 0)
++    mp = mini_server.sockets[0].getsockname()[1]  # type: ignore[union-attr]
++
++    r2, w2 = await asyncio.open_connection("127.0.0.1", mp)
++    w2.write(_rpc("initialize", {"token": TOKEN}, req_id=1))
++    await w2.drain()
++    _ = await _read_one(r2)
++
++    w2.write(_rpc("tools/call", {"name": "agent.toast", "arguments": {"title": "Hi", "body": "World"}}, req_id=2))
++    await w2.drain()
++    resp = await _read_one(r2)
++
++    assert resp["result"]["isError"] is False
++    assert len(_toast.calls) == 1
++    assert _toast.calls[0]["actions"] is None
++
+     w2.close()
+     mini_server.close()
+     await mini_server.wait_closed()
+@@ -561,11 +646,27 @@ async def test_agent_toast_with_presenter() -> None:
+ 
+ @pytest.mark.asyncio
+ async def test_agent_execute_local_with_host() -> None:
+-    """agent.execute_local invokes the mcp_host and returns its result."""
++    """agent.execute_local invokes the mcp_host and returns its ToolResultImpl.
++
++    ``MCPHost.invoke`` returns a real ``ToolResultImpl`` dataclass (see
++    ``host.py``), never a plain dict — a mock returning a bare dict here
++    would hide the ``json.dumps`` defect entirely, since dicts are already
++    JSON-serialisable. Pre-fix, ``json.dumps({"result": ToolResultImpl(...)})``
++    with no ``default=`` raised ``TypeError: Object of type ToolResultImpl is
++    not JSON serializable`` inside ``_handle_tools_call``'s try block, which
++    was swallowed by ``except Exception`` and reported as ``isError: True``.
++    This test asserts ``isError is False`` and the full payload, which fails
++    against the pre-fix code.
++    """
+     from workstation_agent.mcp_host.mcp_server import AgentMCPServer
+ 
++    tool_result = ToolResultImpl(
++        content=[{"type": "text", "text": "ok"}],
++        is_error=False,
++        raw={"exit_code": 0},
++    )
+     mock_host = MagicMock()
+-    mock_host.invoke = AsyncMock(return_value={"content": [{"type": "text", "text": "ok"}]})
++    mock_host.invoke = AsyncMock(return_value=tool_result)
+ 
+     async def _handler(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+         session = AgentMCPServer(r, w, token=TOKEN, mcp_host=mock_host)
+@@ -586,8 +687,17 @@ async def test_agent_execute_local_with_host() -> None:
+     await w2.drain()
+     resp = await _read_one(r2)
+ 
++    # This is the regression assertion: a successful call must report
++    # isError: False, not True from a swallowed serialisation TypeError.
+     assert resp["result"]["isError"] is False
+     mock_host.invoke.assert_awaited_once_with("my_plugin.my_tool", {"x": 1})
++
++    payload = json.loads(resp["result"]["content"][0]["text"])
++    assert payload["result"] == {
++        "content": [{"type": "text", "text": "ok"}],
++        "is_error": False,
++        "raw": {"exit_code": 0},
++    }
+     w2.close()
+     mini_server.close()
+     await mini_server.wait_closed()

@@ -1,0 +1,2236 @@
+diff --git a/pyproject.toml b/pyproject.toml
+index dfe047d..0115b04 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -38,7 +38,25 @@ dependencies = [
+     "webrtcvad-wheels>=2.0,<3.0",
+     "psutil>=5.0,<6.0",
+     "mcp>=2.1.1,<2.2",
++    "pyserial>=3.5,<4.0",
+ ]
++# Note on `pyserial` (import name `serial`), added by subtask B8 for the
++# `serial` family (contract §5.5, §6): `serial.Serial` backs
++# serial_open/write/read/close's actual device I/O, and `serial.tools.list_ports`
++# backs serial_ports. B8 owns adding this dependency; B7's `devices_list` also
++# uses `serial.tools.list_ports` and was told to rely on B8 having added it
++# rather than adding it a second time.
++#
++#   * Licence: BSD-3-Clause (Chris Liechti and contributors, pyserial project).
++#     Permissive, compatible with this project's MIT licence, and needs no
++#     attribution beyond this record — this comment IS the repo's dependency
++#     record for it, in the same place and the same way the `mcp` note above
++#     records its own reasoning.
++#   * No alternative was seriously considered: pyserial is the de facto
++#     standard cross-platform serial library for Python and is what the
++#     contract itself names ("`pyserial` (BSD-3); §5.5 sessions").
++#   * `>=3.5,<4.0` pins the current stable major line (3.5, 2020-03) with room
++#     for patch releases; there is no 4.x to plan around yet.
+ # Note on `mcp`, amended by subtask B4 (full reasoning in
+ # src/workstation_agent/network_mcp/DECISION.md):
+ #
+diff --git a/src/workstation_agent/plugins/serial/__init__.py b/src/workstation_agent/plugins/serial/__init__.py
+new file mode 100644
+index 0000000..a920e4a
+--- /dev/null
++++ b/src/workstation_agent/plugins/serial/__init__.py
+@@ -0,0 +1,6 @@
++"""Serial plugin for PersonaCore-Agent (contract §5.5, §6, §6.1).
++
++Owns the ``pyserial`` dependency (declared in the repo's ``pyproject.toml``,
++BSD-3, reasoned there) for both this family's device I/O and B7's
++``serial.tools.list_ports`` use in ``devices_list``.
++"""
+diff --git a/src/workstation_agent/plugins/serial/__main__.py b/src/workstation_agent/plugins/serial/__main__.py
+new file mode 100644
+index 0000000..c47a01e
+--- /dev/null
++++ b/src/workstation_agent/plugins/serial/__main__.py
+@@ -0,0 +1,1036 @@
++"""MCP server for the ``serial`` family (contract §5.5, §6, §6.1).
++
++Runs as a line-delimited JSON-RPC 2.0 server over stdin/stdout, exactly like
++every other bundled plugin (see ``plugins/filesystem/__main__.py``). The
++five tools — ``serial.ports``, ``serial.open``, ``serial.write``,
++``serial.read``, ``serial.close`` — are real, not stubs.
++
++**Everything lives in this one file, deliberately.** The signature covering
++a bundled plugin only hashes ``__init__.py`` and ``__main__.py``
++(``mcp_host/loader.py:_resolve_module_paths`` — a ``-m <package>`` entry is
++resolved to exactly those two files, nothing else in the package
++directory). Splitting the session store or the tool logic into their own
++modules would put real, security-relevant behaviour outside what the
++signature actually covers, which is the opposite of what a "signed
++manifest" is supposed to mean. Every other bundled plugin is single-file for
++the same reason; this one stays single-file to not become the first
++exception.
++
++Sections below, top to bottom: the ``pyserial`` backend seam (so this module
++never has to be run against a real device to be tested), session
++bookkeeping (§5.5), the five tools' pure logic (§5.2/§5.3), and the
++JSON-RPC wire harness.
++"""
++# ruff: noqa: ANN401, PLR0911, PLR0913, PLW2901
++
++from __future__ import annotations
++
++import codecs
++import contextlib
++import json
++import secrets
++import sys
++import time
++from dataclasses import dataclass
++from datetime import UTC, datetime
++from typing import TYPE_CHECKING, Any, Protocol, cast
++
++import serial
++import serial.tools.list_ports
++
++if TYPE_CHECKING:
++    from collections.abc import Callable, Sequence
++
++# ---------------------------------------------------------------------------
++# Backend seam — the only place this plugin touches real hardware.
++#
++# ``pyserial`` (import name ``serial``) is a new dependency this subtask
++# adds; see ``pyproject.toml`` for the licence record (BSD-3) and reasoning.
++# Every function below that can reach a physical device takes its I/O
++# through a parameter defaulting to the real backend, which is what lets the
++# rest of this module be tested with **no serial hardware attached** — the
++# situation this family was actually built under.
++# ---------------------------------------------------------------------------
++
++
++class SerialLike(Protocol):
++    """The slice of ``serial.Serial`` this plugin actually uses.
++
++    ``timeout`` is settable because pyserial re-reads it before every
++    blocking ``read()`` rather than fixing it at construction time —
++    :func:`_drain` relies on exactly that to poll several short reads inside
++    one overall deadline.
++    """
++
++    timeout: float | None
++
++    def write(self, data: bytes) -> int | None: ...
++
++    def read(self, size: int = 1) -> bytes: ...
++
++    def close(self) -> None: ...
++
++
++class PortInfoLike(Protocol):
++    """The slice of ``serial.tools.list_ports_common.ListPortInfo`` used here."""
++
++    device: str
++    description: str
++    vid: int | None
++    pid: int | None
++
++
++def _open_serial_port(
++    port: str,
++    baud: int,
++    *,
++    bytesize: int = 8,
++    parity: str = "N",
++    stopbits: float = 1,
++    timeout_s: float = 2,
++) -> SerialLike:
++    """Open *port* with ``pyserial``. Raises on failure; callers translate.
++
++    This is the one function in the whole family that can actually reach a
++    physical device, and it was not exercised against one in this build (no
++    serial hardware was available) — see the test suite for what was
++    verified against a fake instead, and the plugin.toml comment / final
++    report for what remains unverified as a result.
++    """
++    # pyserial's own stub has `Serial.timeout` as a property and `write`
++    # typed against `ReadableBuffer` rather than `bytes`, so it does not
++    # structurally match the narrow `SerialLike` protocol this module
++    # defines on purpose (see its docstring). The cast is the boundary: this
++    # function is the only place `serial.Serial` and `SerialLike` meet.
++    return cast(
++        "SerialLike",
++        serial.Serial(
++            port=port,
++            baudrate=baud,
++            bytesize=bytesize,
++            parity=parity,
++            stopbits=stopbits,
++            timeout=timeout_s,
++        ),
++    )
++
++
++def _list_serial_ports() -> Sequence[PortInfoLike]:
++    """Return the COM ports ``pyserial`` can enumerate on this workstation."""
++    return list(serial.tools.list_ports.comports())
++
++
++# ---------------------------------------------------------------------------
++# Sessions — contract §5.5.
++#
++# ``serial.open`` mints a session, ``serial.write`` / ``serial.read`` /
++# ``serial.close`` use it. Everything here lives in **this plugin
++# subprocess's own memory** and nowhere else:
++#
++# * it is a plain module-level store, so it is gone the instant the process
++#   exits — which happens whenever the Agent does, because the plugin is a
++#   child of the Agent's process tree and is spawned fresh on every
++#   ``MCPHost.start()``. That alone satisfies "sessions die with the Agent"
++#   and "an id from before the Agent last restarted": there is no file, no
++#   registry key, nothing for a restart to find.
++# * ``session_id`` is 128 bits from :func:`secrets.token_hex`, not a counter
++#   or anything derived from caller-supplied input, so a session id cannot
++#   be guessed or enumerated by another caller — and no tool in this family
++#   lists open session ids (``serial_ports`` lists COM ports, not sessions).
++# * idle sessions are reaped on every store access (§5.5's 10-minute idle
++#   close), and at most 4 may be open at once (§5.5).
++#
++# On "sessions must not leak between callers": this Agent runs one
++# ``serial`` plugin subprocess, shared by every caller that reaches
++# ``MCPHost.invoke`` — there is exactly one process, one store. Nothing in
++# ``host.py`` (out of this subtask's allowed paths, and unowned by it) puts
++# a per-connection identity into the tool arguments a plugin receives —
++# ``SessionContext`` reaches the permissions evaluator and the audit row,
++# not the plugin. So the guarantee this module can actually make, and does
++# make, is the one available at this layer: a session id cannot be guessed,
++# is never enumerated, and never survives a restart. Partitioning sessions
++# *per transport connection* would need session-identity plumbed from the
++# host into tool arguments, which is a change to ``host.py`` this subtask is
++# not permitted to make; it is recorded here as a known limitation rather
++# than assumed away.
++#
++# A consequence of the same fact, worth stating separately: the 4-session
++# cap (§5.5) is global to this one process, not per caller. A caller that
++# opens 4 sessions and holds them (up to 10 minutes idle) denies every other
++# caller's ``serial_open`` for that window — this is a real,
++# resource-exhaustion-shaped exposure, and no per-caller isolation is
++# possible from inside the plugin for the reason above. What this module
++# does within that constraint: the reaper runs on every store access rather
++# than on a timer, so a slot frees the instant it is next noticed idle
++# rather than waiting for some separate sweep; and the cap refusal
++# (``open_result``) names when the longest-idle session will free up, so the
++# caller is told this is transient rather than left to guess. Neither
++# changes who gets refused; both are containment, not a fix.
++# ---------------------------------------------------------------------------
++
++#: §5.5 — "An idle session is closed by the Agent after 10 minutes."
++IDLE_TIMEOUT_S: float = 10 * 60
++
++#: §5.5 — "At most 4 open sessions per family."
++MAX_SESSIONS: int = 4
++
++#: How many recently idle-closed session ids to remember, purely so the next
++#: call on one can say *why* ("closed after 10 minutes idle at <time>")
++#: instead of falling back to the generic "from before the Agent last
++#: restarted" message. Bounded so idling out sessions forever cannot grow
++#: this without limit.
++_RECENT_CLOSED_CAP = 32
++
++
++class SessionLimitExceededError(Exception):
++    """Raised by :meth:`SessionStore.create` when §5.5's cap of 4 is hit."""
++
++
++def _iso(epoch_s: float) -> str:
++    """Render a wall-clock epoch time as ISO-8601 with a UTC offset."""
++    return datetime.fromtimestamp(epoch_s, tz=UTC).isoformat()
++
++
++@dataclass
++class Session:
++    """One open serial session."""
++
++    session_id: str
++    port: str
++    baud: int
++    handle: SerialLike
++    opened_at: float
++    last_used: float
++
++
++class SessionStore:
++    """Owns every open serial session for this plugin process.
++
++    ``clock`` (monotonic-style) drives idle-timeout comparisons and
++    ``wall_clock`` (epoch-seconds) drives the human-readable timestamps in
++    refusal messages — both are injectable so tests can move time forward
++    without a real ten-minute sleep.
++    """
++
++    def __init__(
++        self,
++        *,
++        clock: Callable[[], float] = time.monotonic,
++        wall_clock: Callable[[], float] = time.time,
++    ) -> None:
++        self._clock = clock
++        self._wall_clock = wall_clock
++        self._sessions: dict[str, Session] = {}
++        self._recent_closed: dict[str, tuple[float, bool]] = {}
++        self._started_at = wall_clock()
++
++    @property
++    def max_sessions(self) -> int:
++        """§5.5's per-family cap, exposed for refusal messages."""
++        return MAX_SESSIONS
++
++    @property
++    def started_at_iso(self) -> str:
++        """When this plugin process (hence this store) came up."""
++        return _iso(self._started_at)
++
++    def _reap_expired(self) -> None:
++        now = self._clock()
++        expired = [
++            sid
++            for sid, session in self._sessions.items()
++            if now - session.last_used > IDLE_TIMEOUT_S
++        ]
++        for sid in expired:
++            session = self._sessions.pop(sid)
++            with contextlib.suppress(Exception):
++                session.handle.close()
++            self._note_closed(sid, idle=True)
++
++    def _note_closed(self, session_id: str, *, idle: bool) -> None:
++        # Distinguish *why* a session is gone: an idle reap says so ("closed
++        # after 10 minutes idle"), an explicit `serial_close` does not — a
++        # caller that closes its own session and then calls again on it is
++        # not being told it went idle, which would be simply false.
++        self._recent_closed[session_id] = (self._wall_clock(), idle)
++        if len(self._recent_closed) > _RECENT_CLOSED_CAP:
++            oldest = min(self._recent_closed, key=lambda k: self._recent_closed[k][0])
++            del self._recent_closed[oldest]
++
++    def create(self, *, port: str, baud: int, handle: SerialLike) -> Session:
++        """Mint a new session, or raise :class:`SessionLimitExceededError`."""
++        self._reap_expired()
++        if len(self._sessions) >= MAX_SESSIONS:
++            raise SessionLimitExceededError
++        session_id = secrets.token_hex(16)
++        now = self._clock()
++        session = Session(
++            session_id=session_id,
++            port=port,
++            baud=baud,
++            handle=handle,
++            opened_at=now,
++            last_used=now,
++        )
++        self._sessions[session_id] = session
++        return session
++
++    def get(self, session_id: str) -> Session | None:
++        """Return the live session for *session_id*, reaping idle ones first."""
++        self._reap_expired()
++        return self._sessions.get(session_id)
++
++    def touch(self, session_id: str) -> None:
++        """Mark *session_id* as used just now, resetting its idle clock."""
++        session = self._sessions.get(session_id)
++        if session is not None:
++            session.last_used = self._clock()
++
++    def close(self, session_id: str) -> Session | None:
++        """Remove and return *session_id*'s session, or ``None`` if unknown."""
++        self._reap_expired()
++        session = self._sessions.pop(session_id, None)
++        if session is not None:
++            self._note_closed(session_id, idle=False)
++        return session
++
++    def count(self) -> int:
++        """How many sessions are open right now, after reaping idle ones."""
++        self._reap_expired()
++        return len(self._sessions)
++
++    def next_reap_in(self) -> float | None:
++        """Seconds until the longest-idle open session is auto-reaped.
++
++        ``None`` when no sessions are open. This does not change *who* gets
++        refused at the §5.5 cap of 4 — the cap and the 10-minute idle
++        timeout are both fixed by the contract, and this plugin has no
++        caller identity to partition sessions by (see the module docstring)
++        — but it turns a bare "close one first" refusal into one that says
++        when relief arrives on its own, which is the one thing available at
++        this layer to soften a global cap one caller can otherwise exhaust
++        for everyone.
++        """
++        self._reap_expired()
++        if not self._sessions:
++            return None
++        oldest_last_used = min(s.last_used for s in self._sessions.values())
++        return max(0.0, IDLE_TIMEOUT_S - (self._clock() - oldest_last_used))
++
++    def unknown_reason(self, session_id: str) -> str:
++        """Explain why *session_id* is not open: idle-closed vs never-seen."""
++        entry = self._recent_closed.get(session_id)
++        if entry is not None:
++            closed_at, idle = entry
++            if idle:
++                return f"closed after 10 minutes idle at {_iso(closed_at)}"
++            return f"already closed at {_iso(closed_at)}"
++        return f"from before the Agent last restarted at {self.started_at_iso}"
++
++
++#: One store for the lifetime of this process. There is exactly one
++#: ``serial`` plugin subprocess per running Agent, so a module-level
++#: singleton is the store, not a convenience shortcut for one.
++_STORE = SessionStore()
++
++
++# ---------------------------------------------------------------------------
++# Tool logic — contract §6/§6.1. Pure functions of their arguments plus the
++# store; the only I/O is through ``open_fn`` / ``list_ports_fn``, both
++# overridable, so every branch here is reachable from a test with no serial
++# device attached.
++# ---------------------------------------------------------------------------
++
++#: §6.1 — ``max_bytes`` for ``serial_read`` is schema-capped at 60000, which
++#: doubles as the hard ceiling used here even when the caller omits it. This
++#: is a *byte* bound on what is drained from the device.
++MAX_READ_BYTES = 60_000
++
++#: §5.3 — the contract's cap is on the *text result*, in characters, which is
++#: a different number from a byte bound whenever the content is not pure
++#: ASCII. Kept as its own constant and enforced with an explicit post-decode
++#: check (see ``read_result``) rather than relied on implicitly via
++#: ``MAX_READ_BYTES`` happening to equal it today — so that tuning the byte
++#: bound later cannot silently blow the character cap.
++MAX_READ_CHARS = 60_000
++
++#: §6.1 — "timeout_s defaults to 2, max 20."
++DEFAULT_READ_TIMEOUT_S = 2.0
++MAX_READ_TIMEOUT_S = 20.0
++
++#: Poll granularity while scanning for an ``until`` marker: small enough
++#: that the overall deadline is honoured to a fraction of a second, large
++#: enough not to spin needlessly on a fake or a slow device.
++_POLL_CHUNK_S = 0.05
++
++_NOT_FOUND_HINTS = (
++    "cannot find the file",
++    "no such file",
++    "filenotfounderror",
++    "does not exist",
++    "no such device",
++)
++
++
++def _fail(reason: str, *, code: str = "error") -> dict[str, Any]:
++    return {"ok": False, "code": code, "reason": reason}
++
++
++def _unknown_session(store: SessionStore, session_id: str) -> dict[str, Any]:
++    # session_id is caller-supplied and never echoed back: it is either the
++    # opaque hex this plugin minted (fine, but pointless to repeat) or a
++    # guess/typo from the caller, and echoing arbitrary caller input into a
++    # refusal reason is exactly the discipline `permissions.safe_name` and
++    # `host.sanitise_reason` enforce elsewhere in this codebase.
++    why = store.unknown_reason(session_id)
++    return _fail(f"That serial session is not open ({why}).", code="unknown_session")
++
++
++def _safe_decode(data: bytes) -> str:
++    """Decode *data* as UTF-8, or "" — never mangle, never raise."""
++    try:
++        return data.decode("utf-8")
++    except UnicodeDecodeError:
++        return ""
++
++
++def _decode_utf8_prefix(raw: bytes) -> tuple[str, int] | None:
++    """Decode as much of *raw* as forms complete UTF-8 characters.
++
++    Returns ``(text, consumed)`` with ``consumed <= len(raw)``, or ``None``
++    when *raw* is not valid UTF-8 at all.
++
++    The distinction matters: ``_drain`` stops on a byte cap or a timeout, not
++    on a character boundary, so its last few bytes may be an incomplete —
++    but otherwise perfectly valid — multi-byte sequence. That is the read
++    being cut off, not the device sending something malformed, and reporting
++    it as "not valid UTF-8" would blame the wrong thing. ``codecs`` gives
++    this distinction for free: ``final=False`` is exactly the incremental
++    decoder's contract of "don't fail on a trailing partial sequence, just
++    tell me how much you actually consumed" — anything it still raises on
++    (a bad lead byte, an overlong encoding, an encoded surrogate, an invalid
++    byte in the middle of the buffer) is genuinely invalid, not truncated,
++    and stays refused exactly as before.
++    """
++    try:
++        # `final` is positional-only in the C-level codec function; there is
++        # no keyword spelling available to satisfy FBT003 here.
++        text, consumed = codecs.utf_8_decode(raw, "strict", False)  # noqa: FBT003
++    except UnicodeDecodeError:
++        return None
++    return text, consumed
++
++
++def _cap_read_text(text: str) -> str:
++    """Enforce §5.3's *character* cap on a decoded read result.
++
++    Independent of whatever byte bound produced ``text`` — see
++    ``MAX_READ_CHARS``'s docstring for why this must not be assumed to fall
++    out of the byte cap automatically.
++    """
++    return text[:MAX_READ_CHARS]
++
++
++def _clamp(value: float, low: float, high: float) -> float:
++    return max(low, min(high, value))
++
++
++def _port_entry(port: PortInfoLike) -> dict[str, Any]:
++    vid = getattr(port, "vid", None)
++    pid = getattr(port, "pid", None)
++    return {
++        "port": str(getattr(port, "device", "")),
++        "description": str(getattr(port, "description", "") or ""),
++        "vid": f"{vid:04x}" if isinstance(vid, int) else None,
++        "pid": f"{pid:04x}" if isinstance(pid, int) else None,
++    }
++
++
++def ports_result(*, list_ports_fn: Callable[[], Sequence[PortInfoLike]] | None = None) -> dict:
++    """serial_ports: contract §6.1's ``com`` shape as ``{"ok": true, "ports": [...]}``."""
++    fn = list_ports_fn or _list_serial_ports
++    try:
++        found = list(fn())
++    except Exception as exc:  # noqa: BLE001 - enumerating ports must never crash the plugin
++        return _fail(f"could not list serial ports: {type(exc).__name__}")
++    return {"ok": True, "ports": [_port_entry(p) for p in found]}
++
++
++def _open_failure(exc: Exception) -> dict:
++    message = str(exc).lower()
++    if any(hint in message for hint in _NOT_FOUND_HINTS):
++        return _fail("No serial port by that name was found.", code="not_found")
++    return _fail("The serial port could not be opened.")
++
++
++def open_result(
++    store: SessionStore,
++    *,
++    port: Any,
++    baud: Any,
++    bytesize: Any = 8,
++    parity: Any = "N",
++    stopbits: Any = 1,
++    timeout_s: Any = 2,
++    open_fn: Callable[..., SerialLike] | None = None,
++) -> dict:
++    """serial_open: validate, open the port, mint and store a session."""
++    fn = open_fn or _open_serial_port
++
++    if not isinstance(port, str) or not port.strip():
++        return _fail("serial_open needs a port name, for example COM3.")
++    if not isinstance(baud, int) or isinstance(baud, bool) or baud <= 0:
++        return _fail("serial_open needs a positive integer baud rate.")
++
++    try:
++        bytesize_i = 8 if isinstance(bytesize, bool) or bytesize is None else int(bytesize)
++        stopbits_f = 1.0 if isinstance(stopbits, bool) or stopbits is None else float(stopbits)
++        timeout_f = 2.0 if isinstance(timeout_s, bool) or timeout_s is None else float(timeout_s)
++        parity_s = "N" if parity is None else str(parity)
++    except (TypeError, ValueError):
++        return _fail("serial_open received a malformed connection setting.")
++
++    try:
++        handle = fn(
++            port,
++            baud,
++            bytesize=bytesize_i,
++            parity=parity_s,
++            stopbits=stopbits_f,
++            timeout_s=_clamp(timeout_f, 0.0, MAX_READ_TIMEOUT_S),
++        )
++    except Exception as exc:  # noqa: BLE001 - driver/hardware errors, translated below
++        return _open_failure(exc)
++
++    try:
++        session = store.create(port=port, baud=baud, handle=handle)
++    except SessionLimitExceededError:
++        with contextlib.suppress(Exception):
++            handle.close()
++        reason = (
++            f"At most {store.max_sessions} serial sessions may be open at once; "
++            "close one first."
++        )
++        wait_s = store.next_reap_in()
++        if wait_s is not None:
++            # There is no per-caller isolation here (see the module
++            # docstring): the cap is global to the whole plugin process, so
++            # one caller holding 4 sessions open denies everyone else's
++            # serial_open until one of those sessions is closed or goes
++            # idle. Naming when the longest-idle one will be auto-reaped is
++            # the best containment available at this layer without caller
++            # identity — it turns a bare, opaque refusal into one that says
++            # relief is coming and roughly when, rather than leaving the
++            # caller to guess whether this is permanent.
++            reason += (
++                f" The longest-idle session will free up in about {wait_s:.0f}s if left unused."
++            )
++        return _fail(reason)
++
++    return {"ok": True, "session_id": session.session_id, "port": port, "baud": baud}
++
++
++def _build_write_payload(text: Any, hex_: Any) -> tuple[bytes | None, dict | None]:
++    """Validate and encode ``serial_write``'s ``text``/``hex`` into bytes.
++
++    Returns ``(payload, None)`` on success or ``(None, error_dict)`` — split
++    out of :func:`write_result` purely to keep that function's branch count
++    within the repo's complexity budget; the validation rules themselves are
++    unchanged.
++    """
++    if text is not None and hex_ is not None:
++        return None, _fail("serial_write takes text or hex, not both.")
++    if text is None and hex_ is None:
++        return None, _fail("serial_write needs text or hex to send.")
++
++    if hex_ is not None:
++        if not isinstance(hex_, str):
++            return None, _fail("hex must be a string of lowercase hex digits.")
++        try:
++            return bytes.fromhex(hex_), None
++        except ValueError:
++            return None, _fail("hex must be lowercase hex digits with no separators.")
++
++    if not isinstance(text, str):
++        return None, _fail("text must be a string.")
++    try:
++        return text.encode("utf-8"), None
++    except UnicodeEncodeError:
++        # A lone/unpaired surrogate: `json.loads` happily produces one as a
++        # string value, but UTF-8 cannot represent it. Same class of bug
++        # fixed on the named-pipe token and the LAN endpoint's own body
++        # validation — reject explicitly rather than let it raise out of
++        # this function or fall through to `errors="replace"`.
++        return None, _fail("text contains characters that cannot be represented.")
++
++
++def write_result(
++    store: SessionStore,
++    *,
++    session_id: Any,
++    text: Any = None,
++    hex_: Any = None,
++) -> dict:
++    """serial_write: send ``text`` or ``hex`` down an open session."""
++    if not isinstance(session_id, str) or not session_id:
++        return _fail("serial_write needs a session_id from serial_open.")
++
++    session = store.get(session_id)
++    if session is None:
++        return _unknown_session(store, session_id)
++
++    payload, error = _build_write_payload(text, hex_)
++    if error is not None:
++        return error
++    if payload is None:  # pragma: no cover - invariant: error is None iff payload is set
++        return _fail("serial_write needs text or hex to send.")
++
++    try:
++        written = session.handle.write(payload)
++    except OSError:
++        # Narrowed from a blanket `except Exception`: this must catch real
++        # hardware/driver failures (`serial.SerialException` is an `OSError`
++        # subclass) and must NOT catch a bug in this function's own logic
++        # above, which would otherwise be misreported as "the port failed"
++        # when the port was never touched.
++        return _fail("The write to the serial port failed.")
++
++    store.touch(session_id)
++    n = written if isinstance(written, int) and 0 <= written <= len(payload) else len(payload)
++    sent = payload[:n]
++    return {
++        "ok": True,
++        "session_id": session_id,
++        "bytes": n,
++        "text": _safe_decode(sent),
++        "hex": sent.hex(),
++        "timed_out": False,
++    }
++
++
++def _drain(
++    ser: SerialLike,
++    *,
++    until_bytes: bytes | None,
++    cap: int,
++    explicit_cap: bool,
++    deadline: float,
++) -> tuple[bytes, bool]:
++    """Read from *ser* until a marker, a byte cap, or *deadline* (monotonic).
++
++    §6.1: "with neither `until` nor a full `max_bytes` the read returns at
++    the timeout with `timed_out: true`" — modelled directly. ``timed_out``
++    is False only once a stop condition the *caller asked for* was actually
++    reached (the marker matched, or an explicitly requested ``max_bytes``
++    was filled); reading up to the internal safety ceiling with neither
++    still counts as running out the clock.
++    """
++    buf = bytearray()
++
++    if until_bytes is None:
++        remaining = max(0.0, deadline - time.monotonic())
++        ser.timeout = remaining
++        buf.extend(ser.read(cap))
++        reached_full = explicit_cap and len(buf) >= cap
++        return bytes(buf), not reached_full
++
++    while True:
++        remaining = deadline - time.monotonic()
++        if remaining <= 0:
++            return bytes(buf), True
++        ser.timeout = min(remaining, _POLL_CHUNK_S)
++        chunk = ser.read(1)
++        if chunk:
++            buf.extend(chunk)
++            if buf.endswith(until_bytes):
++                return bytes(buf), False
++            if explicit_cap and len(buf) >= cap:
++                return bytes(buf), False
++            if len(buf) >= MAX_READ_BYTES:
++                return bytes(buf), True
++
++
++def _validate_until(until: Any) -> tuple[bytes | None, dict | None]:
++    """Validate ``until`` and encode it, or return a §5.2 error.
++
++    Split out of :func:`read_result` to keep its branch count within the
++    repo's complexity budget. Two rules matter here, both fixed in the same
++    rework: an empty string is rejected outright rather than silently
++    reinterpreted as "no marker" (it trivially matches everywhere, which is
++    not useful and not obviously what an empty string was even meant to
++    say), and encoding is never allowed to raise — a lone/unpaired surrogate
++    is the third appearance of this exact class in this build (the
++    named-pipe token, the LAN endpoint's own body validation, now a read
++    delimiter), rejected explicitly rather than left to raise out of this
++    function and get relabelled "the read failed" by a broad except further
++    down.
++    """
++    if until is None:
++        return None, None
++    if not isinstance(until, str):
++        return None, _fail("until must be a string.")
++    if until == "":
++        return None, _fail("until must not be empty.")
++    try:
++        return until.encode("utf-8"), None
++    except UnicodeEncodeError:
++        return None, _fail("until contains characters that cannot be represented.")
++
++
++def _validate_read_timeout(timeout_s: Any) -> tuple[float | None, dict | None]:
++    """Validate and clamp ``timeout_s``, or return a §5.2 error."""
++    raw_timeout = DEFAULT_READ_TIMEOUT_S if timeout_s is None else timeout_s
++    if isinstance(raw_timeout, bool):
++        return None, _fail("timeout_s must be a number.")
++    try:
++        timeout = float(raw_timeout)
++    except (TypeError, ValueError):
++        return None, _fail("timeout_s must be a number.")
++    return _clamp(timeout, 0.0, MAX_READ_TIMEOUT_S), None
++
++
++def read_result(
++    store: SessionStore,
++    *,
++    session_id: Any,
++    until: Any = None,
++    max_bytes: Any = None,
++    timeout_s: Any = None,
++) -> dict:
++    """serial_read: drain an open session, refusing anything not valid UTF-8."""
++    if not isinstance(session_id, str) or not session_id:
++        return _fail("serial_read needs a session_id from serial_open.")
++
++    session = store.get(session_id)
++    if session is None:
++        return _unknown_session(store, session_id)
++
++    until_bytes, error = _validate_until(until)
++    if error is not None:
++        return error
++
++    bad_max_bytes = max_bytes is not None and (
++        not isinstance(max_bytes, int) or isinstance(max_bytes, bool) or max_bytes < 1
++    )
++    if bad_max_bytes:
++        return _fail("max_bytes must be a positive integer.")
++
++    timeout, error = _validate_read_timeout(timeout_s)
++    if error is not None or timeout is None:
++        return error if error is not None else _fail("timeout_s must be a number.")
++
++    explicit_cap = max_bytes is not None
++    cap = min(int(max_bytes), MAX_READ_BYTES) if explicit_cap else MAX_READ_BYTES
++
++    try:
++        raw, timed_out = _drain(
++            session.handle,
++            until_bytes=until_bytes,
++            cap=cap,
++            explicit_cap=explicit_cap,
++            deadline=time.monotonic() + timeout,
++        )
++    except OSError:
++        # Narrowed from a blanket `except Exception`. `_drain` no longer has
++        # a path that raises anything else on its own (the `until`/encoding
++        # validation above used to be able to reach `buf.endswith(...)` with
++        # a bad value and have that logic bug reported as "the port failed"
++        # by this same broad catch) — only `serial.SerialException`
++        # (an `OSError` subclass) and other real I/O errors should ever
++        # land here, and only those should be reported as a hardware fault.
++        return _fail("The read from the serial port failed.")
++
++    store.touch(session_id)
++
++    decoded = _decode_utf8_prefix(raw)
++    if decoded is None:
++        # §5.3, restated for this family in the brief: binary never
++        # travels. This is a genuine decode failure — bytes that are not
++        # valid UTF-8 anywhere in the buffer, not merely a sequence cut
++        # short at the end (see `_decode_utf8_prefix`). The bytes are gone
++        # once drained from the device; there is nothing to "keep" for a
++        # retry, and the honest answer is a refusal, not a mangled or
++        # hex-only substitute smuggled through the `ok: true` path.
++        return _fail(
++            f"The device returned {len(raw)} bytes that are not valid UTF-8; "
++            "binary transfer is not available yet.",
++        )
++    text, _consumed = decoded
++    # `consumed < len(raw)` means the last few bytes are an incomplete —
++    # but otherwise valid — multi-byte sequence, truncated by the byte cap
++    # or the timeout. That is this function stopping mid-character, not the
++    # device sending something invalid, so it is dropped from `text`
++    # silently rather than reported as any kind of fault. `bytes`/`hex`
++    # still reflect the complete drained buffer, so nothing is hidden —
++    # a caller that cares can recover the undecoded tail from `hex`.
++    text = _cap_read_text(text)
++
++    return {
++        "ok": True,
++        "session_id": session_id,
++        "bytes": len(raw),
++        "text": text,
++        "hex": raw.hex(),
++        "timed_out": timed_out,
++    }
++
++
++def close_result(store: SessionStore, *, session_id: Any) -> dict:
++    """serial_close: release the session and the underlying port."""
++    if not isinstance(session_id, str) or not session_id:
++        return _fail("serial_close needs a session_id from serial_open.")
++
++    session = store.close(session_id)
++    if session is None:
++        return _unknown_session(store, session_id)
++
++    with contextlib.suppress(Exception):
++        session.handle.close()
++
++    return {"ok": True, "session_id": session_id}
++
++
++# ---------------------------------------------------------------------------
++# JSON-RPC wire harness.
++# ---------------------------------------------------------------------------
++
++
++def _send(msg: dict[str, Any]) -> None:
++    sys.stdout.write(json.dumps(msg, separators=(",", ":")) + "\n")
++    sys.stdout.flush()
++
++
++def _reply(request_id: Any, result: Any) -> None:
++    _send({"jsonrpc": "2.0", "id": request_id, "result": result})
++
++
++def _rpc_error(request_id: Any, code: int, message: str) -> None:
++    _send({"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}})
++
++
++_SESSION_ID_SCHEMA = {"type": "string", "description": "A session id from serial_open."}
++
++_TOOLS = [
++    {
++        "name": "serial.ports",
++        "description": "List the COM ports on the workstation.",
++        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
++    },
++    {
++        "name": "serial.open",
++        "description": "Open a serial port and return a session id for reading and writing.",
++        "inputSchema": {
++            "type": "object",
++            "properties": {
++                "port": {"type": "string", "description": "The port name, for example COM3."},
++                "baud": {"type": "integer", "description": "Baud rate, for example 115200."},
++                "bytesize": {"type": "integer", "default": 8, "description": "Data bits."},
++                "parity": {
++                    "type": "string",
++                    "enum": ["N", "E", "O", "M", "S"],
++                    "default": "N",
++                    "description": "Parity. Defaults to none.",
++                },
++                "stopbits": {"type": "number", "default": 1, "description": "Stop bits."},
++                "timeout_s": {
++                    "type": "number",
++                    "minimum": 0,
++                    "maximum": 20,
++                    "default": 2,
++                    "description": "Default read timeout for this session, in seconds.",
++                },
++            },
++            "required": ["port", "baud"],
++            "additionalProperties": False,
++        },
++    },
++    {
++        "name": "serial.write",
++        "description": "Write text or raw bytes to an open serial session.",
++        "inputSchema": {
++            "type": "object",
++            "properties": {
++                "session_id": _SESSION_ID_SCHEMA,
++                "text": {"type": "string", "description": "Text to write."},
++                "hex": {
++                    "type": "string",
++                    "description": "Raw bytes as lowercase hex with no separators.",
++                },
++            },
++            "required": ["session_id"],
++            "additionalProperties": False,
++        },
++    },
++    {
++        "name": "serial.read",
++        "description": "Read from an open serial session until a marker, a byte count, "
++        "or a timeout.",
++        "inputSchema": {
++            "type": "object",
++            "properties": {
++                "session_id": _SESSION_ID_SCHEMA,
++                "until": {
++                    "type": "string",
++                    "description": "A literal string to stop at, matched after decoding.",
++                },
++                "max_bytes": {
++                    "type": "integer",
++                    "minimum": 1,
++                    "maximum": 60000,
++                    "description": "Most bytes to read. Capped at 60000.",
++                },
++                "timeout_s": {
++                    "type": "number",
++                    "minimum": 0,
++                    "maximum": 20,
++                    "default": 2,
++                    "description": "Seconds to wait. Default 2, maximum 20.",
++                },
++            },
++            "required": ["session_id"],
++            "additionalProperties": False,
++        },
++    },
++    {
++        "name": "serial.close",
++        "description": "Close an open serial session and release the port.",
++        "inputSchema": {
++            "type": "object",
++            "properties": {"session_id": _SESSION_ID_SCHEMA},
++            "required": ["session_id"],
++            "additionalProperties": False,
++        },
++    },
++]
++
++
++def _call_ports(_args: dict[str, Any]) -> dict[str, Any]:
++    return ports_result()
++
++
++def _call_open(args: dict[str, Any]) -> dict[str, Any]:
++    return open_result(
++        _STORE,
++        port=args.get("port"),
++        baud=args.get("baud"),
++        bytesize=args.get("bytesize", 8),
++        parity=args.get("parity", "N"),
++        stopbits=args.get("stopbits", 1),
++        timeout_s=args.get("timeout_s", 2),
++    )
++
++
++def _call_write(args: dict[str, Any]) -> dict[str, Any]:
++    return write_result(
++        _STORE,
++        session_id=args.get("session_id"),
++        text=args.get("text"),
++        hex_=args.get("hex"),
++    )
++
++
++def _call_read(args: dict[str, Any]) -> dict[str, Any]:
++    return read_result(
++        _STORE,
++        session_id=args.get("session_id"),
++        until=args.get("until"),
++        max_bytes=args.get("max_bytes"),
++        timeout_s=args.get("timeout_s"),
++    )
++
++
++def _call_close(args: dict[str, Any]) -> dict[str, Any]:
++    return close_result(_STORE, session_id=args.get("session_id"))
++
++
++_DISPATCH: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
++    "serial.ports": _call_ports,
++    "serial.open": _call_open,
++    "serial.write": _call_write,
++    "serial.read": _call_read,
++    "serial.close": _call_close,
++}
++
++
++def _text_block(payload: dict[str, Any]) -> dict[str, Any]:
++    return {"type": "text", "text": json.dumps(payload, separators=(",", ":"))}
++
++
++def _handle_tools_call(request_id: Any, params: dict[str, Any]) -> None:
++    tool_name = params.get("name")
++    args = params.get("arguments")
++    if not isinstance(args, dict):
++        args = {}
++
++    handler = _DISPATCH.get(tool_name) if isinstance(tool_name, str) else None
++    if handler is None:
++        payload = {"ok": False, "code": "error", "reason": f"unknown tool: {tool_name}"}
++        _reply(request_id, {"content": [_text_block(payload)], "isError": True})
++        return
++
++    try:
++        result = handler(args)
++    except Exception:  # noqa: BLE001 - a tool must never crash the plugin process
++        result = {"ok": False, "code": "error", "reason": "the tool failed unexpectedly"}
++
++    _reply(
++        request_id,
++        {"content": [_text_block(result)], "isError": not bool(result.get("ok", False))},
++    )
++
++
++def _handle(msg: dict[str, Any]) -> bool:
++    """Process one message; return False to stop the event loop."""
++    method = msg.get("method")
++    request_id = msg.get("id")
++
++    if request_id is None:
++        return True  # a notification from the client — nothing to reply to
++
++    if method == "initialize":
++        _reply(
++            request_id,
++            {
++                "protocolVersion": "2024-11-05",
++                "capabilities": {"tools": {}},
++                "serverInfo": {"name": "serial", "version": "0.1.0"},
++            },
++        )
++        return True
++
++    if method == "ping":
++        _reply(request_id, {})
++        return True
++
++    if method == "tools/list":
++        _reply(request_id, {"tools": _TOOLS})
++        return True
++
++    if method == "tools/call":
++        _handle_tools_call(request_id, msg.get("params") or {})
++        return True
++
++    if method == "shutdown":
++        _reply(request_id, {})
++        return False
++
++    _rpc_error(request_id, -32601, f"unknown method: {method}")
++    return True
++
++
++def main() -> None:
++    """Main entry point: process stdin line by line."""
++    for raw in sys.stdin:
++        raw = raw.strip()
++        if not raw:
++            continue
++        try:
++            msg = json.loads(raw)
++        except json.JSONDecodeError:
++            continue
++        if not _handle(msg):
++            break
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/src/workstation_agent/plugins/serial/plugin.toml b/src/workstation_agent/plugins/serial/plugin.toml
+new file mode 100644
+index 0000000..dfa7f0c
+--- /dev/null
++++ b/src/workstation_agent/plugins/serial/plugin.toml
+@@ -0,0 +1,48 @@
++id = "serial"
++name = "Serial"
++version = "0.1.0"
++runtime = "python"
++entry = ["-m", "workstation_agent.plugins.serial"]
++declared_permissions = [
++  "tool:serial.ports",
++  "tool:serial.open",
++  "tool:serial.write",
++  "tool:serial.read",
++  "tool:serial.close",
++  # What each argument IS.  args:<tool>:<mode>[:[!]<name>=<class>,...]
++  # mode is read|action; class is ws_path|ws_command|web_target|foreign|opaque;
++  # "!" marks the argument required.  A tool with no entry here is refused,
++  # and so is a call carrying an argument no entry names.
++  #
++  # None of this family's arguments are a workstation path, command or URL —
++  # a COM port name and a session id are opaque identifiers this plugin
++  # itself mints or compares, and a serial payload (text/hex to write, the
++  # `until` marker to read for) lives in the device's own namespace, not the
++  # workstation's.  Declaring any of `text`, `hex`, `until` as `ws_path`
++  # would compare a device payload against Windows filesystem roots it was
++  # never meant to resemble, and every legitimate write/read would then be
++  # denied outright (contract PLAN-BUILD.md, "a serial payload is NOT a
++  # workstation path") — `foreign` is the class that says so.
++  "args:serial.ports:read",
++  "args:serial.open:action:!port=opaque,!baud=opaque,bytesize=opaque,parity=opaque,stopbits=opaque,timeout_s=opaque",
++  "args:serial.write:action:!session_id=opaque,text=foreign,hex=foreign",
++  "args:serial.read:read:!session_id=opaque,until=foreign,max_bytes=opaque,timeout_s=opaque",
++  "args:serial.close:action:!session_id=opaque",
++]
++# No path:/cmd:/domain: entries: this family never touches a workstation
++# path, runs no workstation command, and dials no URL, so none of the three
++# hard-guard/confirmable conditions this gate knows about
++# (outside_declared_paths / command_outside_allowlist / domain_outside_allowlist)
++# apply here — leaving this empty is the correct declaration, not an
++# oversight.  Contract §7's own always-prompt list (serial_open, serial_write)
++# and pre-approved list (serial_ports, serial_read, serial_close) is "an
++# Agent setting" (contract §7) layered by B3 on top of this gate by tool
++# name, not something this manifest can express — B3 had not landed in this
++# worktree at the time this was built (verified: no such mapping exists yet
++# in confirm.py or config/schema.py). It needs no change here to pick up
++# serial_open/serial_write once it lands, because it keys on the served
++# wire names, not on anything declared in this file.
++confirmable_conditions = []
++
++[compat]
++min_host_version = "0.1.0"
+diff --git a/src/workstation_agent/plugins/serial/signature.sig b/src/workstation_agent/plugins/serial/signature.sig
+new file mode 100644
+index 0000000000000000000000000000000000000000..58e85c818e0a7dc0177e2865c346d48a4c5c0707
+GIT binary patch
+literal 64
+zcmV-G0KfkY^pW&MuP1yphk5toTh%xQ-R->BFmP-txj3j#te9<Lafc16is3(IIjM``
+WiP1>0X_G_`wd|GhO4E*rc>M}Jydkmx
+
+literal 0
+HcmV?d00001
+
+diff --git a/tests/integration/mcp_host/test_serial_plugin.py b/tests/integration/mcp_host/test_serial_plugin.py
+new file mode 100644
+index 0000000..a4a3d6a
+--- /dev/null
++++ b/tests/integration/mcp_host/test_serial_plugin.py
+@@ -0,0 +1,194 @@
++"""Integration test: the real ``serial`` plugin subprocess through MCPHost.
++
++Unlike ``tests/unit/plugins/serial/*`` (which drive the pure logic with a
++fake backend), this exercises the whole path a real call takes: signature
++verification of the shipped, signed ``plugin.toml``, a real subprocess
++spawned by the supervisor, the JSON-RPC wire, the declaration gate, and back.
++
++No serial hardware is required: ``serial.ports`` is real device enumeration
++(whatever COM ports genuinely exist on the machine running this test, which
++may be none), and ``serial.open`` against a port name nothing on this
++machine has is exercised for its *failure* path — proving the gate, the
++subprocess and the not_found/error mapping work end to end, which is exactly
++what item 4 of the brief says cannot be proven for the *success* path
++without a real device.
++"""
++# ruff: noqa: E402, ARG001
++
++from __future__ import annotations
++
++import json
++import os
++import sys
++from pathlib import Path
++
++import pytest
++
++pytestmark = pytest.mark.skipif(
++    os.getenv("CI") == "true",
++    reason="plugin subprocess race on GH Actions py3.12 (task #10)",
++)
++
++_REPO_ROOT = Path(__file__).resolve().parents[3]
++_WORKTREE_SRC = _REPO_ROOT / "src"
++if str(_WORKTREE_SRC) not in sys.path:
++    sys.path.insert(0, str(_WORKTREE_SRC))
++if str(_REPO_ROOT) not in sys.path:
++    sys.path.insert(0, str(_REPO_ROOT))
++
++import workstation_agent.mcp_host.audit as audit_mod
++import workstation_agent.mcp_host.loader as loader_mod
++from workstation_agent.config.schema import AgentConfig
++from workstation_agent.config.schema import PluginConfig as _PluginCfg
++from workstation_agent.mcp_host.host import MCPHost
++
++_pub_hex_path = _REPO_ROOT / "working" / "signing" / "first_party.pub.hex"
++_first_party_pubkey = bytes.fromhex(_pub_hex_path.read_text().strip())
++if _first_party_pubkey not in loader_mod.TRUSTED_PUBKEYS:
++    loader_mod.TRUSTED_PUBKEYS.insert(0, _first_party_pubkey)
++
++
++@pytest.fixture
++def agent_config():
++    cfg = AgentConfig()
++    cfg.plugins.per_plugin["serial"] = _PluginCfg(
++        enabled=True,
++        granted_permissions=[
++            "tool:serial.ports",
++            "tool:serial.open",
++            "tool:serial.write",
++            "tool:serial.read",
++            "tool:serial.close",
++        ],
++    )
++    return cfg
++
++
++@pytest.fixture(autouse=True)
++def isolated_audit_db(tmp_path):
++    db_path = tmp_path / "audit.db"
++    audit_mod.set_db_path(db_path)
++    yield db_path
++    audit_mod.reset_connection()
++
++
++def _text_payload(result) -> dict:
++    texts = [item["text"] for item in result.content if item.get("type") == "text"]
++    assert len(texts) == 1
++    return json.loads(texts[0])
++
++
++@pytest.mark.asyncio
++async def test_serial_plugin_loads_and_verifies(agent_config, isolated_audit_db):
++    host = MCPHost()
++    await host.start(agent_config, confirm_cb=None)
++    try:
++        plugins = await host.plugins()
++        serial = next(p for p in plugins if p.id == "serial")
++        assert serial.status == "running"
++        assert serial.signature_status == "valid"
++    finally:
++        await host.stop()
++
++
++@pytest.mark.asyncio
++async def test_serial_plugin_exposes_five_tools(agent_config, isolated_audit_db):
++    host = MCPHost()
++    await host.start(agent_config, confirm_cb=None)
++    try:
++        tools = await host.tools()
++        names = {t.name for t in tools if t.name.startswith("serial.")}
++        assert names == {
++            "serial.ports",
++            "serial.open",
++            "serial.write",
++            "serial.read",
++            "serial.close",
++        }
++    finally:
++        await host.stop()
++
++
++@pytest.mark.asyncio
++async def test_serial_ports_end_to_end(agent_config, isolated_audit_db):
++    """A real, pre-approved call: no confirm callback needed, no hardware
++    needed either — an empty (or non-empty) port list is both a success."""
++    host = MCPHost()
++    await host.start(agent_config, confirm_cb=None)
++    try:
++        result = await host.invoke("serial.ports", {})
++    finally:
++        await host.stop()
++
++    assert not result.is_error
++    payload = _text_payload(result)
++    assert payload["ok"] is True
++    assert isinstance(payload["ports"], list)
++
++
++@pytest.mark.asyncio
++async def test_serial_open_on_a_port_that_does_not_exist_is_refused_end_to_end(
++    agent_config, isolated_audit_db,
++):
++    """No hardware is needed to prove the failure path: a COM port name
++    vanishingly unlikely to exist on the machine running this test still
++    round-trips through the gate, the subprocess and pyserial's own error,
++    landing on a clean §5.2 envelope rather than an exception or a hang."""
++
++    async def _auto_approve(_req) -> bool:
++        return True
++
++    host = MCPHost()
++    await host.start(agent_config, confirm_cb=_auto_approve)
++    try:
++        result = await host.invoke("serial.open", {"port": "COM987", "baud": 9600})
++    finally:
++        await host.stop()
++
++    payload = _text_payload(result)
++    assert payload["ok"] is False
++    assert payload["code"] in {"not_found", "error"}
++    assert "reason" in payload
++
++
++@pytest.mark.asyncio
++async def test_serial_write_on_an_unknown_session_is_refused_end_to_end(
++    agent_config, isolated_audit_db,
++):
++    async def _auto_approve(_req) -> bool:
++        return True
++
++    host = MCPHost()
++    await host.start(agent_config, confirm_cb=_auto_approve)
++    try:
++        result = await host.invoke(
++            "serial.write", {"session_id": "0" * 32, "text": "AT\r\n"},
++        )
++    finally:
++        await host.stop()
++
++    payload = _text_payload(result)
++    assert payload["ok"] is False
++    assert payload["code"] == "unknown_session"
++
++
++@pytest.mark.asyncio
++async def test_serial_write_ungranted_argument_is_denied_by_the_gate(
++    agent_config, isolated_audit_db,
++):
++    """A call carrying an argument the manifest never declared must be
++    refused by the gate before it ever reaches the plugin subprocess —
++    proves the declaration gate is actually wired for this family, not just
++    unit-tested in isolation."""
++    host = MCPHost()
++    await host.start(agent_config, confirm_cb=None)
++    try:
++        result = await host.invoke(
++            "serial.write",
++            {"session_id": "abc", "text": "AT\r\n", "not_a_real_argument": "x"},
++        )
++    finally:
++        await host.stop()
++
++    assert result.ok is False
++    assert result.code == "denied"
+diff --git a/tests/unit/plugins/serial/__init__.py b/tests/unit/plugins/serial/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/tests/unit/plugins/serial/test_declaration_gate.py b/tests/unit/plugins/serial/test_declaration_gate.py
+new file mode 100644
+index 0000000..b672288
+--- /dev/null
++++ b/tests/unit/plugins/serial/test_declaration_gate.py
+@@ -0,0 +1,154 @@
++"""The serial plugin's own contribution to the declaration-gate tests.
++
++``tests/unit/mcp_host/test_argument_declarations.py`` already parametrises
++over every shipped ``plugin.toml`` (including this one) and proves the two
++generic properties: every declared tool has an ``args:`` entry, and no
++``args:`` entry names an undeclared tool. What is specific to this family,
++and worth its own test, is the classification the brief calls out by name:
++``text``, ``hex`` and ``until`` are serial *payloads* — they live in the
++device's namespace, not the workstation's — and must be declared ``foreign``,
++never ``ws_path``. This file proves both directions: the real, shipped
++declaration lets a legitimate write through, and a manifest that
++misclassifies the payload as ``ws_path`` denies that same legitimate write.
++That second half is the mutation test PLAN-BUILD.md asks for, kept in the
++suite rather than only run by hand once.
++"""
++
++from __future__ import annotations
++
++import tomllib
++from pathlib import Path
++
++from workstation_agent.mcp_host.loader import PluginManifest
++from workstation_agent.mcp_host.permissions import classify, evaluate
++
++_PLUGIN_DIR = (
++    Path(__file__).resolve().parents[4] / "src" / "workstation_agent" / "plugins" / "serial"
++)
++
++
++def _load_manifest(declared_permissions: list[str] | None = None) -> PluginManifest:
++    """The real shipped ``plugin.toml``, optionally with its declarations swapped out."""
++    data = tomllib.loads((_PLUGIN_DIR / "plugin.toml").read_text(encoding="utf-8"))
++    declared = declared_permissions if declared_permissions is not None else list(
++        data["declared_permissions"],
++    )
++    return PluginManifest(
++        id=data["id"],
++        name=data["name"],
++        version=data["version"],
++        runtime=data["runtime"],
++        entry=list(data.get("entry", [])),
++        plugin_dir=_PLUGIN_DIR,
++        signature_file=_PLUGIN_DIR / "signature.sig",
++        declared_permissions=declared,
++        confirmable_conditions=list(data.get("confirmable_conditions", [])),
++        compat=dict(data.get("compat", {})),
++    )
++
++
++_GRANTED = {
++    "tool:serial.ports",
++    "tool:serial.open",
++    "tool:serial.write",
++    "tool:serial.read",
++    "tool:serial.close",
++}
++
++
++def test_shipped_manifest_classifies_write_payloads_as_foreign() -> None:
++    manifest = _load_manifest()
++    classified = classify(manifest, "serial.write", {"session_id": "abc", "text": "AT\r\n"})
++    assert classified.paths == (), "a serial payload must never be compared to a Windows root"
++    assert not classified.undeclared
++    assert not classified.missing
++
++
++def test_shipped_manifest_classifies_until_as_foreign() -> None:
++    manifest = _load_manifest()
++    classified = classify(manifest, "serial.read", {"session_id": "abc", "until": "OK\r\n"})
++    assert classified.paths == ()
++
++
++def test_shipped_manifest_classifies_session_id_port_baud_as_opaque() -> None:
++    manifest = _load_manifest()
++    # opaque and foreign are mechanically identical (both exempt from the
++    # workstation allowlists) — what matters here is that neither `session_id`
++    # nor `port`/`baud` is a ws_path candidate either.
++    open_classified = classify(manifest, "serial.open", {"port": "COM3", "baud": 115200})
++    assert open_classified.paths == ()
++    assert not open_classified.undeclared
++
++
++def test_shipped_manifest_allows_a_legitimate_write() -> None:
++    manifest = _load_manifest()
++    decision = evaluate(
++        manifest,
++        "serial.write",
++        {"session_id": "abc123", "text": "AT\r\n"},
++        _GRANTED,
++    )
++    assert decision == "allow"
++
++
++def test_shipped_manifest_allows_a_legitimate_read_with_until() -> None:
++    manifest = _load_manifest()
++    decision = evaluate(
++        manifest,
++        "serial.read",
++        {"session_id": "abc123", "until": "OK\r\n"},
++        _GRANTED,
++    )
++    assert decision == "allow"
++
++
++# ---------------------------------------------------------------------------
++# The mutation: declare the payload as ws_path instead of foreign.
++# ---------------------------------------------------------------------------
++
++
++def test_mutation_declaring_the_write_payload_as_ws_path_breaks_every_legitimate_write() -> None:
++    """This is the exact mistake item 2 of the brief warns about: if `text`
++    were declared `ws_path`, it would be compared against this plugin's
++    declared roots — of which there are none, because this family has no
++    workstation paths at all — and `_outside_declared_paths` denies outright
++    (a declared class with zero declared roots is "no path access", not "no
++    restriction"). A legitimate `AT\\r\\n` write is not a Windows path, is
++    never found inside any root, and the call denies.
++
++    If this test ever passes with `decision == "allow"`, the manifest's
++    payload classification silently regressed to ws_path (or something
++    equally wrong) and every real serial_write would be broken in
++    production — which is exactly why this must fail loudly, not quietly."""
++    mutated = [
++        "tool:serial.write",
++        "args:serial.write:action:!session_id=opaque,text=ws_path,hex=foreign",
++    ]
++    manifest = _load_manifest(declared_permissions=mutated)
++
++    decision = evaluate(
++        manifest,
++        "serial.write",
++        {"session_id": "abc123", "text": "AT\r\n"},
++        {"tool:serial.write"},
++    )
++    assert decision == "deny", (
++        "declaring a serial payload as ws_path must break the call — proving "
++        "why the real manifest declares it foreign instead"
++    )
++
++
++def test_mutation_declaring_until_as_ws_path_breaks_a_legitimate_read() -> None:
++    mutated = [
++        "tool:serial.read",
++        "args:serial.read:read:!session_id=opaque,until=ws_path",
++    ]
++    manifest = _load_manifest(declared_permissions=mutated)
++
++    decision = evaluate(
++        manifest,
++        "serial.read",
++        {"session_id": "abc123", "until": "OK\r\n"},
++        {"tool:serial.read"},
++    )
++    assert decision == "deny"
+diff --git a/tests/unit/plugins/serial/test_logic.py b/tests/unit/plugins/serial/test_logic.py
+new file mode 100644
+index 0000000..c5ba7c9
+--- /dev/null
++++ b/tests/unit/plugins/serial/test_logic.py
+@@ -0,0 +1,531 @@
++"""Unit tests for the serial plugin's tool logic (contract §6, §6.1).
++
++Every test here drives the pure `*_result` functions with a fake standing in
++for `SerialLike` — no serial hardware is used or required anywhere in this
++file, which is the whole point of the backend seam in
++`workstation_agent.plugins.serial.__main__`.
++"""
++
++from __future__ import annotations
++
++import pytest
++
++from workstation_agent.plugins.serial import __main__ as serial_main
++from workstation_agent.plugins.serial.__main__ import (
++    MAX_READ_CHARS,
++    MAX_READ_TIMEOUT_S,
++    SessionStore,
++    _cap_read_text,
++    close_result,
++    open_result,
++    ports_result,
++    read_result,
++    write_result,
++)
++
++
++class ByteQueueSerial:
++    """A fake `SerialLike` that returns queued bytes immediately, never
++    really blocking. Good enough to drive the read loop deterministically:
++    when a test wants the *timeout* branch to fire, the queue is simply
++    left short and the (small, test-chosen) `timeout_s` does the waiting."""
++
++    def __init__(self, data: bytes = b"") -> None:
++        self._buf = bytearray(data)
++        self.timeout: float | None = None
++        self.closed = False
++        self.written = bytearray()
++        self.raise_on_write: Exception | None = None
++        self.raise_on_read: Exception | None = None
++
++    def write(self, data: bytes) -> int:
++        if self.raise_on_write is not None:
++            raise self.raise_on_write
++        self.written.extend(data)
++        return len(data)
++
++    def read(self, size: int = 1) -> bytes:
++        if self.raise_on_read is not None:
++            raise self.raise_on_read
++        n = min(size, len(self._buf))
++        chunk = bytes(self._buf[:n])
++        del self._buf[:n]
++        return chunk
++
++    def close(self) -> None:
++        self.closed = True
++
++
++class _PortInfo:
++    def __init__(self, device: str, description: str, vid: int | None, pid: int | None) -> None:
++        self.device = device
++        self.description = description
++        self.vid = vid
++        self.pid = pid
++
++
++# ---------------------------------------------------------------------------
++# serial_ports
++# ---------------------------------------------------------------------------
++
++
++def test_ports_result_lists_com_ports_with_hex_vid_pid() -> None:
++    fake_ports = [
++        _PortInfo("COM3", "USB Serial", 0x1234, 0xABCD),
++        _PortInfo("COM1", "", None, None),
++    ]
++    result = ports_result(list_ports_fn=lambda: fake_ports)
++    assert result == {
++        "ok": True,
++        "ports": [
++            {"port": "COM3", "description": "USB Serial", "vid": "1234", "pid": "abcd"},
++            {"port": "COM1", "description": "", "vid": None, "pid": None},
++        ],
++    }
++
++
++def test_ports_result_never_crashes_the_plugin_on_a_listing_error() -> None:
++    def _boom():
++        msg = "enumeration failed"
++        raise OSError(msg)
++
++    result = ports_result(list_ports_fn=_boom)
++    assert result["ok"] is False
++    assert result["code"] == "error"
++
++
++# ---------------------------------------------------------------------------
++# serial_open
++# ---------------------------------------------------------------------------
++
++
++def test_open_result_success_mints_a_session() -> None:
++    store = SessionStore()
++    fake = ByteQueueSerial()
++    result = open_result(store, port="COM3", baud=115200, open_fn=lambda *_a, **_kw: fake)
++    assert result["ok"] is True
++    assert result["port"] == "COM3"
++    assert result["baud"] == 115200
++    assert store.get(result["session_id"]) is not None
++
++
++@pytest.mark.parametrize(
++    ("kwargs", "why"),
++    [
++        ({"port": "", "baud": 9600}, "empty port"),
++        ({"port": 123, "baud": 9600}, "non-string port"),
++        ({"port": "COM3", "baud": 0}, "zero baud"),
++        ({"port": "COM3", "baud": -1}, "negative baud"),
++        ({"port": "COM3", "baud": True}, "bool is not an int baud"),
++        ({"port": "COM3", "baud": "115200"}, "string baud"),
++    ],
++)
++def test_open_result_rejects_malformed_arguments(kwargs, why) -> None:
++    store = SessionStore()
++    result = open_result(store, open_fn=lambda *_a, **_kw: ByteQueueSerial(), **kwargs)
++    assert result["ok"] is False, why
++    assert result["code"] == "error"
++
++
++def test_open_result_maps_a_missing_port_to_not_found() -> None:
++    store = SessionStore()
++
++    def _open_fn(*_a, **_kw):
++        msg = (
++            "could not open port 'COM231': FileNotFoundError(2, "
++            "'The system cannot find the file specified.')"
++        )
++        raise Exception(msg)  # noqa: TRY002 - mirrors pyserial's own SerialException shape
++
++    result = open_result(store, port="COM231", baud=9600, open_fn=_open_fn)
++    assert result == {
++        "ok": False,
++        "code": "not_found",
++        "reason": "No serial port by that name was found.",
++    }
++
++
++def test_open_result_maps_an_unrecognised_failure_to_error_without_leaking_the_message() -> None:
++    store = SessionStore()
++
++    def _open_fn(*_a, **_kw):
++        msg = r"PermissionError(13, 'Access is denied.') at C:\secret\path"
++        raise Exception(msg)  # noqa: TRY002
++
++    result = open_result(store, port="COM3", baud=9600, open_fn=_open_fn)
++    assert result["ok"] is False
++    assert result["code"] == "error"
++    assert r"C:\secret\path" not in result["reason"], "must never echo a path back"
++
++
++def test_open_result_refuses_a_fifth_session_and_closes_the_unused_handle() -> None:
++    store = SessionStore()
++    handles = [ByteQueueSerial() for _ in range(5)]
++    it = iter(handles)
++
++    for _ in range(4):
++        result = open_result(store, port="COM3", baud=9600, open_fn=lambda *_a, **_kw: next(it))
++        assert result["ok"] is True
++
++    fifth = open_result(store, port="COM3", baud=9600, open_fn=lambda *_a, **_kw: next(it))
++    assert fifth["ok"] is False
++    assert fifth["code"] == "error"
++    assert "4 serial sessions" in fifth["reason"]
++    assert handles[4].closed is True, "the unused 5th handle must not leak"
++
++
++def test_open_result_clamps_timeout_to_twenty_seconds() -> None:
++    store = SessionStore()
++    seen: dict[str, float] = {}
++
++    def _open_fn(_port, _baud, **kw):
++        seen["timeout_s"] = kw["timeout_s"]
++        return ByteQueueSerial()
++
++    open_result(store, port="COM3", baud=9600, timeout_s=999, open_fn=_open_fn)
++    assert seen["timeout_s"] == MAX_READ_TIMEOUT_S
++
++
++# ---------------------------------------------------------------------------
++# serial_write
++# ---------------------------------------------------------------------------
++
++
++def _opened_session(
++    store: SessionStore, fake: ByteQueueSerial | None = None,
++) -> tuple[str, ByteQueueSerial]:
++    fake = fake or ByteQueueSerial()
++    result = open_result(store, port="COM3", baud=9600, open_fn=lambda *_a, **_kw: fake)
++    return result["session_id"], fake
++
++
++def test_write_result_sends_text() -> None:
++    store = SessionStore()
++    session_id, fake = _opened_session(store)
++
++    result = write_result(store, session_id=session_id, text="AT\r\n")
++    assert result["ok"] is True
++    assert result["bytes"] == 4
++    assert result["text"] == "AT\r\n"
++    assert result["hex"] == "41540d0a"
++    assert result["timed_out"] is False
++    assert bytes(fake.written) == b"AT\r\n"
++
++
++def test_write_result_sends_hex() -> None:
++    store = SessionStore()
++    session_id, fake = _opened_session(store)
++
++    result = write_result(store, session_id=session_id, hex_="deadbeef")
++    assert result["ok"] is True
++    assert result["bytes"] == 4
++    assert result["hex"] == "deadbeef"
++    assert bytes(fake.written) == b"\xde\xad\xbe\xef"
++
++
++def test_write_result_hex_that_is_not_valid_utf8_gives_empty_text_not_mangled_text() -> None:
++    """The write echo never mangles non-UTF-8 bytes into `text` — it is
++    empty instead, same discipline as the read-side refusal, just not a
++    whole-call failure since the operation itself (the write) succeeded."""
++    store = SessionStore()
++    session_id, _ = _opened_session(store)
++
++    result = write_result(store, session_id=session_id, hex_="ff")
++    assert result["ok"] is True
++    assert result["text"] == ""
++    assert result["hex"] == "ff"
++
++
++@pytest.mark.parametrize(
++    "kwargs",
++    [
++        {},  # neither text nor hex
++        {"text": "a", "hex_": "00"},  # both
++        {"hex_": "not-hex"},
++        {"text": 5},
++    ],
++)
++def test_write_result_rejects_malformed_payloads(kwargs) -> None:
++    store = SessionStore()
++    session_id, _ = _opened_session(store)
++    result = write_result(store, session_id=session_id, **kwargs)
++    assert result["ok"] is False
++    assert result["code"] == "error"
++
++
++def test_write_result_unknown_session() -> None:
++    store = SessionStore()
++    result = write_result(store, session_id="nope", text="hi")
++    assert result["ok"] is False
++    assert result["code"] == "unknown_session"
++
++
++def test_write_result_survives_a_hardware_failure() -> None:
++    store = SessionStore()
++    fake = ByteQueueSerial()
++    fake.raise_on_write = OSError("device unplugged")
++    session_id, _ = _opened_session(store, fake)
++
++    result = write_result(store, session_id=session_id, text="hi")
++    assert result["ok"] is False
++    assert result["code"] == "error"
++
++
++# ---------------------------------------------------------------------------
++# serial_read — §5.3's binary rule is the point of this section.
++# ---------------------------------------------------------------------------
++
++
++def test_read_result_returns_decoded_text_and_hex() -> None:
++    store = SessionStore()
++    session_id, _ = _opened_session(store, ByteQueueSerial(b"OK\r\n"))
++
++    result = read_result(store, session_id=session_id, max_bytes=4, timeout_s=1)
++    assert result["ok"] is True
++    assert result["text"] == "OK\r\n"
++    assert result["hex"] == "4f4b0d0a"
++    assert result["bytes"] == 4
++    assert result["timed_out"] is False  # the requested max_bytes was filled
++
++
++def test_read_result_reads_until_the_marker() -> None:
++    store = SessionStore()
++    session_id, _ = _opened_session(store, ByteQueueSerial(b"hello\nmore-data-not-read"))
++
++    result = read_result(store, session_id=session_id, until="\n", timeout_s=1)
++    assert result["ok"] is True
++    assert result["text"] == "hello\n"
++    assert result["timed_out"] is False
++
++
++def test_read_result_with_no_until_and_no_max_bytes_times_out_by_definition() -> None:
++    """§6.1: "with neither `until` nor a full `max_bytes` the read returns
++    at the timeout with `timed_out: true`" — even though data did arrive."""
++    store = SessionStore()
++    session_id, _ = _opened_session(store, ByteQueueSerial(b"partial"))
++
++    result = read_result(store, session_id=session_id, timeout_s=0.05)
++    assert result["ok"] is True
++    assert result["text"] == "partial"
++    assert result["timed_out"] is True
++
++
++def test_read_result_with_an_until_marker_never_seen_times_out() -> None:
++    store = SessionStore()
++    session_id, _ = _opened_session(store, ByteQueueSerial(b"no marker here"))
++
++    result = read_result(store, session_id=session_id, until="XYZ", timeout_s=0.05)
++    assert result["ok"] is True
++    assert result["timed_out"] is True
++
++
++def test_read_result_unknown_session() -> None:
++    store = SessionStore()
++    result = read_result(store, session_id="ghost")
++    assert result["ok"] is False
++    assert result["code"] == "unknown_session"
++
++
++@pytest.mark.parametrize("max_bytes", [0, -1, True, "10"])
++def test_read_result_rejects_a_bad_max_bytes(max_bytes) -> None:
++    store = SessionStore()
++    session_id, _ = _opened_session(store)
++    result = read_result(store, session_id=session_id, max_bytes=max_bytes)
++    assert result["ok"] is False
++    assert result["code"] == "error"
++
++
++def test_read_result_clamps_timeout_to_twenty_seconds() -> None:
++    store = SessionStore()
++    fake = ByteQueueSerial(b"x")
++    session_id, _ = _opened_session(store, fake)
++
++    read_result(store, session_id=session_id, timeout_s=999, max_bytes=1)
++    assert fake.timeout is not None
++    assert fake.timeout <= MAX_READ_TIMEOUT_S
++
++
++# --- The mutation-test the brief asks for: non-UTF-8 device output --------
++
++
++def test_read_result_refuses_non_utf8_bytes_rather_than_mangling_or_passing_them_through() -> None:
++    """This is the specific scenario the brief calls "the single most likely
++    place in the whole build to return raw binary by accident": a device
++    handing back bytes that are not valid UTF-8 (0xFF is not a valid UTF-8
++    lead or continuation byte in any position).
++
++    A broken implementation that did `raw.decode("utf-8", errors="replace")`
++    or `errors="ignore"` would return `ok: true` here with mangled text —
++    this test fails loudly against exactly that mutation, which was verified
++    by hand during development (see the final report)."""
++    store = SessionStore()
++    non_utf8 = b"\xff\xfe\x00\x01garbage"
++    session_id, _ = _opened_session(store, ByteQueueSerial(non_utf8))
++
++    result = read_result(store, session_id=session_id, max_bytes=len(non_utf8), timeout_s=1)
++
++    assert result["ok"] is False
++    assert result["code"] == "error"
++    assert "text" not in result
++    assert "hex" not in result
++    assert str(len(non_utf8)) in result["reason"]
++    assert "binary transfer is not available yet" in result["reason"]
++
++
++def test_read_result_survives_a_hardware_failure() -> None:
++    store = SessionStore()
++    fake = ByteQueueSerial()
++    fake.raise_on_read = OSError("device unplugged")
++    session_id, _ = _opened_session(store, fake)
++
++    result = read_result(store, session_id=session_id, max_bytes=1, timeout_s=0.05)
++    assert result["ok"] is False
++    assert result["code"] == "error"
++
++
++# --- Rework cycle 1, finding 1: a cap/timeout cutting mid-character must ---
++# --- not be reported as the device's fault. -------------------------------
++
++
++def test_read_result_truncated_multibyte_char_is_not_reported_as_a_device_fault() -> None:
++    """A device sending perfectly valid non-ASCII UTF-8, cut off mid-character
++    by the byte cap, must come back `ok: true` with the complete prefix — not
++    `ok: false` blaming the device for something this function did to its own
++    stream. `€` encodes as 3 bytes (`e2 82 ac`); capping at 4 of the 5 total
++    bytes ("AB" + 2 of the euro sign's 3 bytes) is exactly that cut."""
++    euro = "€".encode()
++    raw = b"AB" + euro
++    assert len(raw) == 5
++    store = SessionStore()
++    session_id, _ = _opened_session(store, ByteQueueSerial(raw))
++
++    result = read_result(store, session_id=session_id, max_bytes=4, timeout_s=1)
++
++    assert result["ok"] is True
++    assert result.get("code") is None
++    assert result["text"] == "AB", "the incomplete trailing sequence is dropped, not mangled"
++    assert result["bytes"] == 4, "the full drained buffer is still reported"
++    assert result["hex"] == raw[:4].hex(), "nothing is silently lost — it's in hex"
++    assert result["timed_out"] is False  # the requested max_bytes was filled
++
++
++def test_read_result_truncated_at_the_timeout_rather_than_the_cap_is_also_not_a_fault() -> None:
++    """Same defect, reached via the other stop condition: no `max_bytes`
++    given, the read stops at the timeout with whatever is in the buffer,
++    which can just as easily end mid-character."""
++    euro = "€".encode()
++    raw = b"AB" + euro[:2]
++    store = SessionStore()
++    session_id, _ = _opened_session(store, ByteQueueSerial(raw))
++
++    result = read_result(store, session_id=session_id, timeout_s=0.05)
++
++    assert result["ok"] is True
++    assert result["text"] == "AB"
++    assert result["bytes"] == len(raw)
++    assert result["timed_out"] is True  # neither `until` nor a full `max_bytes` — §6.1
++
++
++# ---------------------------------------------------------------------------
++# Rework cycle 1, finding 2: the 60,000-*character* cap is enforced
++# independently of whatever byte bound produced the text.
++# ---------------------------------------------------------------------------
++
++
++def test_cap_read_text_enforces_the_character_cap() -> None:
++    long_text = "x" * (MAX_READ_CHARS + 500)
++    assert len(_cap_read_text(long_text)) == MAX_READ_CHARS
++
++
++def test_cap_read_text_reads_the_limit_dynamically_not_at_import_time(monkeypatch) -> None:
++    """Proves the post-decode check is a live guard, not a value baked in at
++    definition time — so tuning `MAX_READ_BYTES` independently of the
++    character cap (finding 2's actual worry) cannot silently exceed it."""
++    monkeypatch.setattr(serial_main, "MAX_READ_CHARS", 3)
++    assert _cap_read_text("abcdef") == "abc"
++
++
++# ---------------------------------------------------------------------------
++# Rework cycle 1, finding 3 & 4: `until=""` and a surrogate-bearing `until`.
++# ---------------------------------------------------------------------------
++
++
++def test_read_result_rejects_an_empty_until_explicitly() -> None:
++    store = SessionStore()
++    session_id, _ = _opened_session(store, ByteQueueSerial(b"data"))
++
++    result = read_result(store, session_id=session_id, until="", timeout_s=0.05)
++
++    assert result["ok"] is False
++    assert result["code"] == "error"
++    assert "until" in result["reason"]
++
++
++def test_read_result_rejects_a_surrogate_bearing_until_without_crashing() -> None:
++    store = SessionStore()
++    session_id, _ = _opened_session(store, ByteQueueSerial(b"data"))
++
++    result = read_result(store, session_id=session_id, until="\ud800", timeout_s=0.05)
++
++    assert result["ok"] is False
++    assert result["code"] == "error"
++    assert "cannot be represented" in result["reason"]
++
++
++def test_write_result_rejects_a_surrogate_bearing_text_without_crashing() -> None:
++    """Same class of bug, same fix, on the write side's `text` argument —
++    not one of the four numbered findings, but the same "assume any
++    caller-supplied string can be surrogate-bearing" principle applied
++    where the same `.encode("utf-8")` call exists."""
++    store = SessionStore()
++    session_id, _ = _opened_session(store)
++
++    result = write_result(store, session_id=session_id, text="\ud800")
++
++    assert result["ok"] is False
++    assert result["code"] == "error"
++    assert "cannot be represented" in result["reason"]
++
++
++# ---------------------------------------------------------------------------
++# Rework cycle 1, finding 5: the session cap's blast radius.
++# ---------------------------------------------------------------------------
++
++
++def test_open_result_refusal_names_when_the_oldest_session_will_free_up() -> None:
++    store = SessionStore()
++    handles = [ByteQueueSerial() for _ in range(5)]
++    it = iter(handles)
++    for _ in range(4):
++        open_result(store, port="COM3", baud=9600, open_fn=lambda *_a, **_kw: next(it))
++
++    fifth = open_result(store, port="COM3", baud=9600, open_fn=lambda *_a, **_kw: next(it))
++
++    assert fifth["ok"] is False
++    assert "free up in about" in fifth["reason"], (
++        "the refusal should say relief is coming, even though no per-caller "
++        "isolation is possible from the plugin side (see the module docstring)"
++    )
++
++
++# ---------------------------------------------------------------------------
++# serial_close
++# ---------------------------------------------------------------------------
++
++
++def test_close_result_releases_the_port() -> None:
++    store = SessionStore()
++    fake = ByteQueueSerial()
++    session_id, _ = _opened_session(store, fake)
++
++    result = close_result(store, session_id=session_id)
++    assert result == {"ok": True, "session_id": session_id}
++    assert fake.closed is True
++    assert store.get(session_id) is None
++
++
++def test_close_result_unknown_session() -> None:
++    store = SessionStore()
++    result = close_result(store, session_id="ghost")
++    assert result["ok"] is False
++    assert result["code"] == "unknown_session"
+diff --git a/tests/unit/plugins/serial/test_sessions.py b/tests/unit/plugins/serial/test_sessions.py
+new file mode 100644
+index 0000000..d5d80d8
+--- /dev/null
++++ b/tests/unit/plugins/serial/test_sessions.py
+@@ -0,0 +1,181 @@
++"""Unit tests for the serial plugin's session bookkeeping (contract §5.5).
++
++Everything here drives ``SessionStore`` directly, with injected clocks, so
++the 10-minute idle timeout and the 4-session cap are provable without a real
++sleep and without a serial device.
++"""
++
++from __future__ import annotations
++
++from workstation_agent.plugins.serial.__main__ import (
++    IDLE_TIMEOUT_S,
++    MAX_SESSIONS,
++    SessionLimitExceededError,
++    SessionStore,
++)
++
++
++class _FakeHandle:
++    def __init__(self) -> None:
++        self.closed = False
++        self.timeout: float | None = None
++
++    def write(self, data: bytes) -> int:
++        return len(data)
++
++    def read(self, size: int = 1) -> bytes:  # noqa: ARG002
++        return b""
++
++    def close(self) -> None:
++        self.closed = True
++
++
++class _Clock:
++    """A controllable monotonic-ish clock for tests."""
++
++    def __init__(self, start: float = 1000.0) -> None:
++        self.now = start
++
++    def __call__(self) -> float:
++        return self.now
++
++    def advance(self, seconds: float) -> None:
++        self.now += seconds
++
++
++def _store() -> tuple[SessionStore, _Clock, _Clock]:
++    clock = _Clock(1_000.0)
++    wall = _Clock(1_700_000_000.0)
++    return SessionStore(clock=clock, wall_clock=wall), clock, wall
++
++
++def test_session_ids_are_unguessable_and_unique() -> None:
++    store, _, _ = _store()
++    ids = set()
++    for _ in range(50):
++        session = store.create(port="COM1", baud=9600, handle=_FakeHandle())
++        ids.add(session.session_id)
++        store.close(session.session_id)  # stay under the 4-session cap
++    assert len(ids) == 50
++    for sid in ids:
++        assert len(sid) == 32  # secrets.token_hex(16)
++        int(sid, 16)  # every character is a hex digit
++
++
++def test_at_most_four_sessions_open_at_once() -> None:
++    store, _, _ = _store()
++    for i in range(MAX_SESSIONS):
++        store.create(port=f"COM{i}", baud=9600, handle=_FakeHandle())
++    assert store.count() == MAX_SESSIONS
++
++    try:
++        store.create(port="COM99", baud=9600, handle=_FakeHandle())
++    except SessionLimitExceededError:
++        pass
++    else:
++        msg = "a 5th session must be refused"
++        raise AssertionError(msg)
++
++
++def test_idle_session_is_reaped_after_ten_minutes_and_closes_the_handle() -> None:
++    store, clock, _ = _store()
++    handle = _FakeHandle()
++    session = store.create(port="COM1", baud=9600, handle=handle)
++
++    clock.advance(IDLE_TIMEOUT_S - 1)
++    assert store.get(session.session_id) is not None
++    assert handle.closed is False
++
++    clock.advance(2)  # now just past the 10-minute idle bound
++    assert store.get(session.session_id) is None
++    assert handle.closed is True, "an idle-reaped session must release its port"
++
++
++def test_touch_resets_the_idle_clock() -> None:
++    store, clock, _ = _store()
++    session = store.create(port="COM1", baud=9600, handle=_FakeHandle())
++
++    clock.advance(IDLE_TIMEOUT_S - 1)
++    store.touch(session.session_id)
++    clock.advance(IDLE_TIMEOUT_S - 1)
++
++    assert store.get(session.session_id) is not None, "touching must postpone the idle reap"
++
++
++def test_unknown_session_before_any_open_blames_the_restart_time() -> None:
++    store, _, _wall = _store()
++    reason = store.unknown_reason("deadbeef" * 4)
++    assert "from before the Agent last restarted at" in reason
++    assert store.started_at_iso in reason
++
++
++def test_unknown_session_after_idle_reap_names_the_idle_close() -> None:
++    store, clock, _wall = _store()
++    session = store.create(port="COM1", baud=9600, handle=_FakeHandle())
++    clock.advance(IDLE_TIMEOUT_S + 1)
++    store.get(session.session_id)  # triggers the reap as a side effect
++
++    reason = store.unknown_reason(session.session_id)
++    assert "closed after 10 minutes idle at" in reason
++
++
++def test_unknown_session_after_explicit_close_does_not_claim_idle() -> None:
++    """A caller that closes its own session is not told it "went idle" —
++    that would be false, and was a real defect caught while writing this
++    test (the first implementation used one blanket "idle" message for
++    every kind of closure)."""
++    store, _, _ = _store()
++    session = store.create(port="COM1", baud=9600, handle=_FakeHandle())
++    store.close(session.session_id)
++
++    reason = store.unknown_reason(session.session_id)
++    assert "idle" not in reason
++    assert "already closed at" in reason
++
++
++def test_sessions_are_scoped_to_one_store_instance() -> None:
++    """The strongest guarantee available at this layer: a fresh store (a
++    fresh process, i.e. an Agent restart) knows nothing about a previous
++    store's sessions — this is what "sessions die with the Agent" reduces to
++    at the unit level, since the real guarantee (process exit) cannot be
++    exercised in-process."""
++    store_a, _, _ = _store()
++    session = store_a.create(port="COM1", baud=9600, handle=_FakeHandle())
++
++    store_b, _, _ = _store()
++    assert store_b.get(session.session_id) is None
++
++
++# ---------------------------------------------------------------------------
++# Rework cycle 1, finding 5: `next_reap_in` — the one blast-radius mitigation
++# available without per-caller identity.
++# ---------------------------------------------------------------------------
++
++
++def test_next_reap_in_is_none_with_no_sessions_open() -> None:
++    store, _, _ = _store()
++    assert store.next_reap_in() is None
++
++
++def test_next_reap_in_counts_down_from_the_idle_timeout() -> None:
++    store, clock, _ = _store()
++    store.create(port="COM1", baud=9600, handle=_FakeHandle())
++
++    assert store.next_reap_in() == IDLE_TIMEOUT_S
++
++    clock.advance(100)
++    assert store.next_reap_in() == IDLE_TIMEOUT_S - 100
++
++
++def test_next_reap_in_tracks_the_least_recently_used_session() -> None:
++    store, clock, _ = _store()
++    first = store.create(port="COM1", baud=9600, handle=_FakeHandle())
++    clock.advance(60)
++    store.create(port="COM2", baud=9600, handle=_FakeHandle())
++
++    # The first session is the most idle, so it governs when the next slot
++    # frees up — touching it should push that estimate back out.
++    assert store.next_reap_in() == IDLE_TIMEOUT_S - 60
++
++    store.touch(first.session_id)
++    assert store.next_reap_in() == IDLE_TIMEOUT_S

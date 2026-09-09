@@ -1,0 +1,2372 @@
+diff --git a/pyproject.toml b/pyproject.toml
+index 96a227f..8224753 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -37,12 +37,29 @@ dependencies = [
+     "sounddevice>=0.4,<1.0",
+     "webrtcvad-wheels>=2.0,<3.0",
+     "psutil>=5.0,<6.0",
++    "mcp>=2.1,<3.0",
+ ]
+-# Note: the `mcp` PyPI package was intentionally dropped. SPEC-03A implements the
+-# MCP JSON-RPC stdio protocol inline (see src/workstation_agent/mcp_host/mcp_client.py)
+-# because the `mcp` package's stdio_client bypasses our subprocess env-whitelist +
+-# Job Object isolation. Do not add `mcp` back — it will conflict with system tools
+-# (e.g. PersonaCore's pinned mcp 2.x) with zero benefit to us.
++# Note on `mcp`, amended by subtask B4 (full reasoning in
++# src/workstation_agent/network_mcp/DECISION.md):
++#
++#   * The STDIO CLIENT rejection still stands. SPEC-03A implements the MCP
++#     JSON-RPC stdio protocol inline (mcp_host/mcp_client.py) because the `mcp`
++#     package's stdio_client spawns the subprocess itself and bypasses our
++#     env-whitelist and Job Object isolation. Do not replace MCPStdioClient.
++#   * The SERVER TRANSPORT is now the package's. The LAN endpoint
++#     (network_mcp/) uses mcp's streamable-HTTP server so that the wire protocol
++#     matches, byte for byte, the mcp client PersonaCore's core connects with —
++#     session ids, protocol-version negotiation, SSE framing and resumability.
++#     A tool-list/manifest mismatch is a terminal load failure on the core and
++#     hands-on acceptance is externally blocked, so protocol conformance cannot
++#     be verified by hand and must not be hand-rolled. That transport spawns no
++#     subprocess, so the isolation objection above does not reach it.
++#   * The old "it will conflict with PersonaCore's pinned mcp 2.x" reason is
++#     obsolete: this project has its own venv at .venv/ (see CLAUDE.md). The
++#     package was already resolved into it as a direct requirement of
++#     claude-agent-sdk; declaring it here makes an existing dependency honest.
++#   * Authentication and every input bound live in our own ASGI middleware in
++#     front of the SDK app, not in the SDK. See network_mcp/hardening.py.
+ 
+ [project.optional-dependencies]
+ dev = [
+diff --git a/src/workstation_agent/config/schema.py b/src/workstation_agent/config/schema.py
+index 8887c74..71b951a 100644
+--- a/src/workstation_agent/config/schema.py
++++ b/src/workstation_agent/config/schema.py
+@@ -105,6 +105,80 @@ class PluginsConfig(BaseModel):
+     per_plugin: dict[str, PluginConfig] = Field(default_factory=dict)
+ 
+ 
++class NetworkMcpConfig(BaseModel):
++    """The LAN-facing MCP endpoint PersonaCore connects to (contract §1-§3).
++
++    Off by default. Turning it on puts this workstation's capability families on
++    the network, so it is an explicit operator decision, not a default.
++    """
++
++    enabled: bool = False
++    """Serve the endpoint. Default off: the operator opts in."""
++
++    bind_host: str = "127.0.0.1"
++    """The interface to bind.
++
++    Contract §3: **never 0.0.0.0 by default**. This goes further and refuses a
++    wildcard outright — see :meth:`_reject_wildcard_bind`. The default is
++    loopback, which is useless to PersonaCore on purpose: the operator has to
++    name the interface they mean, and naming it is the moment they decide to
++    expose the machine.
++    """
++
++    port: int = Field(default=8765, ge=0, le=65535)
++    """The port to bind. 0 lets the OS pick an ephemeral port (tests use this)."""
++
++    max_connections: int = Field(default=16, ge=1, le=1024)
++    """Concurrent in-flight requests, including long-lived SSE streams."""
++
++    max_request_bytes: int = Field(default=1024 * 1024, ge=1024, le=64 * 1024 * 1024)
++    """Post-authentication request-body ceiling.
++
++    An unauthenticated peer's body is never read at all, so this bounds only
++    already-authenticated requests. ~17x the largest legitimate payload (§5.3
++    caps results at 60,000 characters). Raise it only if a real ``files_write``
++    needs more.
++    """
++
++    max_json_depth: int = Field(default=64, ge=4, le=512)
++    """JSON nesting ceiling. Deeper bodies are rejected before the parser runs."""
++
++    body_read_timeout_seconds: float = Field(default=10.0, gt=0, le=120)
++    """Seconds a client gets to finish streaming a body. Bounds slow-loris sends."""
++
++    keep_alive_seconds: float = Field(default=5.0, gt=0, le=300)
++    """Idle keep-alive timeout for an established connection."""
++
++    graceful_shutdown_seconds: int = Field(default=3, ge=1, le=60)
++    """Seconds to let in-flight requests finish when stopping the endpoint."""
++
++    max_sessions: int = Field(default=8, ge=1, le=1024)
++    """Concurrent MCP sessions the SDK will track."""
++
++    session_idle_seconds: float = Field(default=300.0, gt=0)
++    """Idle MCP session lifetime before the SDK reclaims it."""
++
++    @field_validator("bind_host")
++    @classmethod
++    def _reject_wildcard_bind(cls, v: str) -> str:
++        """Refuse a wildcard bind (contract §3: an operator-chosen interface).
++
++        ``0.0.0.0``, ``::``, ``*`` and empty all mean "every interface this
++        machine has, including ones the operator has not thought about". The
++        brief forbids that as a default; refusing it as a *value* is the safer
++        reading, and costs an operator who really wants every interface only the
++        effort of naming the one they mean.
++        """
++        host = v.strip()
++        if host.lower() in {"", "0.0.0.0", "::", "[::]", "*", "0", "::0"}:  # noqa: S104
++            msg = (
++                "network_mcp.bind_host must name one interface (a LAN IP or a "
++                f"hostname); {v!r} binds every interface on this machine"
++            )
++            raise ValueError(msg)
++        return host
++
++
+ class AgentConfig(BaseModel):
+     """Root configuration model for PersonaCore-Agent."""
+ 
+@@ -118,6 +192,7 @@ class AgentConfig(BaseModel):
+     notifications: NotificationsConfig = Field(default_factory=NotificationsConfig)
+     ui: UIConfig = Field(default_factory=UIConfig)
+     plugins: PluginsConfig = Field(default_factory=PluginsConfig)
++    network_mcp: NetworkMcpConfig = Field(default_factory=NetworkMcpConfig)
+ 
+     @field_validator("session", mode="before")
+     @classmethod
+diff --git a/src/workstation_agent/mcp_host/mcp_client.py b/src/workstation_agent/mcp_host/mcp_client.py
+index 8d1ba24..ff4d59d 100644
+--- a/src/workstation_agent/mcp_host/mcp_client.py
++++ b/src/workstation_agent/mcp_host/mcp_client.py
+@@ -46,7 +46,25 @@ if TYPE_CHECKING:  # pragma: no cover
+ log = logging.getLogger(__name__)
+ 
+ _JSONRPC_VERSION = "2.0"
+-_DEFAULT_TIMEOUT = 10.0
++
++# Raised from 10.0 deliberately, for three reasons that all point the same way:
++#
++# 1. This is the *innermost* leg of a call — host -> plugin over stdio. A tool
++#    that is job-capable takes ``wait_s`` up to 25 s (contract §5.4), and the
++#    plugin blocks for that long by design. At 10 s a perfectly legal
++#    ``shell_run(wait_s=25)`` timed out here before the work could finish.
++# 2. A confirmable condition puts a 20 s prompt in front of the call
++#    (contract §7). Any path where the wait lands inside this client's budget
++#    would have burned three-quarters of it before the plugin was even asked.
++# 3. The core's own read timeout for an HTTP plugin is 30 s
++#    (PersonaCore ``plugins/mcp_client.py:667``). Matching it means the Agent
++#    does not give up before the thing waiting on the Agent does, so a slow
++#    call surfaces as one timeout with one explanation rather than two.
++#
++# 30 s therefore sits above both the 25 s job ceiling and the 20 s confirmation
++# window, and level with the core. Individual call sites still pass a shorter
++# ``timeout=`` where they have a tighter budget.
++_DEFAULT_TIMEOUT = 30.0
+ 
+ 
+ class MCPProtocolError(RuntimeError):
+diff --git a/src/workstation_agent/network_mcp/DECISION.md b/src/workstation_agent/network_mcp/DECISION.md
+new file mode 100644
+index 0000000..e1da459
+--- /dev/null
++++ b/src/workstation_agent/network_mcp/DECISION.md
+@@ -0,0 +1,148 @@
++# Decision record — the network MCP endpoint (subtask B4)
++
++Two decisions were explicitly delegated to this subtask. Both are recorded here with their
++reasoning, because the reasoning is the part that has to survive.
++
++---
++
++## 1. `mcp` package vs. extending the inline JSON-RPC — **the `mcp` package, server side only**
++
++### What was chosen
++
++`mcp.server.lowlevel.Server(...).streamable_http_app()` provides the `/mcp` endpoint. Our own
++ASGI middleware (`hardening.py`) sits *in front of* it and owns path routing, bearer-token
++authentication, byte bounds, structural validation and the connection cap. The SDK owns the
++wire protocol; we own the security boundary.
++
++`mcp` is now a declared dependency in `pyproject.toml`. It was already resolved into the venv
++as a direct requirement of `claude-agent-sdk`, so this adds no wheel — it makes an existing,
++already-shipped transitive dependency honest.
++
++**The original rejection stands where it was made.** `MCPStdioClient`
++(`mcp_host/mcp_client.py`) is *not* replaced. `mcp`'s `stdio_client` wants to spawn the plugin
++subprocess itself via `anyio.open_process()` with `get_default_environment()`, which bypasses
++both our Job Object wrapping and our environment whitelist. That objection is about process
++spawning; the streamable-HTTP *server* transport spawns nothing and touches no subprocess
++isolation, so the objection does not reach it. The `pyproject.toml` note has been amended, not
++deleted.
++
++### Why
++
++1. **Wire-protocol interoperability is the dominant risk in this subtask, and it is untestable
++   by hand.** The core connects with `mcp` 2.x's `streamable_http_client`
++   (`plugins/mcp_client.py:830`, contract §3). Streamable HTTP is not "JSON-RPC over POST": it
++   is `Mcp-Session-Id` issuance and echo, `MCP-Protocol-Version` negotiation, `Accept`-header
++   discrimination between `application/json` and `text/event-stream`, SSE framing with
++   resumable event ids and `Last-Event-ID` replay, `202 Accepted` for notifications, `DELETE`
++   for session teardown, and initialization ordering. A hand-rolled server that gets any of
++   that subtly wrong presents as a **terminal load failure** on the core (contract §2), and
++   A6 — the hands-on acceptance pass that would have caught it — is externally blocked. Running
++   the same SDK on both ends deletes that entire class of defect rather than testing for it.
++
++2. **The reason it was dropped no longer applies.** The `pyproject.toml` note cited a clash
++   with PersonaCore's pinned `mcp` 2.x. The Agent now has its own venv at `.venv/`, so there is
++   no shared site-packages to clobber, and the benefit is no longer "zero" — it is the whole
++   transport.
++
++3. **It costs us none of the hardening.** Everything the inherited B0 crash classes demand
++   happens in our middleware, *outside* the SDK app: an unauthenticated request never has a
++   single body byte read, never reaches a JSON parser, and never allocates a session. The SDK
++   additionally offers bounds a hand-rolled server would have had to reinvent —
++   `max_request_body_size`, `max_sessions`, `session_idle_timeout`, and
++   `TransportSecuritySettings` Host/Origin validation against DNS rebinding.
++
++4. **Stateful mode gives B2 the session identifier it needs.** B2 must plumb a
++   session/connection identifier from the transport into the permissions evaluator so B3's
++   "remember for this session" is implementable. `Mcp-Session-Id` is exactly that identifier
++   and the SDK issues and tracks it for us. `stateless_http=False` is therefore deliberate.
++
++### What was *not* used, and why
++
++The SDK's own auth (`auth=`, `token_verifier=`, `RequireAuthMiddleware`) is OAuth 2.1 resource-
++server machinery: it advertises protected-resource metadata and returns `WWW-Authenticate`
++challenges pointing at an authorization server. Contract §3 specifies a static 32-byte bearer
++token and a `401` **with no body detail**. Using the OAuth path would leak endpoint metadata to
++unauthenticated peers and answer a different question than the one the contract asks. Our
++middleware is ~40 lines and says exactly what the contract says.
++
++### Accepted costs, stated
++
++- `mcp` becomes a direct dependency of a PyInstaller-frozen binary, and we inherit the SDK's
++  protocol-version cadence. Accepted: the alternative is inheriting the *same* cadence in a
++  reimplementation that nobody conformance-tests.
++- Server and client may run different `mcp` minor versions (2.2.x here, 2.1.1 on the core).
++  Streamable HTTP is versioned by the MCP spec revision, not the package version, and both
++  negotiate it — but the pin is deliberately `>=2.1,<3.0` so a major bump is a decision, not a
++  surprise.
++
++---
++
++## 2. The pre-authentication input bound — **64 KiB, and no body read at all before auth**
++
++### The bound
++
++| stage | bound | enforced by |
++|---|---|---|
++| request line + headers | 16 KiB (`MAX_HEADER_BYTES`) | uvicorn's h11 parser, configured explicitly, before ASGI |
++| **pre-auth body** | **0 bytes** | `Hardening` answers `401` from the scope, never calling `receive()` |
++| post-auth body | 1 MiB (`max_request_bytes`, configurable) | `Content-Length` checked on the header; streamed bodies counted while draining and aborted at the bound |
++| post-auth body read time | 10 s | `asyncio.timeout` around the drain loop |
++| concurrent requests | 16 (`max_connections`) | in-flight counter, `503` over the cap |
++| JSON nesting depth | 64 | iterative pre-scan, before `json.loads` |
++
++### Why these numbers
++
++B0 was required to justify anything above asyncio's 64 KiB default, after a 64 MiB limit was
++rejected for trading a crash for memory exhaustion — an unauthenticated client could pin 64 MB
++per connection. That objection is the design input here, and HTTP lets us do better than pick a
++smaller number.
++
++**The strongest available answer is not a smaller buffer, it is no buffer.** Authentication over
++HTTP is a header check. `Hardening` answers `401` from the ASGI `scope` alone: it never calls
++`receive()`, so an unauthenticated peer's body is never read, never decoded, never parsed, and
++never allocated. So the chosen pre-authentication body bound is **zero bytes** — strictly below
++B0's 64 KiB, and below any number that could have been argued for.
++
++That leaves exactly one thing an unauthenticated peer can make this process hold: the header
++block. That bound is not left to a library default — `MAX_HEADER_BYTES` (16 KiB) is passed to
++uvicorn as `h11_max_incomplete_event_size`, with `http="h11"` pinned so the parser enforcing it
++is the one we configured. Combined with the 16-request concurrency cap, the total unauthenticated
++memory ceiling is **256 KiB across the whole server** — a stated number, not an emergent one.
++
++Note the ordering consequence, which is deliberate: an unauthenticated request with a 1 GiB
++`Content-Length` gets `401`, not `413`. Answering `413` would mean deciding the size question
++before the identity question, and would tell an unauthenticated peer what our bounds are. The
++size checks run only after the token is known good.
++
++The **post-auth** bound is 1 MiB rather than the SDK's 4 MiB default. The largest legitimate
++request is a `files_write` or `adb_push` argument object; §5.3 caps *results* at 60,000
++characters and arguments are smaller still, so 1 MiB is ~17× the largest legitimate payload —
++generous without being a memory lever. It is configurable because `files_write` is the one tool
++whose ceiling an operator might genuinely need to raise.
++
++### Rejecting early rather than buffering to reply politely
++
++Every rejection in `Hardening` is decided from the `scope` or from a header, before any body byte
++is consumed:
++
++- wrong path → `404`, no body read
++- wrong method → `405`, no body read
++- missing/bad/duplicated token → `401`, no body read, no detail
++- over the concurrency cap → `503`, no body read
++- `Content-Length` over the bound → `413`, no body read
++
++Identity is decided before size and before the cap, deliberately. `_in_flight` counts only
++authenticated requests, so answering an unauthenticated peer `503` would both tell it how busy
++this machine is and let a flood of anonymous requests deny the core its slot.
++
++Only a request that has cleared all five has its body drained, and the drain itself is bounded
++in both bytes and seconds: an oversized *streamed* body (no `Content-Length`) aborts the drain
++mid-stream rather than buffering the remainder in order to reply politely, and a slow-loris
++partial send is cut off by the 10 s `asyncio.timeout`.
++
++Every rejection also sets `Connection: close`, so a peer we just refused does not keep a slot on
++a keep-alive connection against the concurrency cap.
++
++Rejection logging is itself rate-limited (first occurrence at WARNING, then every 50th, carrying
++the running total). Unbounded logging on an unauthenticated LAN endpoint is a disk-exhaustion
++lever, and the pattern is the same class of mistake as an unbounded read buffer.
+diff --git a/src/workstation_agent/network_mcp/__init__.py b/src/workstation_agent/network_mcp/__init__.py
+new file mode 100644
+index 0000000..e14ea6d
+--- /dev/null
++++ b/src/workstation_agent/network_mcp/__init__.py
+@@ -0,0 +1,53 @@
++"""The LAN-facing streamable-HTTP MCP endpoint (contract §1-§3, subtask B4).
++
++``https://<operator-chosen-interface>:<port>/mcp``, TLS with a pinned self-signed
++certificate, a 32-byte bearer token, and a static families-only tool allowlist.
++
++The two decisions this subtask was asked to make — the `mcp` package versus
++extending the inline JSON-RPC, and the pre-authentication input bound — are
++recorded with their reasoning in ``DECISION.md`` beside this file.
++
++Modules:
++    :mod:`~workstation_agent.network_mcp.tools`
++        The static allowlist. The authority on what leaves this workstation, and
++        the list subtask B5 generates the registration from.
++    :mod:`~workstation_agent.network_mcp.certs`
++        The persisted self-signed certificate and its pinned fingerprint.
++    :mod:`~workstation_agent.network_mcp.credentials`
++        The persisted bearer token.
++    :mod:`~workstation_agent.network_mcp.hardening`
++        The security boundary: path, method, auth, bounds, caps, and systematic
++        hostile-input rejection.
++    :mod:`~workstation_agent.network_mcp.server`
++        :class:`NetworkMCPServer` — start, stop, and the operator surface.
++"""
++
++from workstation_agent.network_mcp.certs import CertificateInfo, ensure_certificate
++from workstation_agent.network_mcp.credentials import DEFAULT_STATE_DIR, ensure_token
++from workstation_agent.network_mcp.hardening import Hardening, validate_json_body
++from workstation_agent.network_mcp.server import NetworkEndpointInfo, NetworkMCPServer
++from workstation_agent.network_mcp.tools import (
++    SERVED_FAMILIES,
++    SERVED_TOOLS,
++    SERVED_TOOLS_BY_NAME,
++    ServedTool,
++    served_tool_names,
++    validate_tool_names,
++)
++
++__all__ = [
++    "DEFAULT_STATE_DIR",
++    "SERVED_FAMILIES",
++    "SERVED_TOOLS",
++    "SERVED_TOOLS_BY_NAME",
++    "CertificateInfo",
++    "Hardening",
++    "NetworkEndpointInfo",
++    "NetworkMCPServer",
++    "ServedTool",
++    "ensure_certificate",
++    "ensure_token",
++    "served_tool_names",
++    "validate_json_body",
++    "validate_tool_names",
++]
+diff --git a/src/workstation_agent/network_mcp/certs.py b/src/workstation_agent/network_mcp/certs.py
+new file mode 100644
+index 0000000..631be41
+--- /dev/null
++++ b/src/workstation_agent/network_mcp/certs.py
+@@ -0,0 +1,309 @@
++"""The self-signed certificate the network MCP endpoint presents (contract §3).
++
++ECDSA P-256, ten years, SAN = the workstation's hostname and its LAN IP.
++``cryptography>=41.0`` was already declared in ``pyproject.toml`` and unused, so
++this needs no new dependency.
++
++**Persisted and reused across restarts, and that is the load-bearing property.**
++The core does not check this certificate against the system trust store; it pins
++``tls_fingerprint`` from the registration and verifies *that* (contract §3). So a
++regenerated certificate is not a fresh start — it is a new fingerprint, and the
++core's connection fails with "the certificate at <url> is sha256:… but the
++registration pins sha256:…" until a human regenerates and reinstalls the
++registration. Contract §11 item 8 requires that starting the Agent simply brings
++the endpoint back.
++
++Consequences of that, both deliberate:
++
++* A certificate is regenerated **only** when there is none, when the stored one
++  cannot be parsed, when it has expired, or when the operator explicitly asks.
++  Never because the machine's IP changed.
++* If the bound address is not in the certificate's SAN list we log a warning and
++  carry on. Adding the address would change the fingerprint, which is a worse
++  outcome than a SAN the pinning client never looks at. The operator can rotate
++  deliberately via :func:`ensure_certificate` with ``regenerate=True``.
++"""
++
++from __future__ import annotations
++
++import contextlib
++import datetime as dt
++import ipaddress
++import logging
++import socket
++from dataclasses import dataclass
++from typing import TYPE_CHECKING, Final
++
++from cryptography import x509
++from cryptography.hazmat.primitives import hashes, serialization
++from cryptography.hazmat.primitives.asymmetric import ec
++from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
++
++from workstation_agent.network_mcp.credentials import DEFAULT_STATE_DIR, _harden
++
++if TYPE_CHECKING:  # pragma: no cover
++    from pathlib import Path
++
++log = logging.getLogger(__name__)
++
++_CERT_FILE_NAME: Final = "server.crt"
++_KEY_FILE_NAME: Final = "server.key"
++_VALIDITY_DAYS: Final = 3650
++_CLOCK_SKEW = dt.timedelta(days=1)
++
++
++@dataclass(frozen=True)
++class CertificateInfo:
++    """Everything the server and the UI need about the endpoint's certificate."""
++
++    cert_path: Path
++    key_path: Path
++    fingerprint: str
++    """``sha256:`` + 64 lowercase hex of the leaf certificate's DER (contract §3)."""
++    sans: tuple[str, ...]
++    """The SAN entries, as text: DNS names then IP addresses."""
++    not_valid_after: dt.datetime
++    generated: bool
++    """True if this call created the certificate rather than reusing a stored one."""
++
++
++def fingerprint_of(cert: x509.Certificate) -> str:
++    """Return the contract §3 fingerprint string for *cert*."""
++    return "sha256:" + cert.fingerprint(hashes.SHA256()).hex()
++
++
++def _expiry_utc(cert: x509.Certificate) -> dt.datetime:
++    """Return *cert*'s expiry as a timezone-aware UTC datetime.
++
++    ``cryptography`` 41 (the pinned range in ``pyproject.toml``) exposes only the
++    naive ``not_valid_after``, documented as UTC; 42 added ``not_valid_after_utc``
++    and deprecated the naive one. Reading whichever exists keeps this correct
++    across the pin being widened later, and keeps every comparison in this module
++    timezone-aware so a naive/aware mix cannot silently misjudge an expiry.
++    """
++    aware = getattr(cert, "not_valid_after_utc", None)
++    if aware is not None:
++        return aware
++    return cert.not_valid_after.replace(tzinfo=dt.UTC)
++
++
++def _sans_of(cert: x509.Certificate) -> tuple[str, ...]:
++    try:
++        ext = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName)
++    except x509.ExtensionNotFound:  # pragma: no cover — we always add one
++        return ()
++    names: list[str] = list(ext.value.get_values_for_type(x509.DNSName))
++    names.extend(str(ip) for ip in ext.value.get_values_for_type(x509.IPAddress))
++    return tuple(names)
++
++
++def local_identities(  # noqa: C901 — one guarded lookup per source; splitting hides them
++    extra_host: str | None = None,
++) -> tuple[list[str], list[str]]:
++    """Discover this workstation's DNS names and IP addresses for the SAN.
++
++    Every lookup is guarded: a machine with no DNS, no network, or a hostname
++    that does not resolve must still get a certificate. Worst case the SAN is
++    ``localhost`` and ``127.0.0.1``, which is enough for a pinning client.
++
++    Args:
++        extra_host: The interface the operator chose to bind, if known. Included
++            so the common case (bind to the LAN IP) is covered by the SAN even
++            when name resolution is unhelpful.
++
++    Returns:
++        ``(dns_names, ip_addresses)``, each de-duplicated and order-stable.
++    """
++    dns_names: list[str] = []
++    ips: list[str] = []
++
++    def _add_host(value: str | None) -> None:
++        if not value:
++            return
++        try:
++            ipaddress.ip_address(value)
++        except ValueError:
++            if value not in dns_names:
++                dns_names.append(value)
++        else:
++            if value not in ips:
++                ips.append(value)
++
++    try:
++        hostname = socket.gethostname()
++    except OSError:  # pragma: no cover — gethostname does not realistically fail
++        hostname = ""
++    _add_host(hostname)
++    if hostname:
++        with contextlib.suppress(OSError):  # pragma: no cover
++            _add_host(socket.getfqdn(hostname))
++        try:
++            for addr in socket.gethostbyname_ex(hostname)[2]:
++                _add_host(addr)
++        except OSError:
++            log.debug("hostname %r does not resolve; SAN will omit its addresses", hostname)
++
++    # The primary outbound interface, found without sending a packet: connecting
++    # a UDP socket only sets the destination and picks a source address.
++    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
++    try:
++        sock.connect(("192.0.2.1", 9))  # TEST-NET-1, RFC 5737 — never routed
++        _add_host(sock.getsockname()[0])
++    except OSError:
++        log.debug("no outbound interface; SAN will omit the primary LAN address")
++    finally:
++        sock.close()
++
++    _add_host(extra_host)
++    _add_host("localhost")
++    _add_host("127.0.0.1")
++    return dns_names, ips
++
++
++def _build_certificate(
++    dns_names: list[str],
++    ips: list[str],
++) -> tuple[x509.Certificate, ec.EllipticCurvePrivateKey]:
++    key = ec.generate_private_key(ec.SECP256R1())
++    common_name = dns_names[0] if dns_names else "workstation-agent"
++    subject = x509.Name([
++        x509.NameAttribute(NameOID.COMMON_NAME, common_name),
++        x509.NameAttribute(NameOID.ORGANIZATION_NAME, "PersonaCore-Agent"),
++    ])
++    san_entries: list[x509.GeneralName] = [x509.DNSName(n) for n in dns_names]
++    san_entries.extend(x509.IPAddress(ipaddress.ip_address(i)) for i in ips)
++
++    now = dt.datetime.now(dt.UTC)
++    cert = (
++        x509.CertificateBuilder()
++        .subject_name(subject)
++        .issuer_name(subject)
++        .public_key(key.public_key())
++        .serial_number(x509.random_serial_number())
++        .not_valid_before(now - _CLOCK_SKEW)
++        .not_valid_after(now + dt.timedelta(days=_VALIDITY_DAYS))
++        .add_extension(x509.SubjectAlternativeName(san_entries), critical=False)
++        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
++        .add_extension(
++            x509.KeyUsage(
++                digital_signature=True,
++                content_commitment=False,
++                key_encipherment=False,
++                data_encipherment=False,
++                key_agreement=True,
++                key_cert_sign=False,
++                crl_sign=False,
++                encipher_only=False,
++                decipher_only=False,
++            ),
++            critical=True,
++        )
++        .add_extension(
++            x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]),
++            critical=False,
++        )
++        .add_extension(
++            x509.SubjectKeyIdentifier.from_public_key(key.public_key()),
++            critical=False,
++        )
++        .sign(key, hashes.SHA256())
++    )
++    return cert, key
++
++
++def _load(cert_path: Path, key_path: Path) -> x509.Certificate | None:
++    """Load and sanity-check a stored certificate; None means "unusable"."""
++    if not cert_path.exists() or not key_path.exists():
++        return None
++    try:
++        cert = x509.load_pem_x509_certificate(cert_path.read_bytes())
++        serialization.load_pem_private_key(key_path.read_bytes(), password=None)
++    except (OSError, ValueError, TypeError) as exc:
++        log.warning("stored network MCP certificate at %s is unusable (%s)", cert_path, exc)
++        return None
++    if _expiry_utc(cert) <= dt.datetime.now(dt.UTC):
++        log.warning(
++            "stored network MCP certificate expired on %s; a new one will be generated "
++            "and PersonaCore's pinned tls_fingerprint must be updated",
++            _expiry_utc(cert).isoformat(),
++        )
++        return None
++    return cert
++
++
++def ensure_certificate(
++    state_dir: Path | None = None,
++    *,
++    bind_host: str | None = None,
++    regenerate: bool = False,
++) -> CertificateInfo:
++    """Return the endpoint's certificate, generating it only when it must.
++
++    Args:
++        state_dir: Directory holding ``server.crt`` / ``server.key``. Defaults to
++            :data:`~workstation_agent.network_mcp.credentials.DEFAULT_STATE_DIR`.
++        bind_host: The interface the endpoint will bind, included in the SAN when
++            a certificate is generated and warned about when a stored certificate
++            does not cover it.
++        regenerate: Force a new certificate. **This changes the fingerprint** and
++            therefore breaks the core's pin until the registration is
++            regenerated and reinstalled; it exists for the UI's explicit
++            "rotate certificate" action only.
++
++    Returns:
++        A :class:`CertificateInfo`.
++    """
++    directory = state_dir if state_dir is not None else DEFAULT_STATE_DIR
++    cert_path = directory / _CERT_FILE_NAME
++    key_path = directory / _KEY_FILE_NAME
++
++    stored = None if regenerate else _load(cert_path, key_path)
++    if stored is not None:
++        sans = _sans_of(stored)
++        if bind_host and bind_host not in sans:
++            log.warning(
++                "the stored certificate's SAN (%s) does not cover the bound address %r. "
++                "Not regenerating: a new certificate would change the pinned fingerprint "
++                "and the core verifies the pin, not the SAN.",
++                ", ".join(sans) or "empty",
++                bind_host,
++            )
++        return CertificateInfo(
++            cert_path=cert_path,
++            key_path=key_path,
++            fingerprint=fingerprint_of(stored),
++            sans=sans,
++            not_valid_after=_expiry_utc(stored),
++            generated=False,
++        )
++
++    dns_names, ips = local_identities(bind_host)
++    cert, key = _build_certificate(dns_names, ips)
++
++    directory.mkdir(parents=True, exist_ok=True)
++    cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
++    key_path.write_bytes(
++        key.private_bytes(
++            encoding=serialization.Encoding.PEM,
++            format=serialization.PrivateFormat.PKCS8,
++            encryption_algorithm=serialization.NoEncryption(),
++        ),
++    )
++    _harden(key_path)
++
++    info = CertificateInfo(
++        cert_path=cert_path,
++        key_path=key_path,
++        fingerprint=fingerprint_of(cert),
++        sans=_sans_of(cert),
++        not_valid_after=_expiry_utc(cert),
++        generated=True,
++    )
++    log.info(
++        "generated network MCP certificate %s (SAN: %s). PersonaCore's registration must "
++        "pin tls_fingerprint = %r.",
++        cert_path,
++        ", ".join(info.sans),
++        info.fingerprint,
++    )
++    return info
+diff --git a/src/workstation_agent/network_mcp/credentials.py b/src/workstation_agent/network_mcp/credentials.py
+new file mode 100644
+index 0000000..3a09aa2
+--- /dev/null
++++ b/src/workstation_agent/network_mcp/credentials.py
+@@ -0,0 +1,99 @@
++"""The bearer token for the network MCP endpoint (contract §3).
++
++A 32-byte random token, generated once and **reused across restarts**. Contract
++§11 item 8 requires that stopping and starting the Agent brings the endpoint back
++without the operator touching PersonaCore: if the token were regenerated on every
++boot, the value the operator pasted into the core's secret store as
++``workstation_token`` would stop matching and every call would `401`.
++
++The token is 32 bytes of :mod:`secrets` entropy rendered as 64 lowercase hex
++characters, so it is ASCII-safe to paste into a config field and safe to compare
++as bytes without any encoding step (see ``hardening.py`` for why that matters).
++"""
++
++from __future__ import annotations
++
++import importlib
++import logging
++import os
++import secrets
++from pathlib import Path
++from typing import Final
++
++log = logging.getLogger(__name__)
++
++_TOKEN_BYTES: Final = 32
++_TOKEN_FILE_NAME: Final = "token"  # noqa: S105 — a filename, not a credential
++
++_appdata_env = os.environ.get("APPDATA")
++_APPDATA: Final = Path(_appdata_env) if _appdata_env else Path.home() / ".config"
++
++#: Where the endpoint's cert, key and token live by default.
++DEFAULT_STATE_DIR: Final = _APPDATA / "WorkstationAgent" / "network-mcp"
++
++
++def _harden(path: Path) -> None:
++    """Best-effort DACL hardening, mirroring ``mcp_host.mcp_server``.
++
++    ``security.dpapi`` does not export ``harden_file`` today — the named-pipe
++    server names it too, behind the same guard. Looked up as an optional
++    attribute rather than imported, because that is honestly what it is: the
++    symbol may or may not be there, and a static import of a symbol that is not
++    there is a lie that both type checkers correctly object to.
++
++    Deliberately not fatal. A token file with default ACLs is still far better
++    than no endpoint at all, and the operator is told.
++    """
++    module = importlib.import_module("workstation_agent.security.dpapi")
++    harden = getattr(module, "harden_file", None)
++    if harden is None:
++        log.warning("security.harden_file unavailable; %s is not ACL-hardened", path.name)
++        return
++    try:
++        harden(path)
++    except Exception:  # noqa: BLE001
++        log.warning("security.harden_file failed; %s is not ACL-hardened", path.name)
++
++
++def ensure_token(state_dir: Path | None = None, *, rotate: bool = False) -> str:
++    """Return the endpoint's bearer token, creating it on first run.
++
++    Args:
++        state_dir: Directory holding the token file. Defaults to
++            :data:`DEFAULT_STATE_DIR`.
++        rotate: Generate a fresh token even if one exists. The UI's "rotate
++            token" action. Rotating invalidates the value the operator pasted
++            into PersonaCore's secret store, so it is never automatic.
++
++    Returns:
++        The 64-character lowercase hex token.
++    """
++    directory = state_dir if state_dir is not None else DEFAULT_STATE_DIR
++    path = directory / _TOKEN_FILE_NAME
++
++    if not rotate and path.exists():
++        try:
++            existing = path.read_text(encoding="ascii").strip()
++        except (OSError, UnicodeDecodeError):
++            log.warning(
++                "network MCP token at %s is unreadable; generating a new one. "
++                "PersonaCore's 'workstation_token' secret must be updated.",
++                path,
++            )
++        else:
++            if existing:
++                return existing
++            log.warning("network MCP token at %s is empty; generating a new one", path)
++
++    directory.mkdir(parents=True, exist_ok=True)
++    token = secrets.token_hex(_TOKEN_BYTES)
++    path.write_text(token, encoding="ascii")
++    _harden(path)
++    if rotate:
++        log.warning(
++            "network MCP bearer token rotated. PersonaCore's 'workstation_token' "
++            "secret must be updated or the core will get 401 on every call.",
++        )
++    else:
++        log.info("network MCP bearer token generated at %s", path)
++    return token
+diff --git a/src/workstation_agent/network_mcp/hardening.py b/src/workstation_agent/network_mcp/hardening.py
+new file mode 100644
+index 0000000..15235aa
+--- /dev/null
++++ b/src/workstation_agent/network_mcp/hardening.py
+@@ -0,0 +1,508 @@
++"""The security boundary in front of the MCP endpoint.
++
++Everything hostile that reaches this workstation over the LAN hits this module
++first. The MCP SDK's ASGI app is *behind* it and never sees a request that has
++not cleared every check here.
++
++Why this is a separate, systematic layer
++----------------------------------------
++Subtask B0 hit four remote **pre-authentication** crashes in the named-pipe
++transport, each found in a separate verification round, each a different member
++of the same family. Case-by-case is what cost it four rounds. So the input space
++is enumerated once, here, as a table, and each row has a test:
++
++============================  ==================================  =========================
++hostile input                 where it is stopped                 answer
++============================  ==================================  =========================
++wrong path                    :meth:`Hardening.__call__`          ``404``, body never read
++wrong method                  :meth:`Hardening.__call__`          ``405``, body never read
++missing token                 header check                        ``401``, body never read
++non-ASCII token bytes         ``compare_digest`` on **bytes**     ``401``, body never read
++duplicated ``Authorization``  header check                        ``401``, body never read
++too many requests in flight   in-flight counter                   ``503``, body never read
++oversized ``Content-Length``  header check                        ``413``, body never read
++oversized streamed body       counted during the drain            ``413``, drain aborted
++slow-loris partial send       ``asyncio.timeout`` on the drain    ``408``, drain aborted
++client vanishes mid-body      ``http.disconnect`` during drain    return, no response
++empty body                    :func:`validate_json_body`          ``400``
++invalid UTF-8 on the wire     ``bytes.decode("utf-8")`` strict    ``400``
++unpaired surrogate in JSON    escape prefilter + iterative walk   ``400``
++deeply nested JSON            iterative depth scan, no recursion  ``400``
++malformed / no separator      ``json.loads``                      ``400``
++non-object, non-array body    type check                          ``400``
++============================  ==================================  =========================
++
++Two properties hold for every row: **the handler returns, it never raises**, and
++**the server is unharmed** — an individual connection is closed but the listener,
++the session manager and every other connection survive.
++
++The four B0 crash classes, mapped
++---------------------------------
++1. ``compare_digest`` raising ``TypeError`` on non-ASCII ``str``. Gone by
++   construction: ASGI hands us header values as :class:`bytes` and we never
++   decode them. ``compare_digest`` on two ``bytes`` objects accepts any byte
++   values at all.
++2. ``.encode("utf-8")`` raising ``UnicodeEncodeError`` on an unpaired surrogate.
++   No token path encodes anything, and a surrogate anywhere in a request body is
++   rejected by :func:`validate_json_body` before the SDK can encode it.
++3. A long line overrunning a 64 KiB read buffer. HTTP frames by ``Content-Length``
++   rather than by newline, and the bound is checked on the header, before the
++   read.
++4. ``RecursionError`` from deeply nested JSON, which ``json.JSONDecodeError`` does
++   not cover. Prevented rather than caught: an iterative pre-scan rejects the
++   body before ``json.loads`` is ever called, and ``RecursionError`` is *also*
++   caught as a belt.
++
++See ``DECISION.md`` in this package for the bound and its justification.
++"""
++# ruff: noqa: ANN401
++# ANN401: ASGI's ``app``, ``receive`` and ``send`` are structurally typed
++# callables with no exported Protocol in this dependency set. Inventing local
++# Protocols for them would add indirection to the one module that most needs to
++# be read straight through.
++
++from __future__ import annotations
++
++import asyncio
++import json
++import logging
++import re
++import secrets
++from typing import Any, Final
++
++log = logging.getLogger(__name__)
++
++Scope = dict[str, Any]
++Message = dict[str, Any]
++
++#: The request-line-plus-headers bound, passed to uvicorn's h11 parser so the
++#: number is ours and stated rather than an implementation default. This is the
++#: **only** memory an unauthenticated peer can make this process hold: the
++#: pre-authentication body bound is zero bytes, because authentication is decided
++#: from the ASGI scope before ``receive()`` is ever called. See ``DECISION.md`` §2.
++MAX_HEADER_BYTES: Final = 16 * 1024
++
++#: Post-authentication body bound. ~17x the largest legitimate payload (§5.3 caps
++#: results at 60,000 characters and arguments are smaller), well under the SDK's
++#: own 4 MiB default.
++DEFAULT_MAX_BODY_BYTES: Final = 1024 * 1024
++
++#: JSON nesting depth ceiling. MCP messages are shallow; 64 is far beyond any
++#: legitimate tool-argument object and far below CPython's recursion limit.
++DEFAULT_MAX_JSON_DEPTH: Final = 64
++
++#: Seconds allowed for a client to finish streaming a request body. Bounds
++#: slow-loris style partial sends.
++DEFAULT_BODY_READ_TIMEOUT: Final = 10.0
++
++#: Concurrent in-flight requests, including long-lived SSE streams.
++DEFAULT_MAX_CONCURRENT: Final = 16
++
++_ALLOWED_METHODS: Final = frozenset({"POST", "GET", "DELETE"})
++
++#: A lone surrogate cannot appear as raw bytes in a body that already decoded as
++#: strict UTF-8, so the only way to smuggle one in is a ``\uD800``-``\uDFFF``
++#: escape. Matching that cheaply in C lets the expensive iterative walk run only
++#: on bodies that could possibly contain one. Paired surrogates also match the
++#: prefilter, and are then correctly cleared by the walk, because ``json.loads``
++#: has already combined a valid pair into a single non-surrogate character.
++#:
++#: The third hex digit must cover ``8``-``f``: D800-DBFF are the high half and
++#: DC00-DFFF the low half, and *either* alone is unpaired. An earlier version of
++#: this pattern listed only ``[89abAB]`` and let every lone **low** surrogate
++#: through — caught by the parametrized matrix in
++#: ``tests/unit/network_mcp/test_hardening.py``, which is the entire reason that
++#: file enumerates the input space instead of listing remembered bugs.
++_SURROGATE_ESCAPE: Final = re.compile(r"\\[uU][dD][89a-fA-F]")
++
++# Log-flooding is itself a resource-exhaustion vector once this is on a LAN, so
++# rejections are logged at WARNING on the first occurrence and then only every
++# _LOG_EVERY-th, carrying the running total so nothing is actually hidden.
++_LOG_EVERY: Final = 50
++
++
++def _check_depth(text: str, max_depth: int) -> str | None:  # noqa: C901
++    """Reject JSON nested deeper than *max_depth*, without recursing.
++
++    Runs before :func:`json.loads`, so ``RecursionError`` is prevented rather
++    than caught. The scan is a single left-to-right pass that tracks string and
++    escape state so brackets inside string literals do not count, and it bails
++    the moment the limit is exceeded rather than scanning the whole body.
++
++    A cheap C-level prefilter skips the Python-level pass entirely when the body
++    cannot possibly nest too deeply: if the total number of opening brackets is
++    at most *max_depth*, neither can the depth be. That is the common shape for
++    a large legitimate payload (one big string, a handful of brackets).
++    """
++    if text.count("[") + text.count("{") <= max_depth:
++        return None
++
++    depth = 0
++    in_string = False
++    escape = False
++    for ch in text:
++        if in_string:
++            if escape:
++                escape = False
++            elif ch == "\\":
++                escape = True
++            elif ch == '"':
++                in_string = False
++            continue
++        if ch == '"':
++            in_string = True
++        elif ch in "[{":
++            depth += 1
++            if depth > max_depth:
++                return f"JSON nests deeper than {max_depth} levels"
++        elif ch in "]}":
++            depth -= 1
++    return None
++
++
++def _has_lone_surrogate(value: object) -> bool:
++    """True if any string anywhere in *value* cannot be encoded as UTF-8.
++
++    Iterative, with an explicit stack: a recursive walk would reintroduce the
++    very ``RecursionError`` this module exists to prevent. Dictionary *keys* are
++    walked as well as values — ``json.loads`` will happily produce a key holding
++    an unpaired surrogate.
++    """
++    stack: list[object] = [value]
++    while stack:
++        item = stack.pop()
++        if isinstance(item, str):
++            try:
++                item.encode("utf-8")
++            except UnicodeEncodeError:
++                return True
++        elif isinstance(item, dict):
++            for key, val in item.items():
++                stack.append(key)
++                stack.append(val)
++        elif isinstance(item, list):
++            stack.extend(item)
++    return False
++
++
++def validate_json_body(  # noqa: PLR0911 — one return per rejected input class; see the table
++    raw: bytes,
++    *,
++    max_depth: int = DEFAULT_MAX_JSON_DEPTH,
++) -> str | None:
++    """Structurally validate a request body. Returns a reason, or None if clean.
++
++    This never raises for any input. Ordering matters and is deliberate: bytes
++    are decoded strictly before anything looks at them, depth is checked before
++    the parser runs, and the surrogate walk runs only on already-parsed data.
++
++    Args:
++        raw: The complete request body as it arrived on the wire.
++        max_depth: Nesting ceiling.
++
++    Returns:
++        A short, non-revealing reason string, or ``None`` when the body is a
++        well-formed JSON object or array safe to hand to the SDK.
++    """
++    if not raw.strip():
++        return "empty request body"
++
++    try:
++        text = raw.decode("utf-8")
++    except UnicodeDecodeError:
++        # Invalid UTF-8 on the wire, as distinct from an escape inside a JSON
++        # string. Rejected rather than decoded with errors="replace": a
++        # replacement policy maps many different malformed inputs onto the same
++        # text, and this body is about to be interpreted as commands.
++        return "request body is not valid UTF-8"
++
++    depth_problem = _check_depth(text, max_depth)
++    if depth_problem is not None:
++        return depth_problem
++
++    try:
++        parsed = json.loads(text)
++    except json.JSONDecodeError:
++        return "request body is not valid JSON"
++    except RecursionError:  # pragma: no cover — _check_depth gets there first
++        return "request body nests too deeply"
++
++    if not isinstance(parsed, (dict, list)):
++        return "request body is not a JSON-RPC message"
++
++    if _SURROGATE_ESCAPE.search(text) and _has_lone_surrogate(parsed):
++        return "request body contains an unpaired surrogate"
++
++    return None
++
++
++def _single_header(headers: list[tuple[bytes, bytes]], name: bytes) -> bytes | None:
++    """Return the sole value of *name*, or None if absent or duplicated.
++
++    A duplicated ``Authorization`` header is ambiguous — different intermediaries
++    resolve it differently — so it is treated as absent rather than guessed at.
++    """
++    found: bytes | None = None
++    for key, value in headers:
++        if key == name:
++            if found is not None:
++                return None
++            found = value
++    return found
++
++
++class Hardening:
++    """ASGI middleware: the endpoint's path, auth, bounds and caps.
++
++    Wraps the MCP SDK's Starlette app. Lifespan messages pass straight through
++    (the SDK's session manager runs in its lifespan); every HTTP request runs the
++    table at the top of this module.
++
++    Args:
++        app: The wrapped ASGI application.
++        token: The expected bearer token. Compared as bytes, never decoded.
++        path: The only path served. Anything else is ``404``.
++        max_body_bytes: Post-authentication body ceiling.
++        max_json_depth: Nesting ceiling for :func:`validate_json_body`.
++        max_concurrent: In-flight request cap, including SSE streams.
++        body_read_timeout: Seconds a client gets to finish streaming a body.
++    """
++
++    def __init__(  # noqa: PLR0913 — each argument is a separately justified bound
++        self,
++        app: Any,
++        *,
++        token: str,
++        path: str = "/mcp",
++        max_body_bytes: int = DEFAULT_MAX_BODY_BYTES,
++        max_json_depth: int = DEFAULT_MAX_JSON_DEPTH,
++        max_concurrent: int = DEFAULT_MAX_CONCURRENT,
++        body_read_timeout: float = DEFAULT_BODY_READ_TIMEOUT,
++    ) -> None:
++        self._app = app
++        # Pre-encoded once, at construction, from *our own* token. The token is
++        # generated by this package as 64 hex characters, so this encode cannot
++        # fail; nothing a client sends is ever encoded or decoded on the auth
++        # path, which is what makes B0 crash classes 1 and 2 unreachable here.
++        self._expected_token = token.encode("ascii")
++        self._path = path
++        self._max_body_bytes = max_body_bytes
++        self._max_json_depth = max_json_depth
++        self._max_concurrent = max_concurrent
++        self._body_read_timeout = body_read_timeout
++        self._in_flight = 0
++        self._rejections = 0
++
++    # -- observability ---------------------------------------------------
++
++    @property
++    def in_flight(self) -> int:
++        """Requests currently being served."""
++        return self._in_flight
++
++    @property
++    def rejections(self) -> int:
++        """Total requests rejected by this middleware since start."""
++        return self._rejections
++
++    def _reject_log(self, scope: Scope, status: int, reason: str) -> None:
++        self._rejections += 1
++        client = scope.get("client")
++        peer = f"{client[0]}:{client[1]}" if client else "unknown"
++        if self._rejections == 1 or self._rejections % _LOG_EVERY == 0:
++            log.warning(
++                "network MCP rejected %s: %d %s (%d rejections total)",
++                peer, status, reason, self._rejections,
++            )
++        else:
++            log.debug("network MCP rejected %s: %d %s", peer, status, reason)
++
++    # -- ASGI ------------------------------------------------------------
++
++    async def __call__(  # noqa: C901, PLR0911, PLR0912
++        self, scope: Scope, receive: Any, send: Any,
++    ) -> None:
++        """ASGI entry point. Returns for every input; never raises.
++
++        The branch count is the point, not an accident: this is the rejection
++        table at the top of this module, in order, one branch each. Splitting it
++        into helpers would hide the order, and the order is the security
++        property — identity is decided before size, size before parsing.
++        """
++        if scope["type"] == "lifespan":
++            await self._app(scope, receive, send)
++            return
++        if scope["type"] != "http":
++            # No websocket surface exists on this endpoint.
++            await send({"type": "websocket.close", "code": 1008})
++            return
++
++        if scope.get("path") != self._path:
++            self._reject_log(scope, 404, "unknown path")
++            await _respond(send, 404)
++            return
++
++        method = scope.get("method", "")
++        if method not in _ALLOWED_METHODS:
++            self._reject_log(scope, 405, f"method {method}")
++            await _respond(send, 405, extra_headers=[(b"allow", b"POST, GET, DELETE")])
++            return
++
++        headers: list[tuple[bytes, bytes]] = scope.get("headers", [])
++
++        # --- authentication, before a single body byte is read -----------
++        authorization = _single_header(headers, b"authorization")
++        if not self._token_ok(authorization):
++            self._reject_log(scope, 401, "bad or missing bearer token")
++            # Contract §3: 401, no body detail.
++            await _respond(
++                send, 401,
++                extra_headers=[(b"www-authenticate", b"Bearer")],
++            )
++            return
++
++        # --- caps and bounds, on authenticated work only -----------------
++        # The cap is checked *after* authentication on purpose. ``_in_flight``
++        # only ever counts authenticated requests, so answering an
++        # unauthenticated peer 503 rather than 401 would tell it how busy this
++        # machine is while also letting a flood of anonymous requests deny the
++        # core its slot. Anonymous connection volume is bounded a layer down, by
++        # uvicorn's own ``limit_concurrency`` and by the header bound.
++        if self._in_flight >= self._max_concurrent:
++            self._reject_log(scope, 503, "connection cap reached")
++            await _respond(send, 503, b"busy")
++            return
++
++
++        content_length = _single_header(headers, b"content-length")
++        declared: int | None = None
++        if content_length is not None:
++            try:
++                declared = int(content_length)
++            except ValueError:
++                self._reject_log(scope, 400, "unparseable Content-Length")
++                await _respond(send, 400, b"bad request")
++                return
++            if declared < 0 or declared > self._max_body_bytes:
++                self._reject_log(scope, 413, f"Content-Length {declared}")
++                await _respond(send, 413, b"request too large")
++                return
++
++        self._in_flight += 1
++        try:
++            if method != "POST":
++                # GET (SSE stream) and DELETE (session teardown) carry no body.
++                await self._app(scope, receive, send)
++                return
++
++            raw, status, reason = await self._drain(receive)
++            if raw is None:
++                if status != _DISCONNECTED:
++                    self._reject_log(scope, status, reason)
++                    await _respond(send, status, reason.encode("ascii", "replace"))
++                # status == _DISCONNECTED: the peer is gone; nobody to answer.
++                return
++
++            problem = validate_json_body(raw, max_depth=self._max_json_depth)
++            if problem is not None:
++                self._reject_log(scope, 400, problem)
++                await _respond(send, 400, problem.encode("ascii", "replace"))
++                return
++
++            await self._app(scope, _replaying(raw, receive), send)
++        finally:
++            self._in_flight -= 1
++
++    def _token_ok(self, authorization: bytes | None) -> bool:
++        """Constant-time bearer check on raw bytes.
++
++        ``authorization`` is whatever the peer sent: arbitrary bytes, possibly
++        non-ASCII, possibly empty. It is never decoded, so there is no encoding
++        step that can raise. ``secrets.compare_digest`` accepts any two
++        ``bytes`` objects; only the length is observable.
++        """
++        if authorization is None:
++            return False
++        scheme, _, credentials = authorization.strip().partition(b" ")
++        # The scheme is not secret, so a plain comparison is fine here. It is
++        # case-insensitive per RFC 7235.
++        if scheme.lower() != b"bearer":
++            return False
++        return secrets.compare_digest(credentials.strip(), self._expected_token)
++
++    async def _drain(self, receive: Any) -> tuple[bytes | None, int, str]:
++        """Read the body under a byte bound and a time bound.
++
++        Returns ``(body, 0, "")`` on success. On failure the body is ``None``
++        and the status is either an HTTP status to answer with or
++        :data:`_DISCONNECTED`, meaning the peer vanished mid-body and there is
++        nobody left to answer.
++        """
++        chunks: list[bytes] = []
++        total = 0
++        try:
++            async with asyncio.timeout(self._body_read_timeout):
++                while True:
++                    message = await receive()
++                    if message["type"] == "http.disconnect":
++                        return None, _DISCONNECTED, "client disconnected"
++                    body: bytes = message.get("body", b"")
++                    total += len(body)
++                    if total > self._max_body_bytes:
++                        # Abort mid-stream rather than buffering the rest to
++                        # reply politely.
++                        return None, 413, "request too large"
++                    chunks.append(body)
++                    if not message.get("more_body", False):
++                        break
++        except TimeoutError:
++            return None, 408, "request body timed out"
++        except (ConnectionError, OSError):
++            return None, _DISCONNECTED, "client disconnected"
++        return b"".join(chunks), 0, ""
++
++
++#: Sentinel status: the peer went away, so no response is possible or wanted.
++_DISCONNECTED: Final = -1
++
++
++def _replaying(raw: bytes, receive: Any) -> Any:
++    """An ASGI ``receive`` that replays the already-drained body once.
++
++    After the replay it falls through to the real ``receive`` so the wrapped app
++    still observes ``http.disconnect``.
++    """
++    delivered = False
++
++    async def _receive() -> Message:
++        nonlocal delivered
++        if not delivered:
++            delivered = True
++            return {"type": "http.request", "body": raw, "more_body": False}
++        return await receive()
++
++    return _receive
++
++
++async def _respond(
++    send: Any,
++    status: int,
++    body: bytes = b"",
++    *,
++    extra_headers: list[tuple[bytes, bytes]] | None = None,
++) -> None:
++    """Send a minimal response and close the connection.
++
++    ``Connection: close`` is deliberate: a peer we just rejected does not get to
++    keep a slot on a keep-alive connection.
++    """
++    headers: list[tuple[bytes, bytes]] = [
++        (b"content-length", str(len(body)).encode("ascii")),
++        (b"connection", b"close"),
++    ]
++    if body:
++        headers.append((b"content-type", b"text/plain; charset=utf-8"))
++    if extra_headers:
++        headers.extend(extra_headers)
++    await send({"type": "http.response.start", "status": status, "headers": headers})
++    await send({"type": "http.response.body", "body": body})
+diff --git a/src/workstation_agent/network_mcp/server.py b/src/workstation_agent/network_mcp/server.py
+new file mode 100644
+index 0000000..120d46e
+--- /dev/null
++++ b/src/workstation_agent/network_mcp/server.py
+@@ -0,0 +1,542 @@
++"""The streamable-HTTP MCP endpoint PersonaCore connects to (contract §1-§3).
++
++``https://<operator-chosen-interface>:<port>/mcp``. Self-signed, pinned
++certificate; 32-byte bearer token; a static families-only tool allowlist; every
++call routed through :meth:`MCPHost.invoke`, which is the gate.
++
++**Self-contained by design.** This module performs no application wiring: it does
++not touch ``app.py``, does not create an ``MCPHost``, and does not read the config
++store. It takes a config object and a host, and exposes :meth:`NetworkMCPServer.start`
++and :meth:`NetworkMCPServer.stop`. Subtask B1 owns ``app.py`` this phase and B5 does
++the wiring; see this package's ``DECISION.md`` and the B4 summary for the single
++hook B5 needs.
++
++What is *not* here, on purpose
++------------------------------
++* The §5.2 result envelope and §5.6 special-token stripping are **B2's**. This
++  module bridges to them: if a tool result already carries an ``ok`` key it is
++  passed through untouched, so B2's work lands without a change here.
++* ``export-registration`` is **B5's**. It generates the manifest from
++  :func:`~workstation_agent.network_mcp.tools.served_tool_names`, the same list
++  this server serves from, which is what makes the two provably equal.
++* The UI surface showing the token and fingerprint is **B5's**.
++  :meth:`NetworkMCPServer.info` returns everything that surface needs.
++"""
++# ruff: noqa: PLC0415, ANN401
++# PLC0415: mcp/uvicorn imports are deferred so importing this module (for the tool
++#   table, the cert helpers or the config schema) does not pull in a web server.
++# ANN401: MCPHost, the uvicorn server and the SDK's ASGI app are structurally
++#   typed here on purpose — this module must not import them at module scope.
++
++from __future__ import annotations
++
++import asyncio
++import contextlib
++import json
++import logging
++import ssl
++from dataclasses import dataclass
++from typing import TYPE_CHECKING, Any, Final
++
++from workstation_agent.network_mcp.certs import CertificateInfo, ensure_certificate
++from workstation_agent.network_mcp.credentials import ensure_token
++from workstation_agent.network_mcp.hardening import (
++    MAX_HEADER_BYTES,
++    Hardening,
++)
++from workstation_agent.network_mcp.tools import (
++    SERVED_TOOLS,
++    SERVED_TOOLS_BY_NAME,
++    validate_tool_names,
++)
++
++if TYPE_CHECKING:  # pragma: no cover
++    import datetime as dt
++    from pathlib import Path
++
++    from workstation_agent.config.schema import NetworkMcpConfig
++
++log = logging.getLogger(__name__)
++
++#: §5.3: text results are capped by the Agent at 60,000 characters.
++RESULT_CHAR_CAP: Final = 60_000
++
++#: How long :meth:`NetworkMCPServer.start` waits for uvicorn to bind.
++_BIND_TIMEOUT: Final = 10.0
++
++_SERVER_NAME: Final = "workstation"
++
++
++@dataclass(frozen=True)
++class NetworkEndpointInfo:
++    """Everything the operator, the UI and the registration generator need.
++
++    This is what subtask B5's "show the token and fingerprint once, with copy
++    buttons" surface renders, and what its ``export-registration`` writes into
++    ``workstation/manifest.toml``.
++    """
++
++    url: str
++    """``https://<host>:<port>/mcp`` — the registration's ``url`` field."""
++    bind_host: str
++    port: int
++    fingerprint: str
++    """``sha256:<64 hex>`` — the registration's ``tls_fingerprint`` field."""
++    token: str
++    """The bearer token. Pasted into the core's secret store as ``workstation_token``."""
++    certificate_sans: tuple[str, ...]
++    certificate_expires: dt.datetime
++    tool_names: tuple[str, ...]
++    """The served set. B5 asserts the exported set equals this."""
++    running: bool
++
++
++class NetworkMCPServer:
++    """The LAN-facing MCP endpoint.
++
++    Args:
++        config: The endpoint's settings. ``bind_host`` is validated by the schema
++            to be a named interface, never a wildcard.
++        mcp_host: The :class:`~workstation_agent.mcp_host.host.MCPHost` every call
++            is routed through. Passing ``None`` serves ``tools/list`` and answers
++            every ``tools/call`` with the §5.2 ``error`` envelope, which is what
++            the endpoint should do before the host has started.
++        state_dir: Where the certificate, key and token live. Defaults to
++            ``%APPDATA%\\WorkstationAgent\\network-mcp``.
++
++    Raises:
++        RuntimeError: from :meth:`start` if the endpoint is already running.
++    """
++
++    def __init__(
++        self,
++        config: NetworkMcpConfig,
++        *,
++        mcp_host: Any | None = None,
++        state_dir: Path | None = None,
++    ) -> None:
++        self._config = config
++        self._mcp_host = mcp_host
++        self._state_dir = state_dir
++        self._token: str | None = None
++        self._cert: CertificateInfo | None = None
++        self._uvicorn: Any = None
++        self._task: asyncio.Task[None] | None = None
++        self._port: int = config.port
++        self._hardening: Hardening | None = None
++
++    # -- lifecycle -------------------------------------------------------
++
++    async def start(self) -> NetworkEndpointInfo:
++        """Generate/load credentials, bind the interface over TLS, and serve.
++
++        Returns:
++            The bound endpoint's :class:`NetworkEndpointInfo`.
++
++        Raises:
++            RuntimeError: if the endpoint is already running, if the served-tool
++                table violates contract §2, or if uvicorn cannot bind.
++        """
++        if self._task is not None and not self._task.done():
++            msg = "network MCP endpoint is already running"
++            raise RuntimeError(msg)
++
++        # Checked at startup, not only in tests. A name the core's manifest
++        # loader rejects is a *terminal load failure* on its side (contract §2),
++        # reported there rather than here; refusing to serve is the cheaper and
++        # far more legible failure.
++        problems = validate_tool_names()
++        if problems:
++            msg = "the served-tool table violates contract §2: " + "; ".join(problems)
++            raise RuntimeError(msg)
++
++        import uvicorn
++
++        self._token = ensure_token(self._state_dir)
++        self._cert = ensure_certificate(self._state_dir, bind_host=self._config.bind_host)
++
++        app = self._build_app(self._token)
++
++        config = uvicorn.Config(
++            app,
++            host=self._config.bind_host,
++            port=self._config.port,
++            # TLS is structural: there is no code path in this module that
++            # serves plain HTTP, and no setting that turns it off.
++            ssl_certfile=str(self._cert.cert_path),
++            ssl_keyfile=str(self._cert.key_path),
++            ssl_version=ssl.PROTOCOL_TLS_SERVER,
++            log_level="warning",
++            lifespan="on",  # the SDK's session manager runs in the app's lifespan
++            # Pin the HTTP parser so the header bound below is the one we set,
++            # not whichever implementation happened to be installed.
++            http="h11",
++            h11_max_incomplete_event_size=MAX_HEADER_BYTES,
++            limit_concurrency=self._config.max_connections,
++            timeout_keep_alive=int(self._config.keep_alive_seconds),
++            # Bounded, or a peer holding a keep-alive connection (which the core
++            # always does) makes shutdown wait forever and the lifespan task gets
++            # cancelled out from under the SDK's session manager.
++            timeout_graceful_shutdown=self._config.graceful_shutdown_seconds,
++            server_header=False,  # do not advertise the stack to the LAN
++            date_header=True,
++        )
++        server = uvicorn.Server(config)
++        self._uvicorn = server
++        self._task = asyncio.create_task(_guarded_serve(server), name="network-mcp-serve")
++
++        loop = asyncio.get_running_loop()
++        deadline = loop.time() + _BIND_TIMEOUT
++        while loop.time() < deadline:
++            if self._task.done():
++                # serve() failed (port in use, bad certificate, ...). Surface it.
++                self._task.result()
++                msg = "network MCP endpoint exited during startup"
++                raise RuntimeError(msg)
++            if getattr(server, "started", False) and server.servers:
++                break
++            await asyncio.sleep(0.02)
++        else:  # pragma: no cover — only on a wedged bind
++            await self.stop()
++            msg = f"network MCP endpoint did not bind within {_BIND_TIMEOUT}s"
++            raise RuntimeError(msg)
++
++        self._port = _assigned_port(server, self._config.port)
++        info = self.info()
++        log.info(
++            "network MCP endpoint listening on %s (fingerprint %s, %d tools)",
++            info.url, info.fingerprint, len(info.tool_names),
++        )
++        return info
++
++    async def stop(self) -> None:
++        """Stop serving. Safe to call when not running, and safe to call twice."""
++        server, task = self._uvicorn, self._task
++        self._uvicorn = self._task = None
++        if server is not None:
++            server.should_exit = True
++        if task is not None and not task.done():
++            with contextlib.suppress(asyncio.TimeoutError, asyncio.CancelledError, Exception):
++                await asyncio.wait_for(asyncio.shield(task), timeout=5.0)
++            if not task.done():  # pragma: no cover — uvicorn normally exits
++                task.cancel()
++                with contextlib.suppress(asyncio.CancelledError, Exception):
++                    await task
++        log.info("network MCP endpoint stopped")
++
++    @property
++    def running(self) -> bool:
++        """True while the endpoint is bound and serving."""
++        return self._task is not None and not self._task.done()
++
++    # -- operator surface (B5 renders this) -------------------------------
++
++    def info(self) -> NetworkEndpointInfo:
++        """Return the endpoint's identity, credentials and served set.
++
++        Works before :meth:`start`, generating the certificate and token if they
++        do not exist yet, so the UI can show the operator what to paste into
++        PersonaCore without the endpoint being up.
++        """
++        if self._token is None:
++            self._token = ensure_token(self._state_dir)
++        if self._cert is None:
++            self._cert = ensure_certificate(self._state_dir, bind_host=self._config.bind_host)
++        host = self._config.bind_host
++        if ":" in host:  # IPv6 literal
++            host = f"[{host}]"
++        return NetworkEndpointInfo(
++            url=f"https://{host}:{self._port}/mcp",
++            bind_host=self._config.bind_host,
++            port=self._port,
++            fingerprint=self._cert.fingerprint,
++            token=self._token,
++            certificate_sans=self._cert.sans,
++            certificate_expires=self._cert.not_valid_after,
++            tool_names=tuple(t.name for t in SERVED_TOOLS),
++            running=self.running,
++        )
++
++    def rotate_token(self) -> str:
++        """Generate a fresh bearer token. Takes effect on the next :meth:`start`.
++
++        Invalidates the value the operator pasted into PersonaCore's secret
++        store, so this is an explicit operator action, never automatic.
++        """
++        self._token = ensure_token(self._state_dir, rotate=True)
++        return self._token
++
++    def regenerate_certificate(self) -> CertificateInfo:
++        """Generate a fresh certificate. Takes effect on the next :meth:`start`.
++
++        **Changes the fingerprint**, so the registration must be regenerated and
++        reinstalled on PersonaCore's Plugins page or the core's pin will fail.
++        """
++        self._cert = ensure_certificate(
++            self._state_dir, bind_host=self._config.bind_host, regenerate=True,
++        )
++        return self._cert
++
++    # -- the ASGI app ----------------------------------------------------
++
++    def _build_app(self, token: str) -> Any:
++        """Build the hardened ASGI app: our middleware wrapping the SDK's."""
++        from mcp import types
++        from mcp.server.lowlevel import Server
++        from mcp.server.transport_security import TransportSecuritySettings
++
++        async def _on_list_tools(
++            _ctx: Any, _params: Any,
++        ) -> types.ListToolsResult:
++            # Built through model_validate rather than the constructor: the
++            # SDK models carry snake_case field names with camelCase wire
++            # aliases, and which of the two the generated __init__ accepts
++            # differs from what a type checker sees. Validating a plain dict
++            # of wire names is unambiguous to both.
++            return types.ListToolsResult.model_validate({
++                "tools": [
++                    {
++                        "name": tool.name,
++                        "description": tool.description,
++                        "inputSchema": tool.input_schema,
++                    }
++                    for tool in SERVED_TOOLS
++                ],
++            })
++
++        async def _on_call_tool(
++            _ctx: Any, params: types.CallToolRequestParams,
++        ) -> types.CallToolResult:
++            envelope = await self._invoke(params.name, dict(params.arguments or {}))
++            text = json.dumps(envelope, ensure_ascii=False, default=str)
++            return types.CallToolResult.model_validate({
++                "content": [{"type": "text", "text": self._scrub(text)}],
++                # §5.2: a denied or unconfirmed call is a normal result carrying
++                # ok:false, not an MCP-level error. The core fences the text
++                # either way; isError would make the persona report a fault
++                # instead of saying plainly that nobody confirmed it.
++                "isError": False,
++            })
++
++        server: Any = Server(
++            _SERVER_NAME,
++            version=_agent_version(),
++            instructions=(
++                "Acts on the owner's workstation and the devices plugged into it."
++            ),
++            on_list_tools=_on_list_tools,
++            on_call_tool=_on_call_tool,
++        )
++
++        host = self._config.bind_host
++        sdk_app = server.streamable_http_app(
++            streamable_http_path="/mcp",
++            # Stateful: the Mcp-Session-Id the SDK issues is the transport-level
++            # session identifier B2 plumbs into the permissions evaluator so B3's
++            # "remember for this session" is implementable. See DECISION.md §1.4.
++            stateless_http=False,
++            json_response=False,
++            max_request_body_size=self._config.max_request_bytes,
++            max_sessions=self._config.max_sessions,
++            session_idle_timeout=self._config.session_idle_seconds,
++            transport_security=TransportSecuritySettings(
++                enable_dns_rebinding_protection=True,
++                allowed_hosts=self._allowed_hosts(),
++                allowed_origins=[],
++            ),
++            host=host,
++        )
++
++        self._hardening = Hardening(
++            sdk_app,
++            token=token,
++            path="/mcp",
++            max_body_bytes=self._config.max_request_bytes,
++            max_json_depth=self._config.max_json_depth,
++            max_concurrent=self._config.max_connections,
++            body_read_timeout=self._config.body_read_timeout_seconds,
++        )
++        return self._hardening
++
++    def _allowed_hosts(self) -> list[str]:
++        """Host-header allowlist for the SDK's DNS-rebinding protection.
++
++        The core connects by whatever ``url`` the registration carries, which is
++        the bind address or a name that resolves to it, so the certificate's SAN
++        entries are exactly the right allowlist — they are the names this
++        endpoint claims to be.
++        """
++        names: list[str] = [self._config.bind_host]
++        if self._cert is not None:
++            names.extend(self._cert.sans)
++        allowed: list[str] = []
++        for name in dict.fromkeys(names):
++            bracketed = f"[{name}]" if ":" in name else name
++            allowed.append(f"{bracketed}:*")
++            allowed.append(bracketed)
++        return allowed
++
++    # -- invocation ------------------------------------------------------
++
++    async def _invoke(  # noqa: PLR0911 — one return per §5.2 result code
++        self, name: str, args: dict[str, Any],
++    ) -> dict[str, Any]:
++        """Route one tool call through the gate and return a §5.2 envelope.
++
++        Never raises and never leaks: no stack trace, no traceback object, and
++        the bearer token is scrubbed from the rendered text by
++        :meth:`_scrub` before it leaves.
++        """
++        tool = SERVED_TOOLS_BY_NAME.get(name)
++        if tool is None:
++            # Not reachable through a well-behaved client, since tools/list only
++            # advertises the table — but an authenticated peer can send anything.
++            return _fail("not_found", f"This workstation does not serve a tool called {name!r}.")
++
++        if self._mcp_host is None:
++            return _fail("error", "The Agent's plugin host is not running.")
++
++        try:
++            result = await self._mcp_host.invoke(tool.internal_name, args)
++        except PermissionError as exc:
++            # MCPHost.invoke raises PermissionError for both a policy denial and
++            # a confirmation the operator did not give. §5.2 distinguishes them,
++            # and only the confirm path mentions confirmation.
++            text = str(exc)
++            if "confirm" in text.lower():
++                return _fail(
++                    "unconfirmed",
++                    "A prompt was shown on the workstation and nobody confirmed it in time.",
++                )
++            return _fail("denied", f"The Agent's permissions refuse {name}.")
++        except KeyError:
++            # No running plugin owns the tool: the family has not been built or
++            # loaded yet. Advertised in tools/list because the registration and
++            # the served set must agree (contract §2).
++            return _fail(
++                "error",
++                f"The {tool.family!r} capability family is not loaded on this workstation.",
++            )
++        except TimeoutError:
++            return _fail("timeout", f"{name} ran out of its own time budget.")
++        except Exception as exc:  # nothing may escape onto the LAN
++            log.exception("network MCP tool %s failed", name)
++            return _fail("error", f"{type(exc).__name__}: {exc}"[:500])
++
++        return _envelope_from_result(result)
++
++    def _scrub(self, text: str) -> str:
++        """Remove the bearer token from outgoing text (§5.2: never the token)."""
++        if self._token and self._token in text:
++            log.error("network MCP result contained the bearer token; redacted")
++            return text.replace(self._token, "[redacted]")
++        return text
++
++
++async def _guarded_serve(server: Any) -> None:
++    """Run ``uvicorn.Server.serve()`` without letting it kill the event loop.
++
++    uvicorn answers a failed bind — a port already in use, an unreadable key
++    file — with ``sys.exit(3)`` (``uvicorn/server.py:183``). ``SystemExit`` is a
++    ``BaseException``, and asyncio deliberately re-raises those straight out of
++    ``Task.__step`` into the running loop rather than storing them on the task.
++    In a standalone ``uvicorn`` process that is exactly right; inside the Agent,
++    where this endpoint is one subsystem among many, it would tear down the whole
++    application loop because a port was busy. Translating it here keeps a bind
++    failure a reportable error on :meth:`NetworkMCPServer.start`.
++    """
++    try:
++        await server.serve()
++    except SystemExit as exc:
++        msg = (
++            "the network MCP endpoint could not bind "
++            f"(uvicorn exited with status {exc.code}); the port may already be in use"
++        )
++        raise RuntimeError(msg) from exc
++
++
++def _fail(code: str, reason: str) -> dict[str, Any]:
++    """A §5.2 failure envelope."""
++    return {"ok": False, "code": code, "reason": reason}
++
++
++_TRAILER = "\n[... {} more characters; use jobs_output to page ...]"
++
++
++def _cap(text: str) -> str:
++    """Apply §5.3's 60,000-character cap with its documented trailer.
++
++    Applied at the transport because "never put more than the cap onto the LAN"
++    is a property of this endpoint, not of any one family.
++
++    The trailer's own length is reserved out of the cap so the whole returned
++    string — trailer included — stays within :data:`RESULT_CHAR_CAP`. That is
++    what §5.3 says ("text results are capped by the Agent at 60,000
++    characters"), and it also makes the function **idempotent**: capping an
++    already-capped string returns it unchanged, so B2 capping earlier in the
++    chain cannot cause a second truncation that eats real content and reports a
++    wrong remaining count. The reservation uses ``len(text)`` for the digit
++    width, which is an upper bound on the number actually printed, so the
++    reserved room is never too small.
++    """
++    if len(text) <= RESULT_CHAR_CAP:
++        return text
++    keep = max(RESULT_CHAR_CAP - len(_TRAILER.format(len(text))), 0)
++    return text[:keep] + _TRAILER.format(len(text) - keep)
++
++
++def _envelope_from_result(result: Any) -> dict[str, Any]:
++    """Adapt a :class:`MCPHost` result into a §5.2 envelope.
++
++    Two shapes are handled deliberately:
++
++    * **B2's shape (forward-compatible).** Once subtask B2 lands, a tool result's
++      text is already the §5.2 envelope. If the text parses as a JSON object with
++      an ``ok`` key, it is returned untouched — B2's work needs no change here.
++    * **Today's shape.** ``MCPHost.invoke`` returns ``ToolResultImpl`` carrying
++      raw MCP content blocks. They are joined and wrapped so the endpoint is
++      contract-shaped before B2 exists.
++    """
++    is_error = bool(getattr(result, "is_error", False))
++    blocks = getattr(result, "content", None) or []
++    parts: list[str] = []
++    for block in blocks:
++        if isinstance(block, dict):
++            if block.get("type") == "text":
++                parts.append(str(block.get("text", "")))
++            else:
++                parts.append(json.dumps(block, ensure_ascii=False, default=str))
++        else:  # pragma: no cover — plugins return dict blocks today
++            parts.append(str(block))
++    text = _cap("\n".join(parts))
++
++    if text:
++        try:
++            parsed = json.loads(text)
++        except (ValueError, RecursionError):
++            parsed = None
++        if isinstance(parsed, dict) and "ok" in parsed:
++            return parsed
++
++    if is_error:
++        return _fail("error", text or "The tool reported a failure with no message.")
++    return {"ok": True, "text": text}
++
++
++def _assigned_port(server: Any, requested: int) -> int:
++    """Read the port uvicorn actually bound (``port=0`` means the OS picks)."""
++    for sock in getattr(server, "servers", []) or []:
++        for raw in getattr(sock, "sockets", []) or []:
++            with contextlib.suppress(OSError, IndexError, TypeError):
++                return int(raw.getsockname()[1])
++    return requested
++
++
++def _agent_version() -> str:
++    """The Agent's version, reported to the core in ``serverInfo``."""
++    try:
++        from importlib.metadata import version
++
++        return version("workstation-agent")
++    except Exception:  # noqa: BLE001 — a frozen build may have no metadata
++        return "0.0.0"
+diff --git a/src/workstation_agent/network_mcp/tools.py b/src/workstation_agent/network_mcp/tools.py
+new file mode 100644
+index 0000000..3b6b2f8
+--- /dev/null
++++ b/src/workstation_agent/network_mcp/tools.py
+@@ -0,0 +1,508 @@
++"""The static families-only allowlist served on the network endpoint.
++
++This module is **the** authority on which tools leave this workstation. It is a
++frozen, hand-maintained table, not a runtime query — that is the whole point.
++
++Why static
++----------
++The brief's "every tool the loaded families expose" was rejected during review
++(``working/brief-review/REVIEW-SUMMARY.md`` §3 item 1) and the plan records the
++replacement as a standing decision:
++
++* Taken literally it would put ``screen.*``, ``clipboard.*``, ``desktop.*`` and
++  ``browser.*`` on the LAN, while contract §10 defers screenshots-the-model-can-see
++  and voice to v2/v3.
++* Three runtime mechanisms (plugin enable/disable, signature verification, a
++  plugin crashing) can change what ``MCPHost.tools()`` returns without a release.
++  The core reconciles the registration's tool list against the served list at load
++  and **a mismatch is a terminal load failure** (contract §2). A served set that
++  can drift at runtime therefore guarantees the failure the contract forbids.
++
++So the served set comes from one list, in one place, that changes only when
++someone edits this file — and subtask B5 generates ``workstation-registration.zip``
++from this same list, which is what makes the two provably equal rather than
++coincidentally equal.
++
++``agent.*`` internal tools (``agent.speak``, ``agent.toast``, ``agent.status``,
++``agent.last_transcript``, ``agent.pause_listening``, ``agent.execute_local``) are
++**never** in this table. They are the local named pipe's surface, not the LAN's.
++
++Naming
++------
++Contract §2: tool names must match ``^[a-z][a-z0-9-]{1,63}$`` after ``_`` → ``-``,
++and **no dots**. The Agent's internal names are ``family.verb``; the wire names are
++``family_verb``. Both are stored explicitly on each entry rather than derived by
++splitting, because a verb containing an underscore would make the split ambiguous
++and a silent mistranslation is worse than a verbose table.
++
++Tools whose family is not yet loaded (``shell``, ``files``, ``jobs``, ``devices``,
++``adb``, ``serial`` land in B6-B8) are still advertised: the registration and the
++served list must agree, and a call to a missing family answers with the §5.2
++``error`` envelope rather than disappearing from ``tools/list``.
++"""
++
++from __future__ import annotations
++
++import re
++from dataclasses import dataclass
++from typing import Any, Final
++
++#: Contract §2 / ``contracts/manifest.py:16,470-478``. Applied to the wire name
++#: after ``_`` → ``-``.
++TOOL_NAME_PATTERN: Final = re.compile(r"^[a-z][a-z0-9-]{1,63}$")
++
++
++@dataclass(frozen=True)
++class ServedTool:
++    """One tool the network endpoint serves.
++
++    Attributes:
++        name: The wire name (contract §2 ``family_verb``). What the core calls.
++        internal_name: The Agent-internal ``family.verb`` id passed to
++            :meth:`workstation_agent.mcp_host.host.MCPHost.invoke`.
++        family: The family this tool belongs to.
++        description: Sent to the model verbatim (§5.1).
++        input_schema: JSON Schema for the arguments (§5.1). Every property has a
++            ``description``; booleans default to the safe value.
++        risk: The risk level B5 writes into the registration. Always ``"safe"`` —
++            contract §4: the core cannot prompt (issue #6), so *the Agent is the
++            gate* and every tool is declared ``safe`` to the core. This is weaker
++            than the spec's risk model and the contract says so in as many words.
++    """
++
++    name: str
++    internal_name: str
++    family: str
++    description: str
++    input_schema: dict[str, Any]
++    risk: str = "safe"
++
++    @property
++    def manifest_name(self) -> str:
++        """The name as contract §2's pattern sees it (``_`` → ``-``)."""
++        return self.name.replace("_", "-")
++
++
++def _obj(
++    properties: dict[str, dict[str, Any]],
++    required: list[str] | None = None,
++) -> dict[str, Any]:
++    """Build a flat JSON Schema object (§5.1: arguments are a flat object)."""
++    schema: dict[str, Any] = {
++        "type": "object",
++        "properties": properties,
++        "additionalProperties": False,
++    }
++    if required:
++        schema["required"] = required
++    return schema
++
++
++_PATH = {
++    "type": "string",
++    "description": "A path on the workstation, inside a declared root. "
++                   "A path outside the declared roots is denied.",
++}
++_WAIT_S = {
++    "type": "integer",
++    "description": "Seconds to wait before returning a job handle instead of a result. "
++                   "Default 20, maximum 25.",
++    "minimum": 0,
++    "maximum": 25,
++    "default": 20,
++}
++_JOB_ID = {"type": "string", "description": "A job id from a previous call."}
++_SESSION_ID = {"type": "string", "description": "A session id from serial_open."}
++_ADB_SERIAL = {
++    "type": "string",
++    "description": "The ADB device serial. Optional when exactly one device is attached.",
++}
++
++
++#: The complete served set. Ordering is contract §6's ordering.
++SERVED_TOOLS: Final[tuple[ServedTool, ...]] = (
++    ServedTool(
++        name="workstation_status",
++        internal_name="workstation.status",
++        family="workstation",
++        description=(
++            "Report the workstation's hostname, user, OS, uptime, Agent version, "
++            "the capability families loaded, and how many jobs and sessions are open."
++        ),
++        input_schema=_obj({}),
++    ),
++    ServedTool(
++        name="devices_list",
++        internal_name="devices.list",
++        family="devices",
++        description=(
++            "List everything currently attached to the workstation: USB devices, "
++            "ADB devices, and COM ports."
++        ),
++        input_schema=_obj({}),
++    ),
++    ServedTool(
++        name="shell_run",
++        internal_name="shell.run",
++        family="shell",
++        description=(
++            "Run a command on the workstation and return its exit code, stdout and stderr. "
++            "Long-running commands return a job id instead; page the output with jobs_output."
++        ),
++        input_schema=_obj(
++            {
++                "command": {"type": "string", "description": "The command line to run."},
++                "cwd": {
++                    "type": "string",
++                    "description": "Working directory. Defaults to a declared root.",
++                },
++                "shell": {
++                    "type": "string",
++                    "enum": ["powershell", "cmd"],
++                    "default": "powershell",
++                    "description": "Which shell interprets the command.",
++                },
++                "wait_s": _WAIT_S,
++            },
++            ["command"],
++        ),
++    ),
++    ServedTool(
++        name="files_list",
++        internal_name="files.list",
++        family="files",
++        description="List the entries of a directory on the workstation, inside a declared root.",
++        input_schema=_obj({"path": _PATH}, ["path"]),
++    ),
++    ServedTool(
++        name="files_read",
++        internal_name="files.read",
++        family="files",
++        description=(
++            "Read a text file on the workstation, inside a declared root. "
++            "Binary files are refused; large files are paged with from_byte."
++        ),
++        input_schema=_obj(
++            {
++                "path": _PATH,
++                "from_byte": {
++                    "type": "integer",
++                    "minimum": 0,
++                    "default": 0,
++                    "description": "Byte offset to start reading from.",
++                },
++                "max_bytes": {
++                    "type": "integer",
++                    "minimum": 1,
++                    "maximum": 60000,
++                    "description": "Most bytes to return. Capped at 60000.",
++                },
++            },
++            ["path"],
++        ),
++    ),
++    ServedTool(
++        name="files_write",
++        internal_name="files.write",
++        family="files",
++        description=(
++            "Write text to a file on the workstation, inside a declared root. "
++            "Overwrites unless append is true."
++        ),
++        input_schema=_obj(
++            {
++                "path": _PATH,
++                "content": {"type": "string", "description": "The text to write."},
++                "append": {
++                    "type": "boolean",
++                    "default": False,
++                    "description": "Append instead of overwriting. Defaults to false.",
++                },
++            },
++            ["path", "content"],
++        ),
++    ),
++    ServedTool(
++        name="jobs_wait",
++        internal_name="jobs.wait",
++        family="jobs",
++        description="Wait for a running job to finish, or until wait_s elapses.",
++        input_schema=_obj({"job_id": _JOB_ID, "wait_s": _WAIT_S}, ["job_id"]),
++    ),
++    ServedTool(
++        name="jobs_output",
++        internal_name="jobs.output",
++        family="jobs",
++        description="Page the captured output of a job.",
++        input_schema=_obj(
++            {
++                "job_id": _JOB_ID,
++                "from_byte": {
++                    "type": "integer",
++                    "minimum": 0,
++                    "default": 0,
++                    "description": "Byte offset to start reading from.",
++                },
++                "max_bytes": {
++                    "type": "integer",
++                    "minimum": 1,
++                    "maximum": 60000,
++                    "description": "Most bytes to return. Capped at 60000.",
++                },
++            },
++            ["job_id"],
++        ),
++    ),
++    ServedTool(
++        name="jobs_list",
++        internal_name="jobs.list",
++        family="jobs",
++        description="List running jobs and jobs that finished in the last 30 minutes.",
++        input_schema=_obj({}),
++    ),
++    ServedTool(
++        name="jobs_kill",
++        internal_name="jobs.kill",
++        family="jobs",
++        description="Terminate a running job and its process tree.",
++        input_schema=_obj({"job_id": _JOB_ID}, ["job_id"]),
++    ),
++    ServedTool(
++        name="adb_devices",
++        internal_name="adb.devices",
++        family="adb",
++        description="List the Android devices ADB can see, with their state and model.",
++        input_schema=_obj({}),
++    ),
++    ServedTool(
++        name="adb_shell",
++        internal_name="adb.shell",
++        family="adb",
++        description=(
++            "Run a shell command on an attached Android device. "
++            "Long-running commands return a job id."
++        ),
++        input_schema=_obj(
++            {
++                "serial": _ADB_SERIAL,
++                "command": {"type": "string", "description": "The command to run on the device."},
++                "wait_s": _WAIT_S,
++            },
++            ["command"],
++        ),
++    ),
++    ServedTool(
++        name="adb_push",
++        internal_name="adb.push",
++        family="adb",
++        description=(
++            "Copy a file from the workstation onto an attached Android device. "
++            "The workstation path must be inside a declared root."
++        ),
++        input_schema=_obj(
++            {
++                "serial": _ADB_SERIAL,
++                "workstation_path": _PATH,
++                "device_path": {
++                    "type": "string",
++                    "description": "Destination path on the device.",
++                },
++            },
++            ["workstation_path", "device_path"],
++        ),
++    ),
++    ServedTool(
++        name="adb_pull",
++        internal_name="adb.pull",
++        family="adb",
++        description=(
++            "Read a text file from an attached Android device. "
++            "Binary transfer is not available yet."
++        ),
++        input_schema=_obj(
++            {
++                "serial": _ADB_SERIAL,
++                "device_path": {"type": "string", "description": "Path on the device to read."},
++            },
++            ["device_path"],
++        ),
++    ),
++    ServedTool(
++        name="adb_install",
++        internal_name="adb.install",
++        family="adb",
++        description=(
++            "Install an APK from the workstation onto an attached Android device. "
++            "The workstation path must be inside a declared root."
++        ),
++        input_schema=_obj(
++            {"serial": _ADB_SERIAL, "workstation_path": _PATH},
++            ["workstation_path"],
++        ),
++    ),
++    ServedTool(
++        name="adb_logcat",
++        internal_name="adb.logcat",
++        family="adb",
++        description="Capture logcat from an attached Android device for a few seconds.",
++        input_schema=_obj(
++            {
++                "serial": _ADB_SERIAL,
++                "seconds": {
++                    "type": "integer",
++                    "minimum": 1,
++                    "maximum": 20,
++                    "default": 5,
++                    "description": "How long to capture. Maximum 20.",
++                },
++                "filter": {
++                    "type": "string",
++                    "description": "An optional logcat filter expression.",
++                },
++            },
++        ),
++    ),
++    ServedTool(
++        name="serial_ports",
++        internal_name="serial.ports",
++        family="serial",
++        description="List the COM ports on the workstation.",
++        input_schema=_obj({}),
++    ),
++    ServedTool(
++        name="serial_open",
++        internal_name="serial.open",
++        family="serial",
++        description="Open a serial port and return a session id for reading and writing.",
++        input_schema=_obj(
++            {
++                "port": {"type": "string", "description": "The port name, for example COM3."},
++                "baud": {"type": "integer", "description": "Baud rate, for example 115200."},
++                "bytesize": {"type": "integer", "default": 8, "description": "Data bits."},
++                "parity": {
++                    "type": "string",
++                    "enum": ["N", "E", "O", "M", "S"],
++                    "default": "N",
++                    "description": "Parity. Defaults to none.",
++                },
++                "stopbits": {"type": "number", "default": 1, "description": "Stop bits."},
++                "timeout_s": {
++                    "type": "number",
++                    "minimum": 0,
++                    "maximum": 20,
++                    "default": 2,
++                    "description": "Default read timeout for this session, in seconds.",
++                },
++            },
++            ["port", "baud"],
++        ),
++    ),
++    ServedTool(
++        name="serial_write",
++        internal_name="serial.write",
++        family="serial",
++        description="Write text or raw bytes to an open serial session.",
++        input_schema=_obj(
++            {
++                "session_id": _SESSION_ID,
++                "text": {"type": "string", "description": "Text to write."},
++                "hex": {
++                    "type": "string",
++                    "description": "Raw bytes as lowercase hex with no separators.",
++                },
++            },
++            ["session_id"],
++        ),
++    ),
++    ServedTool(
++        name="serial_read",
++        internal_name="serial.read",
++        family="serial",
++        description="Read from an open serial session until a marker, a byte count, or a timeout.",
++        input_schema=_obj(
++            {
++                "session_id": _SESSION_ID,
++                "until": {
++                    "type": "string",
++                    "description": "A literal string to stop at, matched after decoding.",
++                },
++                "max_bytes": {
++                    "type": "integer",
++                    "minimum": 1,
++                    "maximum": 60000,
++                    "description": "Most bytes to read. Capped at 60000.",
++                },
++                "timeout_s": {
++                    "type": "number",
++                    "minimum": 0,
++                    "maximum": 20,
++                    "default": 2,
++                    "description": "Seconds to wait. Default 2, maximum 20.",
++                },
++            },
++            ["session_id"],
++        ),
++    ),
++    ServedTool(
++        name="serial_close",
++        internal_name="serial.close",
++        family="serial",
++        description="Close an open serial session and release the port.",
++        input_schema=_obj({"session_id": _SESSION_ID}, ["session_id"]),
++    ),
++)
++
++
++#: Wire name → descriptor. Built once; the table is frozen.
++SERVED_TOOLS_BY_NAME: Final[dict[str, ServedTool]] = {t.name: t for t in SERVED_TOOLS}
++
++#: The families this endpoint is willing to serve at all.
++SERVED_FAMILIES: Final[tuple[str, ...]] = tuple(
++    dict.fromkeys(t.family for t in SERVED_TOOLS),
++)
++
++
++def served_tool_names() -> tuple[str, ...]:
++    """Return the served wire names, in table order.
++
++    This is the function subtask B5 generates ``workstation-registration.zip``
++    from. It exists so B5 never has to reach into the table's internals, and so
++    "the served set" has exactly one spelling in the codebase.
++    """
++    return tuple(t.name for t in SERVED_TOOLS)
++
++
++def validate_tool_names() -> list[str]:
++    """Return a list of contract §2 violations in the table; empty means clean.
++
++    Checks the manifest form (``_`` → ``-``) against ``TOOL_NAME_PATTERN``, that
++    no wire name contains a dot, that the internal name really is ``family.verb``
++    with a matching family, and that wire names are unique.
++    """
++    problems: list[str] = []
++    seen: set[str] = set()
++    for tool in SERVED_TOOLS:
++        if tool.name in seen:
++            problems.append(f"duplicate served name: {tool.name!r}")
++        seen.add(tool.name)
++        if "." in tool.name:
++            problems.append(f"served name contains a dot (contract §2 forbids it): {tool.name!r}")
++        if not TOOL_NAME_PATTERN.match(tool.manifest_name):
++            problems.append(
++                f"served name {tool.name!r} -> {tool.manifest_name!r} "
++                f"does not match {TOOL_NAME_PATTERN.pattern}",
++            )
++        if tool.internal_name.count(".") != 1:
++            problems.append(
++                f"internal name {tool.internal_name!r} is not family.verb",
++            )
++        elif tool.internal_name.split(".", 1)[0] != tool.family:
++            problems.append(
++                f"internal name {tool.internal_name!r} does not start with family "
++                f"{tool.family!r}",
++            )
++        if tool.risk != "safe":
++            problems.append(
++                f"{tool.name!r} declares risk {tool.risk!r}; contract §4 requires 'safe'",
++            )
++    return problems

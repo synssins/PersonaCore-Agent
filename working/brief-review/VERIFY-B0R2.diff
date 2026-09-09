@@ -1,0 +1,551 @@
+diff --git a/src/workstation_agent/mcp_host/mcp_server.py b/src/workstation_agent/mcp_host/mcp_server.py
+index 6b29751..b0cd044 100644
+--- a/src/workstation_agent/mcp_host/mcp_server.py
++++ b/src/workstation_agent/mcp_host/mcp_server.py
+@@ -34,13 +34,17 @@ from __future__ import annotations
+ 
+ import asyncio
+ import contextlib
++import dataclasses
+ import json
+ import logging
+ import os
+ import secrets
+ import sys
+ from pathlib import Path
+-from typing import Any
++from typing import TYPE_CHECKING, Any
++
++if TYPE_CHECKING:
++    from collections.abc import Callable
+ 
+ log = logging.getLogger(__name__)
+ 
+@@ -58,6 +62,17 @@ _JSONRPC = "2.0"
+ # winerror code returned by CreateNamedPipe when pipe is already bound.
+ _ERROR_PIPE_BUSY = 231
+ 
++# Cap on a single JSON-RPC line's size (readline()'s buffer limit). Both the
++# pipe and TCP readers use this instead of asyncio's 64 KiB default: a
++# pre-authentication client is free to send a large-but-legitimate single
++# request (e.g. a long token — see the "very long token" hostile-input
++# case), and asyncio's default would make ``readline()`` raise
++# ``LimitOverrunError``/``ValueError`` for that before it ever reaches
++# ``_handle_initialize`` for a normal rejection. This bound still keeps
++# per-connection buffering finite; ``serve()`` also treats hitting it as a
++# clean disconnect rather than letting it propagate as an unhandled crash.
++_MAX_RPC_LINE_BYTES = 64 * 1024 * 1024  # 64 MiB
++
+ 
+ # ---------------------------------------------------------------------------
+ # Token management
+@@ -95,6 +110,33 @@ def load_token() -> str | None:
+ # JSON-RPC helpers
+ # ---------------------------------------------------------------------------
+ 
++def _json_default(obj: Any) -> Any:
++    """``json.dumps(default=...)`` hook for types the stdlib can't serialise.
++
++    Tool results routed through :meth:`MCPHost.invoke` come back as
++    ``ToolResultImpl`` (and similar) plain dataclasses, not dicts — see
++    ``workstation_agent.mcp_host.host``. ``json.dumps`` has no idea how to
++    encode a dataclass instance on its own, so every successful
++    ``agent.execute_local`` call raised ``TypeError`` and was reported as
++    ``isError: True`` before this hook existed.
++
++    Anything that isn't a known-serialisable shape raises ``TypeError``
++    here (matching ``json.dumps``'s own contract for a failing ``default``)
++    rather than falling back to ``str()``. A permissive string fallback
++    would silently turn an unexpected type — a ``set``, an exception, a
++    function — into a plausible-looking string instead of surfacing the
++    failure, which is exactly the class of bug this hook exists to fix.
++    ``_handle_tools_call``'s surrounding ``except Exception`` still turns a
++    ``TypeError`` raised here into a proper ``isError: True`` response with
++    the real message, so the failure is reported honestly instead of either
++    crashing the connection or masquerading as success.
++    """
++    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
++        return dataclasses.asdict(obj)
++    msg = f"Object of type {type(obj).__name__} is not JSON serializable"
++    raise TypeError(msg)
++
++
+ def _reply(req_id: Any, result: Any) -> bytes:
+     payload = {"jsonrpc": _JSONRPC, "id": req_id, "result": result}
+     return (json.dumps(payload, separators=(",", ":")) + "\n").encode()
+@@ -114,6 +156,22 @@ def _notification(method: str, params: dict[str, Any]) -> bytes:
+     return (json.dumps(payload, separators=(",", ":")) + "\n").encode()
+ 
+ 
++def _toast_action_logger(action_id: str) -> Callable[[], None]:
++    """Build a ``ToastPresenter`` action callback that just logs the click.
++
++    ``agent.toast`` is invoked over the pipe and its ``tools/call`` response
++    is sent back before the user can possibly have clicked a toast button —
++    there is no MCP request left in flight to report the click through. The
++    callback exists only so the toast is well-formed and the click is
++    observable in the log, not lost silently.
++    """
++
++    def _on_click() -> None:
++        log.info("agent.toast: action %r activated (no MCP channel to report it)", action_id)
++
++    return _on_click
++
++
+ # ---------------------------------------------------------------------------
+ # Tool definitions
+ # ---------------------------------------------------------------------------
+@@ -234,7 +292,16 @@ class AgentMCPServer:
+             while True:
+                 try:
+                     raw = await self._reader.readline()
+-                except (asyncio.IncompleteReadError, ConnectionResetError, BrokenPipeError):
++                except (
++                    asyncio.IncompleteReadError,
++                    ConnectionResetError,
++                    BrokenPipeError,
++                    # readline() raises this (wrapping LimitOverrunError)
++                    # when a line exceeds _MAX_RPC_LINE_BYTES with no
++                    # newline in sight — an oversized/malformed line
++                    # disconnects cleanly rather than crashing the session.
++                    ValueError,
++                ):
+                     break
+                 if not raw:
+                     break
+@@ -290,8 +357,34 @@ class AgentMCPServer:
+ 
+     async def _handle_initialize(self, req_id: Any, params: dict[str, Any]) -> None:
+         """Validate token and complete the MCP handshake."""
+-        client_token = params.get("token", "")
+-        if client_token != self._token:
++        client_token = params.get("token")
++        # This field has now had three variations of the same mistake fixed
++        # on it: `!=` assumed both sides were comparable strings, then
++        # `compare_digest` on `str` assumed the client's string was
++        # ASCII-only, then `.encode("utf-8")` assumed the client's string
++        # was well-formed Unicode. It isn't guaranteed to be any of those —
++        # this is JSON-RPC params from an untrusted, pre-authentication
++        # client, and B4 is about to put this same pattern on a LAN. So:
++        # nothing here is trusted until it is safely bytes. A non-str is
++        # rejected immediately; a str that fails to encode (e.g. an unpaired
++        # surrogate like "\ud800", which json.loads() happily accepts as a
++        # value but UTF-8 cannot represent) is caught and rejected the same
++        # way, rather than being allowed to raise out of the handshake.
++        # Deliberately *rejecting* on a bad encode rather than substituting
++        # `errors="replace"`: a replacement policy maps many different
++        # malformed inputs onto the same output bytes, which is exactly the
++        # kind of collision a token comparison must not tolerate.
++        token_bytes: bytes | None = None
++        if isinstance(client_token, str):
++            try:
++                token_bytes = client_token.encode("utf-8")
++            except UnicodeEncodeError:
++                token_bytes = None
++
++        token_ok = token_bytes is not None and secrets.compare_digest(
++            token_bytes, self._token.encode("utf-8"),
++        )
++        if not token_ok:
+             self._writer.write(_error(req_id, -32000, "invalid token"))
+             await self._writer.drain()
+             log.warning("MCP client presented bad token; rejecting")
+@@ -312,7 +405,7 @@ class AgentMCPServer:
+ 
+         try:
+             result = await self._invoke_tool(tool_name, args)
+-            content = [{"type": "text", "text": json.dumps(result)}]
++            content = [{"type": "text", "text": json.dumps(result, default=_json_default)}]
+             self._writer.write(_reply(req_id, {"content": content, "isError": False}))
+         except Exception as exc:  # noqa: BLE001
+             content = [{"type": "text", "text": str(exc)}]
+@@ -329,12 +422,24 @@ class AgentMCPServer:
+         if tool_name == "agent.toast":
+             title = str(args.get("title", ""))
+             body = str(args.get("body", ""))
+-            actions = args.get("actions", [])
++            raw_actions = args.get("actions") or []
+             if self._toast is not None:
+-                result = await self._toast.present(
+-                    title=title, body=body, actions=actions,
+-                )
+-                return {"ok": True, "action": result}
++                toast_actions = {
++                    str(action_id): (str(action_id), _toast_action_logger(str(action_id)))
++                    for action_id in raw_actions
++                }
++                # ToastPresenter.show() is synchronous and fire-and-forget: it
++                # queues the toast with the OS and returns immediately. It has
++                # no "wait for the click" mode, and building one here would
++                # mean blocking this already-in-flight tools/call response on
++                # a user action that may come seconds later or never — the
++                # named-pipe client has no timeout budget for that. Building
++                # a real awaitable "wait for user response" primitive is
++                # SPEC B1's confirm primitive, not this tool. So we show the
++                # toast and acknowledge; any click is only logged, since
++                # there is no channel left to report it back through once
++                # this call has returned.
++                self._toast.show(title=title, body=body, actions=toast_actions or None)
+             return {"ok": True}
+ 
+         if tool_name == "agent.status":
+@@ -436,7 +541,7 @@ async def _create_pipe_server() -> tuple[asyncio.StreamReader, asyncio.StreamWri
+         log.error("Failed to adopt pipe handle: %s", exc)  # noqa: TRY400
+         return None
+ 
+-    reader = asyncio.StreamReader()
++    reader = asyncio.StreamReader(limit=_MAX_RPC_LINE_BYTES)
+     protocol = asyncio.StreamReaderProtocol(reader)
+     transport, _ = await loop.connect_read_pipe(lambda: protocol, pipe_file)
+     writer = asyncio.StreamWriter(transport, protocol, reader, loop)  # type: ignore[arg-type]
+@@ -513,7 +618,7 @@ async def run_tcp_server(
+         )
+         await session.serve()
+ 
+-    server = await asyncio.start_server(handle_client, host, port)
++    server = await asyncio.start_server(handle_client, host, port, limit=_MAX_RPC_LINE_BYTES)
+     assigned_port = server.sockets[0].getsockname()[1]  # type: ignore[union-attr]
+     return server, assigned_port
+ 
+diff --git a/tests/unit/mcp_host/test_agent_mcp_server.py b/tests/unit/mcp_host/test_agent_mcp_server.py
+index 61ae38e..641498a 100644
+--- a/tests/unit/mcp_host/test_agent_mcp_server.py
++++ b/tests/unit/mcp_host/test_agent_mcp_server.py
+@@ -23,6 +23,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
+ 
+ import pytest
+ 
++from workstation_agent.mcp_host.host import ToolResultImpl
+ from workstation_agent.mcp_host.mcp_server import run_tcp_server
+ 
+ # ---------------------------------------------------------------------------
+@@ -32,6 +33,31 @@ from workstation_agent.mcp_host.mcp_server import run_tcp_server
+ TOKEN = "deadbeef" * 8  # 64 hex chars, doesn't need to be real 32-byte secret
+ 
+ 
++class FakeToastPresenter:
++    """A fake matching :class:`ToastPresenter`'s ACTUAL public signature.
++
++    Deliberately NOT a ``MagicMock``: a ``MagicMock`` accepts any method
++    name (``.present(...)``, ``.pop(...)``, anything) and any signature, so
++    it would happily "succeed" against code calling a method that does not
++    exist on the real ``ToastPresenter``. This fake only has ``show()``,
++    keyword-only, matching ``toast.py``'s real signature exactly — calling
++    ``.present(...)`` on it raises ``AttributeError`` just like it would on
++    the real presenter, which is the whole point.
++    """
++
++    def __init__(self) -> None:
++        self.calls: list[dict[str, Any]] = []
++
++    def show(
++        self,
++        *,
++        title: str,
++        body: str,
++        actions: dict[str, tuple[str, Any]] | None = None,
++    ) -> None:
++        self.calls.append({"title": title, "body": body, "actions": actions})
++
++
+ async def _open_client(port: int) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+     return await asyncio.open_connection("127.0.0.1", port)
+ 
+@@ -111,6 +137,75 @@ async def test_bad_token_rejected(mcp_server_port) -> None:
+     writer.close()
+ 
+ 
++# ---------------------------------------------------------------------------
++# Tests: the "token" field is hostile input — sweep the space, not one case
++#
++# This one field has had three variations of the same mistake fixed on it in
++# successive review rounds: `!=` assumed both sides were comparable strings,
++# then `compare_digest` on plain `str` assumed the client's string was
++# ASCII-only, then `.encode("utf-8")` assumed the client's string was
++# well-formed Unicode (an unpaired surrogate like "\ud800" is valid JSON but
++# not valid UTF-8). Each fix was locally correct and moved the crash
++# somewhere new. So rather than one regression test per bug found, this
++# parametrizes the whole space of things a hostile, pre-authentication
++# client can put in this field, and asserts none of them can raise: each
++# must come back as a clean "invalid token" JSON-RPC error *and* leave the
++# connection usable afterward (checked with a follow-up ping), never an
++# exception that kills the session.
++# ---------------------------------------------------------------------------
++
++_MISSING_TOKEN = object()  # sentinel: omit the "token" key entirely
++
++_HOSTILE_TOKEN_CASES = [
++    pytest.param(_MISSING_TOKEN, id="missing-key"),
++    pytest.param(None, id="null"),
++    pytest.param(123, id="non-string-int"),
++    pytest.param(["a", "b"], id="non-string-list"),
++    pytest.param({"x": 1}, id="non-string-dict"),
++    pytest.param("", id="empty-string"),
++    pytest.param("\ud800", id="unpaired-surrogate-high"),
++    pytest.param("\udfff", id="unpaired-surrogate-low"),
++    pytest.param("café-你好-token", id="non-ascii-valid-utf8"),
++    pytest.param("A" * (10 * 1024 * 1024), id="very-long-10mb"),
++]
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("token_value", _HOSTILE_TOKEN_CASES)
++async def test_hostile_token_values_rejected_without_crashing(mcp_server_port, token_value) -> None:
++    """No value a client can put in the "token" field may raise.
++
++    Covers: a missing key, JSON null, wrong JSON types, an empty string, a
++    lone UTF-16 surrogate in each half of the pair, a genuinely non-ASCII
++    (but well-formed) token, and a 10 MB token. Every case must be rejected
++    the normal way, with the connection still usable — proving the handler
++    itself never raised.
++    """
++    port, _, _ = mcp_server_port
++    reader, writer = await _open_client(port)
++
++    params: dict[str, Any] = {"protocolVersion": "2024-11-05"}
++    if token_value is not _MISSING_TOKEN:
++        params["token"] = token_value
++
++    writer.write(_rpc("initialize", params, req_id=1))
++    await writer.drain()
++    resp = await asyncio.wait_for(_read_one(reader), timeout=10.0)
++
++    assert "error" in resp, f"Expected a clean rejection, got: {resp}"
++    assert resp["error"]["code"] == -32000
++
++    # The connection must still be alive: a follow-up ping gets a normal
++    # reply, proving the handler returned instead of raising out of the
++    # session and tearing the connection down.
++    writer.write(_rpc("ping", req_id=2))
++    await writer.drain()
++    ping_resp = await asyncio.wait_for(_read_one(reader), timeout=5.0)
++    assert "error" not in ping_resp
++
++    writer.close()
++
++
+ @pytest.mark.asyncio
+ async def test_unauthenticated_call_rejected(mcp_server_port) -> None:
+     """Calling tools/list before initialize → -32000."""
+@@ -497,6 +592,40 @@ def test_error_helper() -> None:
+     assert msg["error"]["code"] == -32600
+ 
+ 
++# ---------------------------------------------------------------------------
++# Tests: _json_default
++# ---------------------------------------------------------------------------
++
++
++def test_json_default_serialises_dataclass() -> None:
++    """_json_default still converts dataclasses (e.g. ToolResultImpl)."""
++    from workstation_agent.mcp_host.mcp_server import _json_default
++
++    result = ToolResultImpl(content=[{"type": "text", "text": "hi"}], is_error=False, raw={})
++    assert _json_default(result) == {
++        "content": [{"type": "text", "text": "hi"}],
++        "is_error": False,
++        "raw": {},
++    }
++
++
++@pytest.mark.parametrize("value", [{1, 2, 3}, object(), ValueError("boom"), lambda: None])
++def test_json_default_raises_for_unexpected_types(value: Any) -> None:
++    """_json_default raises TypeError instead of silently stringifying.
++
++    Pre-fix, the fallback was ``return str(obj)``: a ``set``, an exception
++    instance, or a function would silently become a plausible-looking
++    string (``"{1, 2, 3}"``, ``"<function ... at 0x...>"``) instead of
++    surfacing a serialisation failure — exactly how the ``ToolResultImpl``
++    defect (defect 2) hid undetected. This asserts the permissive fallback
++    is gone.
++    """
++    from workstation_agent.mcp_host.mcp_server import _json_default
++
++    with pytest.raises(TypeError):
++        _json_default(value)
++
++
+ # ---------------------------------------------------------------------------
+ # Tests: shutdown method
+ # ---------------------------------------------------------------------------
+@@ -523,11 +652,21 @@ async def test_shutdown_before_auth(mcp_server_port) -> None:
+ 
+ @pytest.mark.asyncio
+ async def test_agent_toast_with_presenter() -> None:
+-    """agent.toast with a presenter calls presenter.present()."""
++    """agent.toast with a presenter calls the real ToastPresenter.show() API.
++
++    Uses ``FakeToastPresenter``, which only implements ``show(*, title, body,
++    actions)`` — the real ``ToastPresenter`` signature. Pre-fix, the call
++    site invoked ``self._toast.present(...)``, which does not exist on this
++    fake (nor on the real presenter): this test would have raised
++    ``AttributeError`` inside ``_invoke_tool``, caught by the broad
++    ``except Exception`` in ``_handle_tools_call``, and come back as
++    ``isError: True`` with the error text mentioning ``present`` — failing
++    the ``isError is False`` assertion below. That is the regression this
++    test guards against.
++    """
+     from workstation_agent.mcp_host.mcp_server import AgentMCPServer
+ 
+-    _toast = MagicMock()
+-    _toast.present = AsyncMock(return_value="clicked")
++    _toast = FakeToastPresenter()
+ 
+     async def _handler(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+         session = AgentMCPServer(r, w, token=TOKEN, toast=_toast)
+@@ -541,14 +680,63 @@ async def test_agent_toast_with_presenter() -> None:
+     await w2.drain()
+     _ = await _read_one(r2)
+ 
+-    w2.write(_rpc("tools/call", {"name": "agent.toast", "arguments": {"title": "Hi", "body": "World"}}, req_id=2))
++    w2.write(_rpc("tools/call", {
++        "name": "agent.toast",
++        "arguments": {"title": "Hi", "body": "World", "actions": ["update_now", "later"]},
++    }, req_id=2))
+     await w2.drain()
+     resp = await _read_one(r2)
+ 
+     assert resp["result"]["isError"] is False
+     result = json.loads(resp["result"]["content"][0]["text"])
+-    assert result["ok"] is True
+-    _toast.present.assert_awaited_once()
++    assert result == {"ok": True}
++
++    # show() was actually called, with the real keyword-only signature.
++    assert len(_toast.calls) == 1
++    call = _toast.calls[0]
++    assert call["title"] == "Hi"
++    assert call["body"] == "World"
++
++    # The list-of-strings "actions" arg from the tool call was adapted into
++    # the dict-of-(label, callback) shape show() actually takes.
++    assert set(call["actions"]) == {"update_now", "later"}
++    for action_id, (label, callback) in call["actions"].items():
++        assert label == action_id
++        assert callable(callback)
++        callback()  # must not raise
++
++    w2.close()
++    mini_server.close()
++    await mini_server.wait_closed()
++
++
++@pytest.mark.asyncio
++async def test_agent_toast_with_presenter_no_actions() -> None:
++    """agent.toast with no actions passes actions=None, not an empty dict."""
++    from workstation_agent.mcp_host.mcp_server import AgentMCPServer
++
++    _toast = FakeToastPresenter()
++
++    async def _handler(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
++        session = AgentMCPServer(r, w, token=TOKEN, toast=_toast)
++        await session.serve()
++
++    mini_server = await asyncio.start_server(_handler, "127.0.0.1", 0)
++    mp = mini_server.sockets[0].getsockname()[1]  # type: ignore[union-attr]
++
++    r2, w2 = await asyncio.open_connection("127.0.0.1", mp)
++    w2.write(_rpc("initialize", {"token": TOKEN}, req_id=1))
++    await w2.drain()
++    _ = await _read_one(r2)
++
++    w2.write(_rpc("tools/call", {"name": "agent.toast", "arguments": {"title": "Hi", "body": "World"}}, req_id=2))
++    await w2.drain()
++    resp = await _read_one(r2)
++
++    assert resp["result"]["isError"] is False
++    assert len(_toast.calls) == 1
++    assert _toast.calls[0]["actions"] is None
++
+     w2.close()
+     mini_server.close()
+     await mini_server.wait_closed()
+@@ -561,11 +749,27 @@ async def test_agent_toast_with_presenter() -> None:
+ 
+ @pytest.mark.asyncio
+ async def test_agent_execute_local_with_host() -> None:
+-    """agent.execute_local invokes the mcp_host and returns its result."""
++    """agent.execute_local invokes the mcp_host and returns its ToolResultImpl.
++
++    ``MCPHost.invoke`` returns a real ``ToolResultImpl`` dataclass (see
++    ``host.py``), never a plain dict — a mock returning a bare dict here
++    would hide the ``json.dumps`` defect entirely, since dicts are already
++    JSON-serialisable. Pre-fix, ``json.dumps({"result": ToolResultImpl(...)})``
++    with no ``default=`` raised ``TypeError: Object of type ToolResultImpl is
++    not JSON serializable`` inside ``_handle_tools_call``'s try block, which
++    was swallowed by ``except Exception`` and reported as ``isError: True``.
++    This test asserts ``isError is False`` and the full payload, which fails
++    against the pre-fix code.
++    """
+     from workstation_agent.mcp_host.mcp_server import AgentMCPServer
+ 
++    tool_result = ToolResultImpl(
++        content=[{"type": "text", "text": "ok"}],
++        is_error=False,
++        raw={"exit_code": 0},
++    )
+     mock_host = MagicMock()
+-    mock_host.invoke = AsyncMock(return_value={"content": [{"type": "text", "text": "ok"}]})
++    mock_host.invoke = AsyncMock(return_value=tool_result)
+ 
+     async def _handler(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+         session = AgentMCPServer(r, w, token=TOKEN, mcp_host=mock_host)
+@@ -586,8 +790,57 @@ async def test_agent_execute_local_with_host() -> None:
+     await w2.drain()
+     resp = await _read_one(r2)
+ 
++    # This is the regression assertion: a successful call must report
++    # isError: False, not True from a swallowed serialisation TypeError.
+     assert resp["result"]["isError"] is False
+     mock_host.invoke.assert_awaited_once_with("my_plugin.my_tool", {"x": 1})
++
++    payload = json.loads(resp["result"]["content"][0]["text"])
++    assert payload["result"] == {
++        "content": [{"type": "text", "text": "ok"}],
++        "is_error": False,
++        "raw": {"exit_code": 0},
++    }
++    w2.close()
++    mini_server.close()
++    await mini_server.wait_closed()
++
++
++@pytest.mark.asyncio
++async def test_agent_execute_local_unserialisable_result_is_error() -> None:
++    """A genuinely unserialisable result reports isError: True, not success.
++
++    If ``mcp_host.invoke`` ever returns something ``_json_default`` can't
++    handle (here, a plain ``set``), the tool call must surface that as a
++    real error — not silently succeed with a stringified value, which is
++    exactly the failure mode a permissive ``str()`` fallback would produce.
++    """
++    from workstation_agent.mcp_host.mcp_server import AgentMCPServer
++
++    mock_host = MagicMock()
++    mock_host.invoke = AsyncMock(return_value={1, 2, 3})
++
++    async def _handler(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
++        session = AgentMCPServer(r, w, token=TOKEN, mcp_host=mock_host)
++        await session.serve()
++
++    mini_server = await asyncio.start_server(_handler, "127.0.0.1", 0)
++    mp = mini_server.sockets[0].getsockname()[1]  # type: ignore[union-attr]
++
++    r2, w2 = await asyncio.open_connection("127.0.0.1", mp)
++    w2.write(_rpc("initialize", {"token": TOKEN}, req_id=1))
++    await w2.drain()
++    _ = await _read_one(r2)
++
++    w2.write(_rpc("tools/call", {
++        "name": "agent.execute_local",
++        "arguments": {"plugin_id": "my_plugin", "tool": "my_tool"},
++    }, req_id=2))
++    await w2.drain()
++    resp = await _read_one(r2)
++
++    assert resp["result"]["isError"] is True
++    assert "not JSON serializable" in resp["result"]["content"][0]["text"]
+     w2.close()
+     mini_server.close()
+     await mini_server.wait_closed()

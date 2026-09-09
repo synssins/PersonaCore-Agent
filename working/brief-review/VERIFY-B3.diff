@@ -1,0 +1,1435 @@
+diff --git a/src/workstation_agent/config/schema.py b/src/workstation_agent/config/schema.py
+index 71b951a..388e7f3 100644
+--- a/src/workstation_agent/config/schema.py
++++ b/src/workstation_agent/config/schema.py
+@@ -2,7 +2,7 @@
+ 
+ from __future__ import annotations
+ 
+-from typing import Literal
++from typing import Final, Literal
+ 
+ from pydantic import AnyHttpUrl, BaseModel, Field, field_validator
+ 
+@@ -105,6 +105,73 @@ class PluginsConfig(BaseModel):
+     per_plugin: dict[str, PluginConfig] = Field(default_factory=dict)
+ 
+ 
++#: Contract §7's default confirmation policy, in the contract's own
++#: underscore ``family_verb`` spelling.  The gate
++#: (``mcp_host.permissions.evaluate_detailed``) and ``MCPHost.invoke`` work in
++#: the dotted ``family.verb`` form the plugin manifests declare; the mapping
++#: between the two lives entirely in
++#: :func:`workstation_agent.confirm.underscore_to_dotted`, never here — this
++#: module only stores what the operator typed.  ``jobs_*`` is the one
++#: family-wildcard entry: it is expanded to ``jobs.*`` at evaluation time and
++#: matches every tool in the ``jobs`` family.
++DEFAULT_NEVER_PROMPT_TOOLS: Final[tuple[str, ...]] = (
++    "workstation_status",
++    "devices_list",
++    "jobs_*",
++    "adb_devices",
++    "adb_pull",
++    "adb_logcat",
++    "serial_ports",
++    "serial_read",
++    "serial_close",
++    "files_list",
++    "files_read",
++)
++
++DEFAULT_ALWAYS_PROMPT_TOOLS: Final[tuple[str, ...]] = (
++    "shell_run",
++    "adb_shell",
++    "adb_push",
++    "adb_install",
++    "files_write",
++    "serial_open",
++    "serial_write",
++)
++
++
++class ConfirmationPolicyConfig(BaseModel):
++    """Operator-editable confirmation policy (contract §7).
++
++    Tool names here are §7's underscore ``family_verb`` form (``files_read``,
++    ``jobs_*``) — the same spelling the contract and the settings UI use.
++    :func:`workstation_agent.confirm.underscore_to_dotted` converts to the
++    gate's dotted form at the point of use; a name that does not convert to
++    anything real simply matches nothing, which fails toward prompting (the
++    safe direction), never away from it.
++
++    ``never_prompt`` and ``always_prompt`` are meant to be mutually exclusive
++    per tool — the settings UI moves a tool from one to the other rather than
++    adding it to both — but if a tool is ever listed in both,
++    :meth:`workstation_agent.confirm.PromptPolicy.classify` resolves it to
++    ``"always"``: the safe failure direction is more confirmation, not less.
++
++    ``remember_for_session`` is a third, independent list: tools for which an
++    explicit Allow is remembered for the rest of the calling session, so a
++    burst of calls (contract §7: "a burst of serial writes asks once") only
++    prompts the first time. Off by default for every tool — the operator
++    opts a tool in explicitly. It is never persisted as *state* (only this
++    *setting* is); the actual remembered approvals live only in
++    :class:`workstation_agent.confirm.PromptPolicy`'s in-memory session map,
++    keyed by ``(session_id, tool)``, which is why they can never leak across
++    sessions and never survive an Agent restart (§5.5: sessions die with the
++    Agent).
++    """
++
++    never_prompt: list[str] = Field(default_factory=lambda: list(DEFAULT_NEVER_PROMPT_TOOLS))
++    always_prompt: list[str] = Field(default_factory=lambda: list(DEFAULT_ALWAYS_PROMPT_TOOLS))
++    remember_for_session: list[str] = Field(default_factory=list)
++
++
+ class NetworkMcpConfig(BaseModel):
+     """The LAN-facing MCP endpoint PersonaCore connects to (contract §1-§3).
+ 
+@@ -193,6 +260,7 @@ class AgentConfig(BaseModel):
+     ui: UIConfig = Field(default_factory=UIConfig)
+     plugins: PluginsConfig = Field(default_factory=PluginsConfig)
+     network_mcp: NetworkMcpConfig = Field(default_factory=NetworkMcpConfig)
++    confirmation: ConfirmationPolicyConfig = Field(default_factory=ConfirmationPolicyConfig)
+ 
+     @field_validator("session", mode="before")
+     @classmethod
+diff --git a/src/workstation_agent/confirm.py b/src/workstation_agent/confirm.py
+index 834c492..b9195db 100644
+--- a/src/workstation_agent/confirm.py
++++ b/src/workstation_agent/confirm.py
+@@ -404,3 +404,232 @@ class ConfirmPresenter:
+             log.exception("confirm[%s]: spoken line failed", correlation_id)
+             return False
+         return True
++
++
++# --------------------------------------------------------------------------
++# §7 confirmation policy — never/always-prompt lists and session memory (B3)
++# --------------------------------------------------------------------------
++#
++# ConfirmPresenter above is the *mechanism*: show one prompt, wait for one
++# answer.  This section is the *policy* that decides, for a given tool and a
++# gate decision, whether that mechanism gets invoked at all — contract §7's
++# operator-editable never-prompt / always-prompt lists, and the per-tool
++# "remember for this session" that lets a burst of calls to the same tool
++# ask only once.
++#
++# Name mapping
++# ------------
++# Contract §7 and ``AgentConfig.confirmation`` spell tool names in the
++# underscore ``family_verb`` form (``files_read``, ``jobs_*``) — the same
++# spelling the contract text and the settings UI use.  The gate
++# (``mcp_host.permissions.evaluate_detailed``) and ``MCPHost.invoke`` work in
++# the dotted ``family.verb`` form the plugin manifests declare
++# (``filesystem.read``).  :func:`underscore_to_dotted` converts, and
++# :func:`tool_matches_pattern` compares case-insensitively, so a hand-typed
++# or mis-cased entry (``Files_write``) still matches.  ``jobs_*`` is the one
++# family wildcard: it becomes ``jobs.*`` and matches every dotted tool
++# *within* the ``jobs`` family (not the bare word ``jobs`` itself, which is
++# not a real tool id) — see :func:`tool_matches_pattern`.
++#
++# A name that still fails to match anything real — a typo the case-fold
++# doesn't rescue, a family that has not been built yet — fails *toward* the
++# gate's own decision, but that is **not symmetrically safe for both
++# lists**: for a never-prompt entry, "matches nothing" means the gate's own
++# decision stands, which is at worst an extra prompt. For an always-prompt
++# entry, "matches nothing" *also* means the gate's own decision stands —
++# and for an action tool the gate often already says "allow" on its own, so
++# a broken always-prompt match can silently produce no prompt at all where
++# §7 wanted one every time. Treat "fails toward prompting" as a claim about
++# the never-prompt list only; case-folding closes the one way this was
++# reachable through an ordinary operator typo, but it is not a guarantee
++# that every possible mismatch on the always-prompt side is harmless.
++#
++# What this can and cannot do
++# ----------------------------
++# * It never runs before the gate and never sees a ``"deny"`` —
++#   ``MCPHost.invoke`` only consults it for calls the gate already resolved
++#   to ``"confirm"`` or ``"allow"``.  A pre-approved (never-prompt) tool that
++#   the gate denies stays denied; this module has no path back to that
++#   decision at all, by construction rather than by a check that could be
++#   missed.
++# * For a gate ``"confirm"``: the policy can only *suppress* the prompt
++#   (never-prompt, or an already-remembered tool+session) — the call still
++#   had to be "allowed in principle" by the gate first.
++# * For a gate ``"allow"``: the policy can *add* a prompt (always-prompt)
++#   that the gate itself did not require — contract §7 wants every
++#   ``shell_run`` and ``files_write`` confirmed even when the
++#   argument-confinement gate has nothing to complain about.
++# * If a tool is (mis)configured into both lists, "always" wins: the safe
++#   failure direction is more confirmation, not less.
++
++
++def underscore_to_dotted(name: str) -> str:
++    """Convert a §7 tool name to the gate's dotted ``family.verb`` form.
++
++    ``"files_read"`` -> ``"files.read"``.  ``"jobs_*"`` (the one family
++    wildcard the contract defines) -> ``"jobs.*"``.  A name with no ``_`` at
++    all — already dotted, empty, or just not a recognised shape — is
++    returned unchanged, which will not match a real dotted tool id.
++
++    Case is *not* folded here — :func:`tool_matches_pattern` does that on
++    both sides at comparison time, once, rather than here and at every call
++    site that might otherwise forget to.
++    """
++    name = name.strip()
++    if not name:
++        return name
++    if name.endswith("_*"):
++        family = name[:-2]
++        return f"{family}.*" if family else name
++    if "_" not in name:
++        return name
++    family, verb = name.split("_", 1)
++    return f"{family}.{verb}"
++
++
++def tool_matches_pattern(pattern: str, tool_id: str) -> bool:
++    """True if dotted *pattern* (from :func:`underscore_to_dotted`) matches *tool_id*.
++
++    Case-folded on both sides before comparing, so an operator- or hand-typed
++    entry like ``Files_write`` still matches the gate's (always lower-case)
++    ``files.write`` — see the asymmetry note below for why this matters more
++    than it looks.
++
++    A trailing ``.*`` matches every tool *within* that family (``jobs.*``
++    matches ``jobs.wait``, ``jobs.output``, ... but not the bare name
++    ``jobs`` itself, which is not a real dotted tool id and should not be
++    swept in just because it shares the family's spelling). Everything else
++    is an exact match only — there is no implicit prefix matching, so
++    ``files.rea`` never matches ``files.read``.
++
++    Failing to match is **not symmetrically safe**. A never-prompt entry
++    that fails to match falls back to the gate's own decision — at worst an
++    extra prompt, never a widened permission. An always-prompt entry that
++    fails to match (a mis-cased config line, say) falls back to the gate's
++    own decision too, but for an action tool the gate often says "allow" on
++    its own — so a broken always-prompt match can silently produce *no*
++    prompt at all where §7 wanted one every time. Case-folding here removes
++    the one way that was reachable through ordinary operator typos.
++    """
++    if not pattern or not tool_id:
++        return False
++    pattern = pattern.casefold()
++    tool_id = tool_id.casefold()
++    if pattern == tool_id:
++        return True
++    if pattern.endswith(".*"):
++        family = pattern[:-2]
++        return bool(family) and tool_id.startswith(family + ".")
++    return False
++
++
++class PromptPolicy:
++    """Runtime view of contract §7's confirmation policy for one MCPHost.
++
++    See :class:`workstation_agent.mcp_host.host.MCPHost`, which owns one
++    instance of this class.  Reads the operator's ``AgentConfig.confirmation``
++    lists via
++    *config_provider*, called fresh on every query — there is no cached copy
++    to go stale, so a setting changed through the UI takes effect on the very
++    next call.
++
++    Session memory (:meth:`remember` / :meth:`is_remembered`) is the only
++    stateful part of this class, and it is deliberately narrow:
++
++    * **per session AND per tool** — keyed by ``(session_id, tool_id)``, so
++      remembering ``serial.write`` for session ``s1`` cannot suppress a
++      prompt for ``files.write`` in ``s1``, nor for ``serial.write`` in a
++      different session ``s2``;
++    * **in memory only** — a plain dict on this instance, never written to
++      disk and never shared with another :class:`PromptPolicy`, so it cannot
++      outlive the process or leak to another one; and
++    * **cleared by** :meth:`reset`, which ``MCPHost.start`` calls on every
++      (re)start — "must not survive an Agent restart" is enforced by that
++      call always happening, not by a TTL that happens to be short enough.
++    """
++
++    def __init__(self, config_provider: Callable[[], Any] | None = None) -> None:
++        """Build a policy view; *config_provider* is called lazily, per query."""
++        self._config_provider = config_provider
++        self._remembered: dict[str, set[str]] = {}
++
++    def reset(self) -> None:
++        """Drop all remembered session approvals.  Called by ``MCPHost.start``."""
++        self._remembered = {}
++
++    def _policy_config(self) -> Any:  # noqa: ANN401 — duck-typed AgentConfig.confirmation
++        if self._config_provider is None:
++            return None
++        try:
++            cfg = self._config_provider()
++        except Exception:
++            log.exception("confirm policy: config provider raised")
++            return None
++        if cfg is None:
++            return None
++        return getattr(cfg, "confirmation", None)
++
++    def classify(self, tool_id: str) -> str | None:
++        """Return ``"always"``, ``"never"``, or ``None`` for *tool_id*.
++
++        ``None`` means "the operator has not named this tool" — the caller
++        must defer entirely to the gate's own decision.  A tool named in
++        both lists resolves to ``"always"`` (see the module docstring).
++        """
++        policy = self._policy_config()
++        if policy is None:
++            return None
++        always = getattr(policy, "always_prompt", None) or ()
++        if any(tool_matches_pattern(underscore_to_dotted(p), tool_id) for p in always):
++            return "always"
++        never = getattr(policy, "never_prompt", None) or ()
++        if any(tool_matches_pattern(underscore_to_dotted(p), tool_id) for p in never):
++            return "never"
++        return None
++
++    def remember_enabled(self, tool_id: str) -> bool:
++        """True if the operator opted *tool_id* into "remember for session"."""
++        policy = self._policy_config()
++        if policy is None:
++            return False
++        patterns = getattr(policy, "remember_for_session", None) or ()
++        return any(tool_matches_pattern(underscore_to_dotted(p), tool_id) for p in patterns)
++
++    def is_remembered(self, session_id: str | None, tool_id: str) -> bool:
++        """True if *tool_id* was already explicitly allowed in *session_id*.
++
++        Always false without a session id — there is nothing to key on, so
++        an in-process caller with no transport session is never remembered
++        and always goes through the real prompt.
++
++        Trust boundary this rests on: keying by ``session_id`` only isolates
++        remembered approvals per session if ``session_id`` itself is
++        unguessable and never reused. This class does not mint or validate
++        it -- it takes whatever ``MCPHost.invoke`` was handed, which comes
++        from ``SessionContext`` (B2), minted per connection with
++        ``uuid.uuid4().hex`` in ``mcp_host/mcp_server.py`` at the time this
++        was written. If that ever changes to something predictable or
++        reused across connections (e.g. derived from a client-supplied
++        value, or recycled from a pool), a never-explicitly-approved caller
++        could inherit another session's remembered approvals purely by
++        presenting its id -- this method has no way to detect that.
++        """
++        if not session_id:
++            return False
++        return tool_id in self._remembered.get(session_id, ())
++
++    def remember(self, session_id: str | None, tool_id: str) -> None:
++        """Record an explicit Allow for *tool_id* in *session_id*, if enabled.
++
++        A no-op without a session id, and a no-op unless the operator opted
++        *tool_id* into remembering (:meth:`remember_enabled`) — remembering
++        is never turned on silently just because a prompt happened to
++        succeed.
++        """
++        if not session_id or not self.remember_enabled(tool_id):
++            return
++        self._remembered.setdefault(session_id, set()).add(tool_id)
++
++    def forget_session(self, session_id: str) -> None:
++        """Drop remembered approvals for one session (e.g. on disconnect)."""
++        self._remembered.pop(session_id, None)
+diff --git a/src/workstation_agent/mcp_host/host.py b/src/workstation_agent/mcp_host/host.py
+index 9392c60..99c5081 100644
+--- a/src/workstation_agent/mcp_host/host.py
++++ b/src/workstation_agent/mcp_host/host.py
+@@ -32,6 +32,7 @@ if TYPE_CHECKING:
+ 
+     from workstation_agent.config.schema import AgentConfig
+ 
++from workstation_agent.confirm import PromptPolicy
+ from workstation_agent.mcp_host.audit import AuditEvent
+ from workstation_agent.mcp_host.audit import log as audit_log
+ from workstation_agent.mcp_host.loader import (
+@@ -331,6 +332,11 @@ class MCPHost:
+         self._tts_speak: Any | None = None
+         self._config: AgentConfig | None = None
+         self._lock = asyncio.Lock()
++        #: Contract §7's operator-editable confirmation policy (B3).  Reads
++        #: ``self._config`` lazily on every query, so a setting saved through
++        #: the UI (via :meth:`set_config`) takes effect on the very next
++        #: ``invoke`` — see ``workstation_agent.confirm.PromptPolicy``.
++        self._prompt_policy = PromptPolicy(config_provider=lambda: self._config)
+ 
+     async def start(
+         self,
+@@ -355,6 +361,10 @@ class MCPHost:
+         self._confirm_cb = confirm_cb
+         self._tts_speak = tts_speak
+         self._attach_voice()
++        # §7 "remember for this session" must not survive an Agent restart
++        # (§5.5: sessions die with the Agent) -- every (re)start drops
++        # whatever the prompt policy had remembered.
++        self._prompt_policy.reset()
+ 
+         manifests = discover()
+         allow_unsigned = config.plugins.allow_unsigned
+@@ -407,6 +417,18 @@ class MCPHost:
+         await self._watchdog.start()
+         audit_log(AuditEvent(event="host_started"))
+ 
++    def set_config(self, config: AgentConfig) -> None:
++        """Push an updated config into the running host without a restart.
++
++        The settings UI calls this after saving a §7 confirmation-policy
++        change (never/always-prompt lists, "remember for this session") so
++        the new lists apply to the very next ``invoke`` call. Unlike
++        :meth:`start`, this does **not** reset remembered session approvals
++        or touch running plugins -- only a real restart does that (§5.5:
++        sessions die with the Agent, not with a settings save).
++        """
++        self._config = config
++
+     async def _spawn(self, runtime: _PluginRuntime) -> None:
+         """Spawn the subprocess, connect the client, collect tools."""
+         manifest = runtime.manifest
+@@ -599,32 +621,68 @@ class MCPHost:
+             )
+             return failure_result(CODE_DENIED, outcome.reason, is_error=False)
+ 
++        # ---- §7 confirmation policy (B3) -----------------------------
++        #
++        # The gate above has already resolved "deny" (returned) or one of
++        # "confirm" / "allow".  The operator's never-prompt / always-prompt
++        # lists only ever act on those two: they can suppress a prompt the
++        # gate asked for ("confirm" + never-prompt, or an already-remembered
++        # tool+session), or add one the gate did not ask for ("allow" +
++        # always-prompt).  There is no branch here that reaches a "deny" --
++        # pre-approval cannot widen one because it is never consulted for one.
+         correlation_id: str | None = None
+-        if outcome.decision == "confirm":
+-            confirmed, correlation_id = await self._do_confirm(
+-                runtime, tool_id, args, condition=outcome.condition,
+-            )
+-            if not confirmed:
++        policy_class = self._prompt_policy.classify(tool_id)
++        wants_prompt = (
++            policy_class != "never" if outcome.decision == "confirm" else policy_class == "always"
++        )
++
++        if wants_prompt:
++            if self._prompt_policy.is_remembered(session_id, tool_id):
+                 _audit(
+-                    "tool_denied",
+-                    "confirm_rejected",
+-                    CODE_UNCONFIRMED,
++                    "tool_confirmed",
++                    "confirm_remembered",
++                    None,
++                    plugin_id=plugin_id,
++                    detail=outcome.rule or "policy_always_prompt",
++                )
++            else:
++                confirmed, correlation_id = await self._do_confirm(
++                    runtime, tool_id, args, condition=outcome.condition,
++                )
++                if not confirmed:
++                    _audit(
++                        "tool_denied",
++                        "confirm_rejected",
++                        CODE_UNCONFIRMED,
++                        plugin_id=plugin_id,
++                        result="unconfirmed",
++                        correlation_id=correlation_id,
++                        detail=outcome.rule,
++                    )
++                    return failure_result(
++                        CODE_UNCONFIRMED,
++                        f"Nobody confirmed {tool_id} on the workstation, so it was not run.",
++                        is_error=False,
++                    )
++                self._prompt_policy.remember(session_id, tool_id)
++                _audit(
++                    "tool_confirmed",
++                    "confirm_allowed",
++                    None,
+                     plugin_id=plugin_id,
+-                    result="unconfirmed",
+                     correlation_id=correlation_id,
+                     detail=outcome.rule,
+                 )
+-                return failure_result(
+-                    CODE_UNCONFIRMED,
+-                    f"Nobody confirmed {tool_id} on the workstation, so it was not run.",
+-                    is_error=False,
+-                )
++        elif outcome.decision == "confirm":
++            # policy_class == "never": the gate wanted a prompt but the
++            # operator's never-prompt list pre-approves this tool.  Logged
++            # distinctly from a plain "allow" so the audit trail shows the
++            # prompt was suppressed by policy, not that none was ever due.
+             _audit(
+                 "tool_confirmed",
+-                "confirm_allowed",
++                "confirm_preapproved",
+                 None,
+                 plugin_id=plugin_id,
+-                correlation_id=correlation_id,
+                 detail=outcome.rule,
+             )
+ 
+diff --git a/src/workstation_agent/ui/backend/routers/config_routes.py b/src/workstation_agent/ui/backend/routers/config_routes.py
+index 71267f8..0eb728d 100644
+--- a/src/workstation_agent/ui/backend/routers/config_routes.py
++++ b/src/workstation_agent/ui/backend/routers/config_routes.py
+@@ -6,13 +6,21 @@ Copyright (c) 2024 PersonaCore-Agent contributors. See LICENSE for details.
+ from __future__ import annotations
+ 
+ import logging
+-from typing import Annotated
++from typing import TYPE_CHECKING, Annotated
+ 
+ from fastapi import APIRouter, Depends, Form, Request
+ from fastapi.responses import HTMLResponse
+ 
++from workstation_agent.config.schema import (
++    DEFAULT_ALWAYS_PROMPT_TOOLS,
++    DEFAULT_NEVER_PROMPT_TOOLS,
++    AgentConfig,
++)
+ from workstation_agent.ui.backend.app import BackendContext, get_context, templates
+ 
++if TYPE_CHECKING:
++    from starlette.datastructures import FormData
++
+ log = logging.getLogger(__name__)
+ 
+ router = APIRouter(prefix="/config", tags=["config"])
+@@ -21,6 +29,23 @@ _PORT_MAX = 65535
+ _PORT_MIN = 1
+ 
+ 
++def _confirmation_tool_names(cfg: AgentConfig | None) -> list[str]:
++    """Every §7 tool the settings UI offers a never/always choice for.
++
++    The fixed contract defaults, plus anything already present in the
++    loaded config's lists — so a tool an operator (or a future family) added
++    outside the defaults still shows up rather than silently vanishing from
++    the form on the next save.
++    """
++    names = set(DEFAULT_NEVER_PROMPT_TOOLS) | set(DEFAULT_ALWAYS_PROMPT_TOOLS)
++    if cfg is not None:
++        confirmation = getattr(cfg, "confirmation", None)
++        if confirmation is not None:
++            names |= set(getattr(confirmation, "never_prompt", None) or ())
++            names |= set(getattr(confirmation, "always_prompt", None) or ())
++    return sorted(names)
++
++
+ @router.get("", response_class=HTMLResponse)
+ async def config_get(
+     request: Request,
+@@ -37,7 +62,16 @@ async def config_get(
+             errors["_global"] = str(exc)
+ 
+     return templates.TemplateResponse(
+-        request, "config.html", {"cfg": cfg, "errors": errors, "saved": False},
++        request,
++        "config.html",
++        {
++            "cfg": cfg,
++            "errors": errors,
++            "saved": False,
++            "confirmation_tools": _confirmation_tool_names(cfg),
++            "policy_errors": {},
++            "policy_saved": False,
++        },
+     )
+ 
+ 
+@@ -75,7 +109,16 @@ async def config_post(  # noqa: PLR0913, PLR0917
+     if ctx.config_store is None:
+         errors["_global"] = "Config store not available"
+         return templates.TemplateResponse(
+-            request, "config.html", {"cfg": cfg, "errors": errors, "saved": False},
++            request,
++            "config.html",
++            {
++                "cfg": cfg,
++                "errors": errors,
++                "saved": False,
++                "confirmation_tools": _confirmation_tool_names(cfg),
++                "policy_errors": {},
++                "policy_saved": False,
++            },
+         )
+ 
+     try:
+@@ -83,7 +126,16 @@ async def config_post(  # noqa: PLR0913, PLR0917
+     except Exception as exc:  # noqa: BLE001
+         errors["_global"] = f"Failed to load current config: {exc}"
+         return templates.TemplateResponse(
+-            request, "config.html", {"cfg": cfg, "errors": errors, "saved": False},
++            request,
++            "config.html",
++            {
++                "cfg": cfg,
++                "errors": errors,
++                "saved": False,
++                "confirmation_tools": _confirmation_tool_names(cfg),
++                "policy_errors": {},
++                "policy_saved": False,
++            },
+         )
+ 
+     # Validate
+@@ -100,7 +152,16 @@ async def config_post(  # noqa: PLR0913, PLR0917
+ 
+     if errors:
+         return templates.TemplateResponse(
+-            request, "config.html", {"cfg": cfg, "errors": errors, "saved": False},
++            request,
++            "config.html",
++            {
++                "cfg": cfg,
++                "errors": errors,
++                "saved": False,
++                "confirmation_tools": _confirmation_tool_names(cfg),
++                "policy_errors": {},
++                "policy_saved": False,
++            },
+         )
+ 
+     # Apply changes
+@@ -122,9 +183,129 @@ async def config_post(  # noqa: PLR0913, PLR0917
+     except Exception as exc:  # noqa: BLE001
+         errors["_global"] = f"Failed to save config: {exc}"
+         return templates.TemplateResponse(
+-            request, "config.html", {"cfg": cfg, "errors": errors, "saved": False},
++            request,
++            "config.html",
++            {
++                "cfg": cfg,
++                "errors": errors,
++                "saved": False,
++                "confirmation_tools": _confirmation_tool_names(cfg),
++                "policy_errors": {},
++                "policy_saved": False,
++            },
+         )
+ 
+     return templates.TemplateResponse(
+-        request, "config.html", {"cfg": cfg, "errors": {}, "saved": True},
++        request,
++        "config.html",
++        {
++            "cfg": cfg,
++            "errors": {},
++            "saved": True,
++            "confirmation_tools": _confirmation_tool_names(cfg),
++            "policy_errors": {},
++            "policy_saved": False,
++        },
++    )
++
++
++def _policy_page(
++    request: Request,
++    cfg: AgentConfig | None,
++    *,
++    policy_errors: dict[str, str],
++    policy_saved: bool,
++) -> HTMLResponse:
++    """Shared ``config.html`` render for every ``POST /config/confirmation`` outcome."""
++    return templates.TemplateResponse(
++        request,
++        "config.html",
++        {
++            "cfg": cfg,
++            "errors": {},
++            "saved": False,
++            "confirmation_tools": _confirmation_tool_names(cfg),
++            "policy_errors": policy_errors,
++            "policy_saved": policy_saved,
++        },
+     )
++
++
++def _apply_confirmation_form(cfg: AgentConfig, tools: list[str], form: FormData) -> None:
++    """Parse the dynamic per-tool radios/checkboxes and write them onto *cfg*."""
++    never: list[str] = []
++    always: list[str] = []
++    remember: list[str] = []
++    for tool in tools:
++        choice = form.get(f"policy_{tool}")
++        if choice == "never":
++            never.append(tool)
++        elif choice == "always":
++            always.append(tool)
++        if form.get(f"remember_{tool}"):
++            remember.append(tool)
++
++    cfg.confirmation.never_prompt = never
++    cfg.confirmation.always_prompt = always
++    cfg.confirmation.remember_for_session = remember
++
++
++def _push_to_running_host(ctx: BackendContext, cfg: AgentConfig) -> None:
++    """Best-effort live-push of *cfg* to ``ctx.mcp_host`` (§7: no restart needed)."""
++    if ctx.mcp_host is None:
++        return
++    push = getattr(ctx.mcp_host, "set_config", None)
++    if not callable(push):
++        return
++    try:
++        push(cfg)
++    except Exception:
++        log.exception("confirmation policy: failed to push config to mcp_host")
++
++
++@router.post("/confirmation", response_class=HTMLResponse, response_model=None)
++async def confirmation_policy_post(
++    request: Request,
++    ctx: Annotated[BackendContext, Depends(get_context)],
++) -> HTMLResponse:
++    """Save §7's per-tool never/always-prompt assignment and remember flags.
++
++    A separate endpoint from ``POST /config`` on purpose: the tool list is
++    dynamic (driven by :func:`_confirmation_tool_names`, not a fixed set of
++    named fields), so it is read from the raw form body rather than typed
++    ``Form(...)`` parameters. Saving pushes the new policy into the running
++    :class:`~workstation_agent.mcp_host.host.MCPHost` (when one is wired) via
++    ``set_config`` so a moved tool, or a newly-enabled "remember", takes
++    effect on the very next tool call -- not just after a restart.
++    """
++    if ctx.config_store is None:
++        return _policy_page(
++            request, None, policy_errors={"_global": "Config store not available"},
++            policy_saved=False,
++        )
++
++    try:
++        cfg = ctx.config_store.load()
++    except Exception as exc:  # noqa: BLE001
++        return _policy_page(
++            request, None,
++            policy_errors={"_global": f"Failed to load current config: {exc}"},
++            policy_saved=False,
++        )
++
++    tools = _confirmation_tool_names(cfg)
++    form = await request.form()
++    _apply_confirmation_form(cfg, tools, form)
++
++    try:
++        ctx.config_store.save(cfg)
++    except Exception as exc:  # noqa: BLE001
++        return _policy_page(
++            request, cfg,
++            policy_errors={"_global": f"Failed to save config: {exc}"},
++            policy_saved=False,
++        )
++
++    _push_to_running_host(ctx, cfg)
++
++    return _policy_page(request, cfg, policy_errors={}, policy_saved=True)
+diff --git a/src/workstation_agent/ui/backend/templates/config.html b/src/workstation_agent/ui/backend/templates/config.html
+index 50f4932..040fd55 100644
+--- a/src/workstation_agent/ui/backend/templates/config.html
++++ b/src/workstation_agent/ui/backend/templates/config.html
+@@ -77,4 +77,50 @@
+ 
+   <button type="submit">Save</button>
+ </form>
++
++<h2>Confirmation Policy (contract §7)</h2>
++<p>
++  Tools that never prompt on this workstation, tools that always prompt, and
++  which of those may be "remembered" for the rest of one session once
++  explicitly allowed (a burst of calls then asks only once).
++</p>
++
++{% if policy_saved %}<p class="success">Confirmation policy saved.</p>{% endif %}
++{% if policy_errors._global is defined %}<p class="error">{{ policy_errors._global }}</p>{% endif %}
++
++<form method="post" action="/config/confirmation">
++  <fieldset>
++    <legend>Per-tool prompting</legend>
++    <table>
++      <thead>
++        <tr>
++          <th>Tool</th>
++          <th>Never prompt</th>
++          <th>Always prompt</th>
++          <th>Remember for session</th>
++        </tr>
++      </thead>
++      <tbody>
++        {% for tool in confirmation_tools %}
++        <tr>
++          <td><code>{{ tool }}</code></td>
++          <td>
++            <input type="radio" name="policy_{{ tool }}" value="never"
++              {% if cfg and tool in cfg.confirmation.never_prompt %}checked{% endif %}>
++          </td>
++          <td>
++            <input type="radio" name="policy_{{ tool }}" value="always"
++              {% if cfg and tool in cfg.confirmation.always_prompt %}checked{% endif %}>
++          </td>
++          <td>
++            <input type="checkbox" name="remember_{{ tool }}" value="true"
++              {% if cfg and tool in cfg.confirmation.remember_for_session %}checked{% endif %}>
++          </td>
++        </tr>
++        {% endfor %}
++      </tbody>
++    </table>
++  </fieldset>
++  <button type="submit">Save Confirmation Policy</button>
++</form>
+ {% endblock %}
+diff --git a/tests/unit/mcp_host/test_host.py b/tests/unit/mcp_host/test_host.py
+index 7f92835..e074b7e 100644
+--- a/tests/unit/mcp_host/test_host.py
++++ b/tests/unit/mcp_host/test_host.py
+@@ -22,6 +22,7 @@ from workstation_agent.mcp_host.host import (
+     _resolve_entry,
+ )
+ from workstation_agent.mcp_host.loader import PluginManifest, VerifyResult
++from workstation_agent.mcp_host.permissions import SessionContext
+ from workstation_agent.mcp_host.supervisor import ResourceLimits, SubprocessHandle
+ 
+ 
+@@ -708,3 +709,272 @@ async def test_invoke_tool_error_logged(isolated_audit_db):
+     rows = audit_mod.query(audit_mod.AuditQuery(event="tool_error"), db_path=isolated_audit_db)
+     assert len(rows) == 1
+     assert rows[0].code == "error"
++
++
++# ---------------------------------------------------------------------------
++# §7 confirmation policy (B3) — never/always-prompt, remember, mapping
++# ---------------------------------------------------------------------------
++
++
++def _ok_client() -> AsyncMock:
++    client = AsyncMock()
++    client.tools_call = AsyncMock(return_value={
++        "content": [{"type": "text", "text": "done"}],
++        "isError": False,
++    })
++    return client
++
++
++def _policy_cfg(*, never=(), always=(), remember=()) -> AgentConfig:
++    cfg = AgentConfig()
++    cfg.confirmation.never_prompt = list(never)
++    cfg.confirmation.always_prompt = list(always)
++    cfg.confirmation.remember_for_session = list(remember)
++    return cfg
++
++
++def _serial_write_runtime() -> host_mod._PluginRuntime:
++    """A `serial.write` tool whose gate decision is "confirm" for this path."""
++    manifest = _make_manifest(
++        "serial",
++        declared_permissions=[
++            "tool:serial.write",
++            "path:/safe/",
++            "args:serial.write:action:!path=ws_path",
++        ],
++    )
++    manifest.confirmable_conditions = ["outside_declared_paths"]
++    return host_mod._PluginRuntime(
++        manifest=manifest,
++        verify_result=VerifyResult(status="unsigned"),
++        status="running",
++        tools=[{"name": "serial.write"}],
++        granted_permissions={"tool:serial.write"},
++        client=_ok_client(),
++    )
++
++
++def _shell_run_runtime(client: AsyncMock | None = None) -> host_mod._PluginRuntime:
++    """A `shell.run` tool whose `cmd:*` allowlist makes the gate say "allow"."""
++    manifest = _make_manifest(
++        "shell",
++        declared_permissions=[
++            "tool:shell.run",
++            "cmd:*",
++            "args:shell.run:action:!command=ws_command",
++        ],
++    )
++    manifest.confirmable_conditions = ["command_outside_allowlist"]
++    return host_mod._PluginRuntime(
++        manifest=manifest,
++        verify_result=VerifyResult(status="unsigned"),
++        status="running",
++        tools=[{"name": "shell.run"}],
++        granted_permissions={"tool:shell.run"},
++        client=client or _ok_client(),
++    )
++
++
++@pytest.mark.asyncio
++async def test_never_prompt_suppresses_a_gate_confirm(isolated_audit_db):
++    """A never-prompt tool that the gate would confirm does not prompt at all."""
++    h = MCPHost()
++    h._runtimes["serial"] = _serial_write_runtime()
++    h._config = _policy_cfg(never=["serial_write"])
++
++    confirm_cb = AsyncMock(return_value=True)
++    h._confirm_cb = confirm_cb
++
++    result = await h.invoke("serial.write", {"path": "/unsafe/x.txt"})
++
++    assert result.ok is True
++    confirm_cb.assert_not_called()
++
++    rows = audit_mod.query(
++        audit_mod.AuditQuery(event="tool_confirmed"), db_path=isolated_audit_db,
++    )
++    assert any(r.decision == "confirm_preapproved" for r in rows)
++
++
++@pytest.mark.asyncio
++async def test_always_prompt_forces_a_prompt_on_a_gate_allow(isolated_audit_db):
++    """An always-prompt tool the gate would silently allow still prompts."""
++    h = MCPHost()
++    h._runtimes["shell"] = _shell_run_runtime()
++    h._config = _policy_cfg(always=["shell_run"])
++
++    confirm_cb = AsyncMock(return_value=True)
++    h._confirm_cb = confirm_cb
++
++    result = await h.invoke("shell.run", {"command": "dir"})
++
++    assert result.ok is True
++    confirm_cb.assert_awaited_once()
++
++
++@pytest.mark.asyncio
++async def test_capitalised_always_prompt_entry_still_prompts(isolated_audit_db):
++    """Rework cycle 1, finding #1 -- the unsafe direction, end to end.
++
++    `Shell_Run` (hand-typed with a capital) must still force a prompt for
++    `shell.run`. Before case-folding, `underscore_to_dotted("Shell_Run")`
++    stayed `"Shell.Run"` and never matched the gate's lower-case
++    `shell.run`, so the tool would have silently fallen through to the
++    gate's own "allow" -- no prompt at all for a tool the operator meant to
++    always confirm.
++    """
++    h = MCPHost()
++    h._runtimes["shell"] = _shell_run_runtime()
++    h._config = _policy_cfg(always=["Shell_Run"])
++    confirm_cb = AsyncMock(return_value=True)
++    h._confirm_cb = confirm_cb
++
++    result = await h.invoke("shell.run", {"command": "dir"})
++
++    assert result.ok is True
++    confirm_cb.assert_awaited_once()
++
++
++@pytest.mark.asyncio
++async def test_always_prompt_rejection_is_unconfirmed(isolated_audit_db):
++    """A forced always-prompt that the operator denies is `unconfirmed`, not a silent allow."""
++    h = MCPHost()
++    client = _ok_client()
++    h._runtimes["shell"] = _shell_run_runtime(client=client)
++    h._config = _policy_cfg(always=["shell_run"])
++    h._confirm_cb = AsyncMock(return_value=False)
++
++    result = await h.invoke("shell.run", {"command": "dir"})
++
++    assert result.ok is False
++    assert result.code == "unconfirmed"
++    client.tools_call.assert_not_called()
++
++
++@pytest.mark.asyncio
++async def test_moving_a_tool_between_lists_takes_effect(isolated_audit_db):
++    """set_config (the UI's live push) changes behaviour on the very next call."""
++    h = MCPHost()
++    h._runtimes["shell"] = _shell_run_runtime()
++    h._config = _policy_cfg()  # shell_run on neither list -> gate's own "allow" stands
++    confirm_cb = AsyncMock(return_value=True)
++    h._confirm_cb = confirm_cb
++
++    await h.invoke("shell.run", {"command": "dir"})
++    confirm_cb.assert_not_called()
++
++    h.set_config(_policy_cfg(always=["shell_run"]))
++    await h.invoke("shell.run", {"command": "dir"})
++    confirm_cb.assert_awaited_once()
++
++
++@pytest.mark.asyncio
++async def test_remember_suppresses_second_prompt_same_session(isolated_audit_db):
++    """§7: "a burst of serial writes asks once" — same tool, same session."""
++    h = MCPHost()
++    h._runtimes["shell"] = _shell_run_runtime()
++    h._config = _policy_cfg(always=["shell_run"], remember=["shell_run"])
++    confirm_cb = AsyncMock(return_value=True)
++    h._confirm_cb = confirm_cb
++    session = SessionContext(session_id="s1")
++
++    r1 = await h.invoke("shell.run", {"command": "dir"}, session=session)
++    r2 = await h.invoke("shell.run", {"command": "dir /w"}, session=session)
++
++    assert r1.ok is True
++    assert r2.ok is True
++    confirm_cb.assert_awaited_once()  # only the first call actually prompted
++
++
++@pytest.mark.asyncio
++async def test_remember_does_not_leak_to_a_different_session(isolated_audit_db):
++    h = MCPHost()
++    h._runtimes["shell"] = _shell_run_runtime()
++    h._config = _policy_cfg(always=["shell_run"], remember=["shell_run"])
++    confirm_cb = AsyncMock(return_value=True)
++    h._confirm_cb = confirm_cb
++
++    await h.invoke("shell.run", {"command": "dir"}, session=SessionContext(session_id="s1"))
++    await h.invoke("shell.run", {"command": "dir"}, session=SessionContext(session_id="s2"))
++
++    assert confirm_cb.await_count == 2  # a different session prompts again
++
++
++@pytest.mark.asyncio
++async def test_remember_does_not_survive_a_restart(cfg_allow_unsigned, isolated_audit_db):
++    """§5.5: sessions die with the Agent — MCPHost.start must drop remembered approvals."""
++    h = MCPHost()
++    h._runtimes["shell"] = _shell_run_runtime()
++    h._config = _policy_cfg(always=["shell_run"], remember=["shell_run"])
++    h._confirm_cb = AsyncMock(return_value=True)
++    session = SessionContext(session_id="s1")
++
++    await h.invoke("shell.run", {"command": "dir"}, session=session)
++    assert h._prompt_policy.is_remembered(session.session_id, "shell.run")
++
++    with patch("workstation_agent.mcp_host.host.discover", return_value=[]):
++        await h.start(cfg_allow_unsigned)
++        await h.stop()
++
++    assert not h._prompt_policy.is_remembered(session.session_id, "shell.run")
++
++
++@pytest.mark.asyncio
++async def test_remember_without_opt_in_prompts_every_time(isolated_audit_db):
++    """always-prompt without the remember flag never suppresses -- burst still asks each time."""
++    h = MCPHost()
++    h._runtimes["shell"] = _shell_run_runtime()
++    h._config = _policy_cfg(always=["shell_run"])  # no remember_for_session entry
++    confirm_cb = AsyncMock(return_value=True)
++    h._confirm_cb = confirm_cb
++    session = SessionContext(session_id="s1")
++
++    await h.invoke("shell.run", {"command": "dir"}, session=session)
++    await h.invoke("shell.run", {"command": "dir /w"}, session=session)
++
++    assert confirm_cb.await_count == 2
++
++
++@pytest.mark.asyncio
++async def test_never_prompt_cannot_widen_a_gate_denial(isolated_audit_db):
++    """Mutation-tested claim: pre-approval must never turn a `deny` into an `allow`.
++
++    `files.read` outside its declared root is a hard `deny` from the gate's
++    read/action split (contract §11 item 6) -- never a `confirm`.  Putting it
++    on the never-prompt list, and even wiring a confirm callback that would
++    happily say yes, must not change the outcome: the policy layer is never
++    consulted for a `deny` at all.
++    """
++    manifest = _make_manifest(
++        "files",
++        declared_permissions=[
++            "tool:files.read",
++            "path:/safe/",
++            "args:files.read:read:!path=ws_path",
++        ],
++    )
++    client = _ok_client()
++    fake_runtime = host_mod._PluginRuntime(
++        manifest=manifest,
++        verify_result=VerifyResult(status="unsigned"),
++        status="running",
++        tools=[{"name": "files.read"}],
++        granted_permissions={"tool:files.read"},
++        client=client,
++    )
++
++    h = MCPHost()
++    h._runtimes["files"] = fake_runtime
++    h._config = _policy_cfg(never=["files_read"])
++    confirm_cb = AsyncMock(return_value=True)  # would allow anything, if ever asked
++    h._confirm_cb = confirm_cb
++
++    result = await h.invoke("files.read", {"path": "/unsafe/x.txt"})
++
++    assert result.ok is False
++    assert result.code == "denied"
++    confirm_cb.assert_not_called()
++    client.tools_call.assert_not_called()
++
++    rows = audit_mod.query(audit_mod.AuditQuery(event="tool_denied"), db_path=isolated_audit_db)
++    assert any(r.code == "denied" for r in rows)
+diff --git a/tests/unit/test_confirm.py b/tests/unit/test_confirm.py
+index 15ffacb..cc162c7 100644
+--- a/tests/unit/test_confirm.py
++++ b/tests/unit/test_confirm.py
+@@ -23,9 +23,12 @@ from workstation_agent.confirm import (
+     OUTCOME_UNCONFIRMED,
+     ConfirmDecision,
+     ConfirmPresenter,
++    PromptPolicy,
+     command_text,
+     prompt_line,
+     toast_stack_available,
++    tool_matches_pattern,
++    underscore_to_dotted,
+ )
+ from workstation_agent.mcp_host.host import ConfirmationRequestImpl
+ from workstation_agent.ui.notifications import toast as toast_mod
+@@ -593,3 +596,211 @@ async def test_show_raising_after_a_click_still_denies():
+     decision = await presenter.request(make_req())
+     assert decision.outcome == OUTCOME_DENIED
+     assert decision.reason == "toast_failed"
++
++
++# ---------------------------------------------------------------------------
++# §7 confirmation policy (B3) — name mapping
++# ---------------------------------------------------------------------------
++
++
++class TestUnderscoreToDotted:
++    def test_simple_family_verb(self):
++        assert underscore_to_dotted("files_read") == "files.read"
++        assert underscore_to_dotted("shell_run") == "shell.run"
++
++    def test_family_wildcard(self):
++        assert underscore_to_dotted("jobs_*") == "jobs.*"
++
++    def test_no_underscore_returned_unchanged(self):
++        """No family separator to find -- returned as-is, matching nothing real."""
++        assert underscore_to_dotted("alreadydotted") == "alreadydotted"
++
++    def test_empty_string(self):
++        assert underscore_to_dotted("") == ""
++
++    def test_whitespace_is_stripped(self):
++        assert underscore_to_dotted("  files_read  ") == "files.read"
++
++    def test_only_first_underscore_splits(self):
++        """A verb that itself contains an underscore keeps it (e.g. multi-word verbs)."""
++        assert underscore_to_dotted("adb_factory_reset") == "adb.factory_reset"
++
++
++class TestToolMatchesPattern:
++    def test_exact_match(self):
++        assert tool_matches_pattern("files.read", "files.read")
++
++    def test_exact_mismatch(self):
++        assert not tool_matches_pattern("files.read", "files.write")
++
++    def test_no_partial_prefix_match(self):
++        assert not tool_matches_pattern("files.rea", "files.read")
++
++    def test_family_wildcard_matches_every_verb(self):
++        assert tool_matches_pattern("jobs.*", "jobs.wait")
++        assert tool_matches_pattern("jobs.*", "jobs.output")
++        assert tool_matches_pattern("jobs.*", "jobs.list")
++
++    def test_family_wildcard_does_not_match_other_family(self):
++        assert not tool_matches_pattern("jobs.*", "adb.devices")
++
++    def test_family_wildcard_does_not_match_the_bare_family_name(self):
++        """`jobs.*` matches tools *within* the family, not the word `jobs` itself.
++
++        Rework cycle 1, finding #2: no real tool is named exactly its
++        family, but the wildcard should describe "within the family", not
++        "starts with the family's spelling".
++        """
++        assert not tool_matches_pattern("jobs.*", "jobs")
++
++    def test_empty_pattern_or_tool_never_matches(self):
++        assert not tool_matches_pattern("", "files.read")
++        assert not tool_matches_pattern("files.read", "")
++
++    def test_case_insensitive_exact_match(self):
++        """Rework cycle 1, finding #1: a mis-cased pattern must still match.
++
++        `underscore_to_dotted("Files_write")` -> `"Files.write"` (case is not
++        folded there by design); the gate's tool id is always lower-case
++        (`files.write`). Without folding here, an always-prompt entry typed
++        with a capital would silently stop matching -- the unsafe direction.
++        """
++        assert tool_matches_pattern("Files.write", "files.write")
++        assert tool_matches_pattern("files.write", "FILES.WRITE")
++
++    def test_case_insensitive_wildcard_match(self):
++        assert tool_matches_pattern("JOBS.*", "jobs.output")
++        assert tool_matches_pattern("jobs.*", "JOBS.OUTPUT")
++
++
++# ---------------------------------------------------------------------------
++# §7 confirmation policy (B3) — PromptPolicy
++# ---------------------------------------------------------------------------
++
++
++def _cfg_with_policy(*, never=(), always=(), remember=()) -> AgentConfig:
++    cfg = AgentConfig()
++    cfg.confirmation.never_prompt = list(never)
++    cfg.confirmation.always_prompt = list(always)
++    cfg.confirmation.remember_for_session = list(remember)
++    return cfg
++
++
++class TestPromptPolicyClassify:
++    def test_no_config_provider_is_neutral(self):
++        policy = PromptPolicy(config_provider=None)
++        assert policy.classify("files.read") is None
++
++    def test_config_provider_raising_is_neutral(self):
++        def _boom():
++            msg = "config unavailable"
++            raise RuntimeError(msg)
++
++        policy = PromptPolicy(config_provider=_boom)
++        assert policy.classify("files.read") is None
++
++    def test_config_without_confirmation_attr_is_neutral(self):
++        policy = PromptPolicy(config_provider=lambda: object())
++        assert policy.classify("files.read") is None
++
++    def test_never_prompt_classification(self):
++        cfg = _cfg_with_policy(never=["files_read"])
++        policy = PromptPolicy(config_provider=lambda: cfg)
++        assert policy.classify("files.read") == "never"
++
++    def test_always_prompt_classification(self):
++        cfg = _cfg_with_policy(always=["shell_run"])
++        policy = PromptPolicy(config_provider=lambda: cfg)
++        assert policy.classify("shell.run") == "always"
++
++    def test_unlisted_tool_is_neutral(self):
++        cfg = _cfg_with_policy(never=["files_read"], always=["shell_run"])
++        policy = PromptPolicy(config_provider=lambda: cfg)
++        assert policy.classify("clipboard.paste") is None
++
++    def test_wildcard_family_classification(self):
++        cfg = _cfg_with_policy(never=["jobs_*"])
++        policy = PromptPolicy(config_provider=lambda: cfg)
++        assert policy.classify("jobs.output") == "never"
++        assert policy.classify("jobs.wait") == "never"
++
++    def test_capitalised_always_prompt_entry_still_classifies_always(self):
++        """Rework cycle 1, finding #1 -- the unsafe direction.
++
++        An always-prompt entry typed (or hand-edited into config.toml) with
++        different casing must still classify as "always": if it silently
++        stopped matching, an action tool the gate would otherwise "allow"
++        on its own could run with no prompt at all.
++        """
++        cfg = _cfg_with_policy(always=["Shell_Run"])
++        policy = PromptPolicy(config_provider=lambda: cfg)
++        assert policy.classify("shell.run") == "always"
++
++    def test_listed_in_both_resolves_to_always(self):
++        """Misconfiguration (both lists) fails toward more confirmation."""
++        cfg = _cfg_with_policy(never=["shell_run"], always=["shell_run"])
++        policy = PromptPolicy(config_provider=lambda: cfg)
++        assert policy.classify("shell.run") == "always"
++
++    def test_config_reread_on_every_call(self):
++        """No cached copy -- a config swapped mid-flight is picked up live."""
++        cfg = _cfg_with_policy()
++        policy = PromptPolicy(config_provider=lambda: cfg)
++        assert policy.classify("shell.run") is None
++        cfg.confirmation.always_prompt = ["shell_run"]
++        assert policy.classify("shell.run") == "always"
++
++
++class TestPromptPolicySessionMemory:
++    def test_not_remembered_without_session_id(self):
++        cfg = _cfg_with_policy(remember=["shell_run"])
++        policy = PromptPolicy(config_provider=lambda: cfg)
++        policy.remember(None, "shell.run")
++        assert not policy.is_remembered(None, "shell.run")
++        assert not policy.is_remembered("", "shell.run")
++
++    def test_remember_requires_opt_in(self):
++        """remember() is a no-op unless the tool is on remember_for_session."""
++        cfg = _cfg_with_policy()  # remember list empty
++        policy = PromptPolicy(config_provider=lambda: cfg)
++        policy.remember("s1", "shell.run")
++        assert not policy.is_remembered("s1", "shell.run")
++
++    def test_remember_then_is_remembered(self):
++        cfg = _cfg_with_policy(remember=["shell_run"])
++        policy = PromptPolicy(config_provider=lambda: cfg)
++        policy.remember("s1", "shell.run")
++        assert policy.is_remembered("s1", "shell.run")
++
++    def test_remember_is_per_tool(self):
++        """Remembering shell.run must not remember files.write in the same session."""
++        cfg = _cfg_with_policy(remember=["shell_run", "files_write"])
++        policy = PromptPolicy(config_provider=lambda: cfg)
++        policy.remember("s1", "shell.run")
++        assert policy.is_remembered("s1", "shell.run")
++        assert not policy.is_remembered("s1", "files.write")
++
++    def test_remember_does_not_leak_across_sessions(self):
++        cfg = _cfg_with_policy(remember=["shell_run"])
++        policy = PromptPolicy(config_provider=lambda: cfg)
++        policy.remember("s1", "shell.run")
++        assert policy.is_remembered("s1", "shell.run")
++        assert not policy.is_remembered("s2", "shell.run")
++
++    def test_reset_clears_all_sessions(self):
++        """reset() -- called by MCPHost.start on every restart -- forgets everything."""
++        cfg = _cfg_with_policy(remember=["shell_run"])
++        policy = PromptPolicy(config_provider=lambda: cfg)
++        policy.remember("s1", "shell.run")
++        assert policy.is_remembered("s1", "shell.run")
++        policy.reset()
++        assert not policy.is_remembered("s1", "shell.run")
++
++    def test_forget_session_only_clears_that_session(self):
++        cfg = _cfg_with_policy(remember=["shell_run"])
++        policy = PromptPolicy(config_provider=lambda: cfg)
++        policy.remember("s1", "shell.run")
++        policy.remember("s2", "shell.run")
++        policy.forget_session("s1")
++        assert not policy.is_remembered("s1", "shell.run")
++        assert policy.is_remembered("s2", "shell.run")
+diff --git a/tests/unit/ui/conftest.py b/tests/unit/ui/conftest.py
+index 15f8983..23f89e4 100644
+--- a/tests/unit/ui/conftest.py
++++ b/tests/unit/ui/conftest.py
+@@ -72,6 +72,9 @@ class FakeMCPHost:
+     def __init__(self, plugins_list: list[FakePluginInfo] | None = None) -> None:
+         self._plugins = plugins_list or []
+         self.reloaded: list[str] = []
++        #: Every config pushed via set_config(), most recent last -- lets a
++        #: test assert a UI save reached the running host without a restart.
++        self.configs_set: list[Any] = []
+ 
+     async def plugins(self) -> list[FakePluginInfo]:
+         return self._plugins
+@@ -85,6 +88,10 @@ class FakeMCPHost:
+     async def reload(self, plugin_id: str) -> None:
+         self.reloaded.append(plugin_id)
+ 
++    def set_config(self, config: Any) -> None:
++        """Mirror ``MCPHost.set_config`` (B3, §7 policy live-push)."""
++        self.configs_set.append(config)
++
+ 
+ # ---------------------------------------------------------------------------
+ # Fake audit reader
+diff --git a/tests/unit/ui/test_config_routes.py b/tests/unit/ui/test_config_routes.py
+index e4add75..636a023 100644
+--- a/tests/unit/ui/test_config_routes.py
++++ b/tests/unit/ui/test_config_routes.py
+@@ -4,7 +4,8 @@ from __future__ import annotations
+ 
+ import pytest
+ 
+-from tests.unit.ui.conftest import FakeConfigStore, make_client
++from tests.unit.ui.conftest import FakeConfigStore, FakeMCPHost, make_client
++from workstation_agent.config.schema import AgentConfig
+ 
+ 
+ def test_config_get_renders_form(tmp_path):
+@@ -163,3 +164,100 @@ def test_config_post_updates_wake_threshold(tmp_path):
+     )
+     assert resp.status_code == 200
+     assert store._cfg.wake.threshold == pytest.approx(0.8)
++
++
++# ---------------------------------------------------------------------------
++# Confirmation policy (§7) UI — B3
++# ---------------------------------------------------------------------------
++
++
++def test_config_get_lists_confirmation_tools(tmp_path):
++    """GET /config shows every §7 default tool with its current radio choice."""
++    store = FakeConfigStore()
++    client = make_client(config_store=store, tmp_path=tmp_path)
++
++    resp = client.get("/config")
++    assert resp.status_code == 200
++    assert "files_read" in resp.text
++    assert "shell_run" in resp.text
++    assert 'name="policy_files_read"' in resp.text
++    assert 'name="remember_shell_run"' in resp.text
++
++
++def test_confirmation_policy_post_moves_tool_between_lists(tmp_path):
++    """POST /config/confirmation moves a tool from always- to never-prompt."""
++    store = FakeConfigStore()
++    client = make_client(config_store=store, tmp_path=tmp_path)
++
++    # shell_run starts on the always-prompt default; move it to never-prompt
++    # and leave every other default tool where it started.
++    data = {}
++    for tool in store._cfg.confirmation.never_prompt:
++        data[f"policy_{tool}"] = "never"
++    for tool in store._cfg.confirmation.always_prompt:
++        data[f"policy_{tool}"] = "always"
++    data["policy_shell_run"] = "never"
++
++    resp = client.post("/config/confirmation", data=data, follow_redirects=False)
++    assert resp.status_code == 200
++    assert "shell_run" in store._cfg.confirmation.never_prompt
++    assert "shell_run" not in store._cfg.confirmation.always_prompt
++    assert "saved" in resp.text.lower()
++
++
++def test_confirmation_policy_post_sets_remember_flag(tmp_path):
++    """A checked "remember" box lands in confirmation.remember_for_session."""
++    store = FakeConfigStore()
++    client = make_client(config_store=store, tmp_path=tmp_path)
++
++    data = {f"policy_{t}": "always" for t in store._cfg.confirmation.always_prompt}
++    data.update({f"policy_{t}": "never" for t in store._cfg.confirmation.never_prompt})
++    data["remember_serial_write"] = "true"
++
++    client.post("/config/confirmation", data=data, follow_redirects=False)
++    assert store._cfg.confirmation.remember_for_session == ["serial_write"]
++
++
++def test_confirmation_policy_post_pushes_to_running_host(tmp_path):
++    """Saving the policy pushes the new config into MCPHost.set_config live."""
++    store = FakeConfigStore()
++    host = FakeMCPHost()
++    client = make_client(config_store=store, mcp_host=host, tmp_path=tmp_path)
++
++    data = {f"policy_{t}": "always" for t in store._cfg.confirmation.always_prompt}
++    data.update({f"policy_{t}": "never" for t in store._cfg.confirmation.never_prompt})
++
++    client.post("/config/confirmation", data=data, follow_redirects=False)
++
++    assert len(host.configs_set) == 1
++    assert host.configs_set[0] is store._cfg
++
++
++def test_confirmation_policy_post_no_store_returns_200(tmp_path):
++    """POST /config/confirmation with no config store still renders gracefully."""
++    from starlette.testclient import TestClient
++
++    from tests.unit.ui.conftest import _LoopbackASGI
++    from workstation_agent.ui.backend.app import BackendContext, create_app
++
++    ctx = BackendContext(config_store=None, log_dir=tmp_path / "logs")
++    app = create_app(ctx)
++    c = TestClient(_LoopbackASGI(app))
++    resp = c.post("/config/confirmation", data={})
++    assert resp.status_code == 200
++    assert "Config store not available" in resp.text
++
++
++def test_default_confirmation_policy_matches_contract_seven():
++    """AgentConfig() ships exactly contract §7's default lists."""
++    cfg = AgentConfig()
++    assert set(cfg.confirmation.never_prompt) == {
++        "workstation_status", "devices_list", "jobs_*", "adb_devices",
++        "adb_pull", "adb_logcat", "serial_ports", "serial_read",
++        "serial_close", "files_list", "files_read",
++    }
++    assert set(cfg.confirmation.always_prompt) == {
++        "shell_run", "adb_shell", "adb_push", "adb_install", "files_write",
++        "serial_open", "serial_write",
++    }
++    assert cfg.confirmation.remember_for_session == []

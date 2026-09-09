@@ -1,0 +1,817 @@
+"""The self-signed certificate the network MCP endpoint presents (contract §3).
+
+ECDSA P-256, ten years, SAN = the workstation's hostname and its LAN IP.
+``cryptography>=41.0`` was already declared in ``pyproject.toml`` and unused, so
+this needs no new dependency.
+
+**Persisted and reused across restarts, and that is the load-bearing property.**
+The core does not check this certificate against the system trust store; it pins
+``tls_fingerprint`` from the registration and verifies *that* (contract §3). So a
+regenerated certificate is not a fresh start — it is a new fingerprint, and the
+core's connection fails with "the certificate at <url> is sha256:… but the
+registration pins sha256:…" until a human regenerates and reinstalls the
+registration. Contract §11 item 8 requires that starting the Agent simply brings
+the endpoint back.
+
+Consequences of that, both deliberate:
+
+* A certificate is regenerated **only** when there is none, when the stored one
+  cannot be parsed, when it has expired, or when the operator explicitly asks.
+  Never because the machine's IP changed.
+* If the bound address is not in the certificate's SAN list we log a warning and
+  carry on. Adding the address would change the fingerprint, which is a worse
+  outcome than a SAN the pinning client never looks at. The operator can rotate
+  deliberately via :func:`ensure_certificate` with ``regenerate=True``.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import datetime as dt
+import ipaddress
+import logging
+import socket
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Final
+
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+
+from workstation_agent.network_mcp.credentials import DEFAULT_STATE_DIR, _harden
+
+if TYPE_CHECKING:  # pragma: no cover
+    from pathlib import Path
+
+log = logging.getLogger(__name__)
+
+_CERT_FILE_NAME: Final = "server.crt"
+_KEY_FILE_NAME: Final = "server.key"
+_VALIDITY_DAYS: Final = 3650
+_CLOCK_SKEW = dt.timedelta(days=1)
+
+
+@dataclass(frozen=True)
+class CertificateInfo:
+    """Everything the server and the UI need about the endpoint's certificate."""
+
+    cert_path: Path
+    key_path: Path
+    fingerprint: str
+    """``sha256:`` + 64 lowercase hex of the leaf certificate's DER (contract §3)."""
+    sans: tuple[str, ...]
+    """The SAN entries, as text: DNS names then IP addresses."""
+    not_valid_after: dt.datetime
+    generated: bool
+    """True if this call created the certificate rather than reusing a stored one."""
+
+
+def fingerprint_of(cert: x509.Certificate) -> str:
+    """Return the contract §3 fingerprint string for *cert*."""
+    return "sha256:" + cert.fingerprint(hashes.SHA256()).hex()
+
+
+def _expiry_utc(cert: x509.Certificate) -> dt.datetime:
+    """Return *cert*'s expiry as a timezone-aware UTC datetime.
+
+    ``cryptography`` 41 (the pinned range in ``pyproject.toml``) exposes only the
+    naive ``not_valid_after``, documented as UTC; 42 added ``not_valid_after_utc``
+    and deprecated the naive one. Reading whichever exists keeps this correct
+    across the pin being widened later, and keeps every comparison in this module
+    timezone-aware so a naive/aware mix cannot silently misjudge an expiry.
+    """
+    aware = getattr(cert, "not_valid_after_utc", None)
+    if aware is not None:
+        return aware
+    return cert.not_valid_after.replace(tzinfo=dt.UTC)
+
+
+def _sans_of(cert: x509.Certificate) -> tuple[str, ...]:
+    try:
+        ext = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName)
+    except x509.ExtensionNotFound:  # pragma: no cover — we always add one
+        return ()
+    names: list[str] = list(ext.value.get_values_for_type(x509.DNSName))
+    names.extend(str(ip) for ip in ext.value.get_values_for_type(x509.IPAddress))
+    return tuple(names)
+
+
+def local_identities(  # noqa: C901 — one guarded lookup per source; splitting hides them
+    extra_host: str | None = None,
+) -> tuple[list[str], list[str]]:
+    """Discover this workstation's DNS names and IP addresses for the SAN.
+
+    Every lookup is guarded: a machine with no DNS, no network, or a hostname
+    that does not resolve must still get a certificate. Worst case the SAN is
+    ``localhost`` and ``127.0.0.1``, which is enough for a pinning client.
+
+    Args:
+        extra_host: The interface the operator chose to bind, if known. Included
+            so the common case (bind to the LAN IP) is covered by the SAN even
+            when name resolution is unhelpful.
+
+    Returns:
+        ``(dns_names, ip_addresses)``, each de-duplicated and order-stable.
+    """
+    dns_names: list[str] = []
+    ips: list[str] = []
+
+    def _add_host(value: str | None) -> None:
+        if not value:
+            return
+        try:
+            ipaddress.ip_address(value)
+        except ValueError:
+            if value not in dns_names:
+                dns_names.append(value)
+        else:
+            if value not in ips:
+                ips.append(value)
+
+    try:
+        hostname = socket.gethostname()
+    except OSError:  # pragma: no cover — gethostname does not realistically fail
+        hostname = ""
+    _add_host(hostname)
+    if hostname:
+        with contextlib.suppress(OSError):  # pragma: no cover
+            _add_host(socket.getfqdn(hostname))
+        try:
+            for addr in socket.gethostbyname_ex(hostname)[2]:
+                _add_host(addr)
+        except OSError:
+            log.debug("hostname %r does not resolve; SAN will omit its addresses", hostname)
+
+    # The primary outbound interface, found without sending a packet: connecting
+    # a UDP socket only sets the destination and picks a source address.
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.connect(("192.0.2.1", 9))  # TEST-NET-1, RFC 5737 — never routed
+        _add_host(sock.getsockname()[0])
+    except OSError:
+        log.debug("no outbound interface; SAN will omit the primary LAN address")
+    finally:
+        sock.close()
+
+    _add_host(extra_host)
+    _add_host("localhost")
+    _add_host("127.0.0.1")
+    return dns_names, ips
+
+
+def _build_certificate(
+    dns_names: list[str],
+    ips: list[str],
+) -> tuple[x509.Certificate, ec.EllipticCurvePrivateKey]:
+    key = ec.generate_private_key(ec.SECP256R1())
+    common_name = dns_names[0] if dns_names else "workstation-agent"
+    subject = x509.Name([
+        x509.NameAttribute(NameOID.COMMON_NAME, common_name),
+        x509.NameAttribute(NameOID.ORGANIZATION_NAME, "PersonaCore-Agent"),
+    ])
+    san_entries: list[x509.GeneralName] = [x509.DNSName(n) for n in dns_names]
+    san_entries.extend(x509.IPAddress(ipaddress.ip_address(i)) for i in ips)
+
+    now = dt.datetime.now(dt.UTC)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(subject)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - _CLOCK_SKEW)
+        .not_valid_after(now + dt.timedelta(days=_VALIDITY_DAYS))
+        .add_extension(x509.SubjectAlternativeName(san_entries), critical=False)
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=True,
+                content_commitment=False,
+                key_encipherment=False,
+                data_encipherment=False,
+                key_agreement=True,
+                key_cert_sign=False,
+                crl_sign=False,
+                encipher_only=False,
+                decipher_only=False,
+            ),
+            critical=True,
+        )
+        .add_extension(
+            x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]),
+            critical=False,
+        )
+        .add_extension(
+            x509.SubjectKeyIdentifier.from_public_key(key.public_key()),
+            critical=False,
+        )
+        .sign(key, hashes.SHA256())
+    )
+    return cert, key
+
+
+def _load(cert_path: Path, key_path: Path) -> x509.Certificate | None:
+    """Load and sanity-check a stored certificate; None means "unusable"."""
+    if not cert_path.exists() or not key_path.exists():
+        return None
+    try:
+        cert = x509.load_pem_x509_certificate(cert_path.read_bytes())
+        serialization.load_pem_private_key(key_path.read_bytes(), password=None)
+    except (OSError, ValueError, TypeError) as exc:
+        log.warning("stored network MCP certificate at %s is unusable (%s)", cert_path, exc)
+        return None
+    if _expiry_utc(cert) <= dt.datetime.now(dt.UTC):
+        log.warning(
+            "stored network MCP certificate expired on %s; a new one will be generated "
+            "and PersonaCore's pinned tls_fingerprint must be updated",
+            _expiry_utc(cert).isoformat(),
+        )
+        return None
+    return cert
+
+
+def ensure_certificate(
+    state_dir: Path | None = None,
+    *,
+    bind_host: str | None = None,
+    regenerate: bool = False,
+) -> CertificateInfo:
+    """Return the endpoint's certificate, generating it only when it must.
+
+    Args:
+        state_dir: Directory holding ``server.crt`` / ``server.key``. Defaults to
+            :data:`~workstation_agent.network_mcp.credentials.DEFAULT_STATE_DIR`.
+        bind_host: The interface the endpoint will bind, included in the SAN when
+            a certificate is generated and warned about when a stored certificate
+            does not cover it.
+        regenerate: Force a new certificate. **This changes the fingerprint** and
+            therefore breaks the core's pin until the registration is
+            regenerated and reinstalled; it exists for the UI's explicit
+            "rotate certificate" action only.
+
+    Returns:
+        A :class:`CertificateInfo`.
+    """
+    directory = state_dir if state_dir is not None else DEFAULT_STATE_DIR
+    cert_path = directory / _CERT_FILE_NAME
+    key_path = directory / _KEY_FILE_NAME
+
+    stored = None if regenerate else _load(cert_path, key_path)
+    if stored is not None:
+        sans = _sans_of(stored)
+        if bind_host and bind_host not in sans:
+            log.warning(
+                "the stored certificate's SAN (%s) does not cover the bound address %r. "
+                "Not regenerating: a new certificate would change the pinned fingerprint "
+                "and the core verifies the pin, not the SAN.",
+                ", ".join(sans) or "empty",
+                bind_host,
+            )
+        return CertificateInfo(
+            cert_path=cert_path,
+            key_path=key_path,
+            fingerprint=fingerprint_of(stored),
+            sans=sans,
+            not_valid_after=_expiry_utc(stored),
+            generated=False,
+        )
+
+    dns_names, ips = local_identities(bind_host)
+    cert, key = _build_certificate(dns_names, ips)
+
+    directory.mkdir(parents=True, exist_ok=True)
+    cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    key_path.write_bytes(
+        key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        ),
+    )
+    _harden(key_path)
+
+    info = CertificateInfo(
+        cert_path=cert_path,
+        key_path=key_path,
+        fingerprint=fingerprint_of(cert),
+        sans=_sans_of(cert),
+        not_valid_after=_expiry_utc(cert),
+        generated=True,
+    )
+    log.info(
+        "generated network MCP certificate %s (SAN: %s). PersonaCore's registration must "
+        "pin tls_fingerprint = %r.",
+        cert_path,
+        ", ".join(info.sans),
+        info.fingerprint,
+    )
+    return info
+"""The static families-only allowlist served on the network endpoint.
+
+This module is **the** authority on which tools leave this workstation. It is a
+frozen, hand-maintained table, not a runtime query — that is the whole point.
+
+Why static
+----------
+The brief's "every tool the loaded families expose" was rejected during review
+(``working/brief-review/REVIEW-SUMMARY.md`` §3 item 1) and the plan records the
+replacement as a standing decision:
+
+* Taken literally it would put ``screen.*``, ``clipboard.*``, ``desktop.*`` and
+  ``browser.*`` on the LAN, while contract §10 defers screenshots-the-model-can-see
+  and voice to v2/v3.
+* Three runtime mechanisms (plugin enable/disable, signature verification, a
+  plugin crashing) can change what ``MCPHost.tools()`` returns without a release.
+  The core reconciles the registration's tool list against the served list at load
+  and **a mismatch is a terminal load failure** (contract §2). A served set that
+  can drift at runtime therefore guarantees the failure the contract forbids.
+
+So the served set comes from one list, in one place, that changes only when
+someone edits this file — and subtask B5 generates ``workstation-registration.zip``
+from this same list, which is what makes the two provably equal rather than
+coincidentally equal.
+
+``agent.*`` internal tools (``agent.speak``, ``agent.toast``, ``agent.status``,
+``agent.last_transcript``, ``agent.pause_listening``, ``agent.execute_local``) are
+**never** in this table. They are the local named pipe's surface, not the LAN's.
+
+Naming
+------
+Contract §2: tool names must match ``^[a-z][a-z0-9-]{1,63}$`` after ``_`` → ``-``,
+and **no dots**. The Agent's internal names are ``family.verb``; the wire names are
+``family_verb``. Both are stored explicitly on each entry rather than derived by
+splitting, because a verb containing an underscore would make the split ambiguous
+and a silent mistranslation is worse than a verbose table.
+
+Tools whose family is not yet loaded (``shell``, ``files``, ``jobs``, ``devices``,
+``adb``, ``serial`` land in B6-B8) are still advertised: the registration and the
+served list must agree, and a call to a missing family answers with the §5.2
+``error`` envelope rather than disappearing from ``tools/list``.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from typing import Any, Final
+
+#: Contract §2 / ``contracts/manifest.py:16,470-478``. Applied to the wire name
+#: after ``_`` → ``-``.
+TOOL_NAME_PATTERN: Final = re.compile(r"^[a-z][a-z0-9-]{1,63}$")
+
+
+@dataclass(frozen=True)
+class ServedTool:
+    """One tool the network endpoint serves.
+
+    Attributes:
+        name: The wire name (contract §2 ``family_verb``). What the core calls.
+        internal_name: The Agent-internal ``family.verb`` id passed to
+            :meth:`workstation_agent.mcp_host.host.MCPHost.invoke`.
+        family: The family this tool belongs to.
+        description: Sent to the model verbatim (§5.1).
+        input_schema: JSON Schema for the arguments (§5.1). Every property has a
+            ``description``; booleans default to the safe value.
+        risk: The risk level B5 writes into the registration. Always ``"safe"`` —
+            contract §4: the core cannot prompt (issue #6), so *the Agent is the
+            gate* and every tool is declared ``safe`` to the core. This is weaker
+            than the spec's risk model and the contract says so in as many words.
+    """
+
+    name: str
+    internal_name: str
+    family: str
+    description: str
+    input_schema: dict[str, Any]
+    risk: str = "safe"
+
+    @property
+    def manifest_name(self) -> str:
+        """The name as contract §2's pattern sees it (``_`` → ``-``)."""
+        return self.name.replace("_", "-")
+
+
+def _obj(
+    properties: dict[str, dict[str, Any]],
+    required: list[str] | None = None,
+) -> dict[str, Any]:
+    """Build a flat JSON Schema object (§5.1: arguments are a flat object)."""
+    schema: dict[str, Any] = {
+        "type": "object",
+        "properties": properties,
+        "additionalProperties": False,
+    }
+    if required:
+        schema["required"] = required
+    return schema
+
+
+_PATH = {
+    "type": "string",
+    "description": "A path on the workstation, inside a declared root. "
+                   "A path outside the declared roots is denied.",
+}
+_WAIT_S = {
+    "type": "integer",
+    "description": "Seconds to wait before returning a job handle instead of a result. "
+                   "Default 20, maximum 25.",
+    "minimum": 0,
+    "maximum": 25,
+    "default": 20,
+}
+_JOB_ID = {"type": "string", "description": "A job id from a previous call."}
+_SESSION_ID = {"type": "string", "description": "A session id from serial_open."}
+_ADB_SERIAL = {
+    "type": "string",
+    "description": "The ADB device serial. Optional when exactly one device is attached.",
+}
+
+
+#: The complete served set. Ordering is contract §6's ordering.
+SERVED_TOOLS: Final[tuple[ServedTool, ...]] = (
+    ServedTool(
+        name="workstation_status",
+        internal_name="workstation.status",
+        family="workstation",
+        description=(
+            "Report the workstation's hostname, user, OS, uptime, Agent version, "
+            "the capability families loaded, and how many jobs and sessions are open."
+        ),
+        input_schema=_obj({}),
+    ),
+    ServedTool(
+        name="devices_list",
+        internal_name="devices.list",
+        family="devices",
+        description=(
+            "List everything currently attached to the workstation: USB devices, "
+            "ADB devices, and COM ports."
+        ),
+        input_schema=_obj({}),
+    ),
+    ServedTool(
+        name="shell_run",
+        internal_name="shell.run",
+        family="shell",
+        description=(
+            "Run a command on the workstation and return its exit code, stdout and stderr. "
+            "Long-running commands return a job id instead; page the output with jobs_output."
+        ),
+        input_schema=_obj(
+            {
+                "command": {"type": "string", "description": "The command line to run."},
+                "cwd": {
+                    "type": "string",
+                    "description": "Working directory. Defaults to a declared root.",
+                },
+                "shell": {
+                    "type": "string",
+                    "enum": ["powershell", "cmd"],
+                    "default": "powershell",
+                    "description": "Which shell interprets the command.",
+                },
+                "wait_s": _WAIT_S,
+            },
+            ["command"],
+        ),
+    ),
+    ServedTool(
+        name="files_list",
+        internal_name="files.list",
+        family="files",
+        description="List the entries of a directory on the workstation, inside a declared root.",
+        input_schema=_obj({"path": _PATH}, ["path"]),
+    ),
+    ServedTool(
+        name="files_read",
+        internal_name="files.read",
+        family="files",
+        description=(
+            "Read a text file on the workstation, inside a declared root. "
+            "Binary files are refused; large files are paged with from_byte."
+        ),
+        input_schema=_obj(
+            {
+                "path": _PATH,
+                "from_byte": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "default": 0,
+                    "description": "Byte offset to start reading from.",
+                },
+                "max_bytes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 60000,
+                    "description": "Most bytes to return. Capped at 60000.",
+                },
+            },
+            ["path"],
+        ),
+    ),
+    ServedTool(
+        name="files_write",
+        internal_name="files.write",
+        family="files",
+        description=(
+            "Write text to a file on the workstation, inside a declared root. "
+            "Overwrites unless append is true."
+        ),
+        input_schema=_obj(
+            {
+                "path": _PATH,
+                "content": {"type": "string", "description": "The text to write."},
+                "append": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Append instead of overwriting. Defaults to false.",
+                },
+            },
+            ["path", "content"],
+        ),
+    ),
+    ServedTool(
+        name="jobs_wait",
+        internal_name="jobs.wait",
+        family="jobs",
+        description="Wait for a running job to finish, or until wait_s elapses.",
+        input_schema=_obj({"job_id": _JOB_ID, "wait_s": _WAIT_S}, ["job_id"]),
+    ),
+    ServedTool(
+        name="jobs_output",
+        internal_name="jobs.output",
+        family="jobs",
+        description="Page the captured output of a job.",
+        input_schema=_obj(
+            {
+                "job_id": _JOB_ID,
+                "from_byte": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "default": 0,
+                    "description": "Byte offset to start reading from.",
+                },
+                "max_bytes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 60000,
+                    "description": "Most bytes to return. Capped at 60000.",
+                },
+            },
+            ["job_id"],
+        ),
+    ),
+    ServedTool(
+        name="jobs_list",
+        internal_name="jobs.list",
+        family="jobs",
+        description="List running jobs and jobs that finished in the last 30 minutes.",
+        input_schema=_obj({}),
+    ),
+    ServedTool(
+        name="jobs_kill",
+        internal_name="jobs.kill",
+        family="jobs",
+        description="Terminate a running job and its process tree.",
+        input_schema=_obj({"job_id": _JOB_ID}, ["job_id"]),
+    ),
+    ServedTool(
+        name="adb_devices",
+        internal_name="adb.devices",
+        family="adb",
+        description="List the Android devices ADB can see, with their state and model.",
+        input_schema=_obj({}),
+    ),
+    ServedTool(
+        name="adb_shell",
+        internal_name="adb.shell",
+        family="adb",
+        description=(
+            "Run a shell command on an attached Android device. "
+            "Long-running commands return a job id."
+        ),
+        input_schema=_obj(
+            {
+                "serial": _ADB_SERIAL,
+                "command": {"type": "string", "description": "The command to run on the device."},
+                "wait_s": _WAIT_S,
+            },
+            ["command"],
+        ),
+    ),
+    ServedTool(
+        name="adb_push",
+        internal_name="adb.push",
+        family="adb",
+        description=(
+            "Copy a file from the workstation onto an attached Android device. "
+            "The workstation path must be inside a declared root."
+        ),
+        input_schema=_obj(
+            {
+                "serial": _ADB_SERIAL,
+                "workstation_path": _PATH,
+                "device_path": {
+                    "type": "string",
+                    "description": "Destination path on the device.",
+                },
+            },
+            ["workstation_path", "device_path"],
+        ),
+    ),
+    ServedTool(
+        name="adb_pull",
+        internal_name="adb.pull",
+        family="adb",
+        description=(
+            "Read a text file from an attached Android device. "
+            "Binary transfer is not available yet."
+        ),
+        input_schema=_obj(
+            {
+                "serial": _ADB_SERIAL,
+                "device_path": {"type": "string", "description": "Path on the device to read."},
+            },
+            ["device_path"],
+        ),
+    ),
+    ServedTool(
+        name="adb_install",
+        internal_name="adb.install",
+        family="adb",
+        description=(
+            "Install an APK from the workstation onto an attached Android device. "
+            "The workstation path must be inside a declared root."
+        ),
+        input_schema=_obj(
+            {"serial": _ADB_SERIAL, "workstation_path": _PATH},
+            ["workstation_path"],
+        ),
+    ),
+    ServedTool(
+        name="adb_logcat",
+        internal_name="adb.logcat",
+        family="adb",
+        description="Capture logcat from an attached Android device for a few seconds.",
+        input_schema=_obj(
+            {
+                "serial": _ADB_SERIAL,
+                "seconds": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 20,
+                    "default": 5,
+                    "description": "How long to capture. Maximum 20.",
+                },
+                "filter": {
+                    "type": "string",
+                    "description": "An optional logcat filter expression.",
+                },
+            },
+        ),
+    ),
+    ServedTool(
+        name="serial_ports",
+        internal_name="serial.ports",
+        family="serial",
+        description="List the COM ports on the workstation.",
+        input_schema=_obj({}),
+    ),
+    ServedTool(
+        name="serial_open",
+        internal_name="serial.open",
+        family="serial",
+        description="Open a serial port and return a session id for reading and writing.",
+        input_schema=_obj(
+            {
+                "port": {"type": "string", "description": "The port name, for example COM3."},
+                "baud": {"type": "integer", "description": "Baud rate, for example 115200."},
+                "bytesize": {"type": "integer", "default": 8, "description": "Data bits."},
+                "parity": {
+                    "type": "string",
+                    "enum": ["N", "E", "O", "M", "S"],
+                    "default": "N",
+                    "description": "Parity. Defaults to none.",
+                },
+                "stopbits": {"type": "number", "default": 1, "description": "Stop bits."},
+                "timeout_s": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 20,
+                    "default": 2,
+                    "description": "Default read timeout for this session, in seconds.",
+                },
+            },
+            ["port", "baud"],
+        ),
+    ),
+    ServedTool(
+        name="serial_write",
+        internal_name="serial.write",
+        family="serial",
+        description="Write text or raw bytes to an open serial session.",
+        input_schema=_obj(
+            {
+                "session_id": _SESSION_ID,
+                "text": {"type": "string", "description": "Text to write."},
+                "hex": {
+                    "type": "string",
+                    "description": "Raw bytes as lowercase hex with no separators.",
+                },
+            },
+            ["session_id"],
+        ),
+    ),
+    ServedTool(
+        name="serial_read",
+        internal_name="serial.read",
+        family="serial",
+        description="Read from an open serial session until a marker, a byte count, or a timeout.",
+        input_schema=_obj(
+            {
+                "session_id": _SESSION_ID,
+                "until": {
+                    "type": "string",
+                    "description": "A literal string to stop at, matched after decoding.",
+                },
+                "max_bytes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 60000,
+                    "description": "Most bytes to read. Capped at 60000.",
+                },
+                "timeout_s": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 20,
+                    "default": 2,
+                    "description": "Seconds to wait. Default 2, maximum 20.",
+                },
+            },
+            ["session_id"],
+        ),
+    ),
+    ServedTool(
+        name="serial_close",
+        internal_name="serial.close",
+        family="serial",
+        description="Close an open serial session and release the port.",
+        input_schema=_obj({"session_id": _SESSION_ID}, ["session_id"]),
+    ),
+)
+
+
+#: Wire name → descriptor. Built once; the table is frozen.
+SERVED_TOOLS_BY_NAME: Final[dict[str, ServedTool]] = {t.name: t for t in SERVED_TOOLS}
+
+#: The families this endpoint is willing to serve at all.
+SERVED_FAMILIES: Final[tuple[str, ...]] = tuple(
+    dict.fromkeys(t.family for t in SERVED_TOOLS),
+)
+
+
+def served_tool_names() -> tuple[str, ...]:
+    """Return the served wire names, in table order.
+
+    This is the function subtask B5 generates ``workstation-registration.zip``
+    from. It exists so B5 never has to reach into the table's internals, and so
+    "the served set" has exactly one spelling in the codebase.
+    """
+    return tuple(t.name for t in SERVED_TOOLS)
+
+
+def validate_tool_names() -> list[str]:
+    """Return a list of contract §2 violations in the table; empty means clean.
+
+    Checks the manifest form (``_`` → ``-``) against ``TOOL_NAME_PATTERN``, that
+    no wire name contains a dot, that the internal name really is ``family.verb``
+    with a matching family, and that wire names are unique.
+    """
+    problems: list[str] = []
+    seen: set[str] = set()
+    for tool in SERVED_TOOLS:
+        if tool.name in seen:
+            problems.append(f"duplicate served name: {tool.name!r}")
+        seen.add(tool.name)
+        if "." in tool.name:
+            problems.append(f"served name contains a dot (contract §2 forbids it): {tool.name!r}")
+        if not TOOL_NAME_PATTERN.match(tool.manifest_name):
+            problems.append(
+                f"served name {tool.name!r} -> {tool.manifest_name!r} "
+                f"does not match {TOOL_NAME_PATTERN.pattern}",
+            )
+        if tool.internal_name.count(".") != 1:
+            problems.append(
+                f"internal name {tool.internal_name!r} is not family.verb",
+            )
+        elif tool.internal_name.split(".", 1)[0] != tool.family:
+            problems.append(
+                f"internal name {tool.internal_name!r} does not start with family "
+                f"{tool.family!r}",
+            )
+        if tool.risk != "safe":
+            problems.append(
+                f"{tool.name!r} declares risk {tool.risk!r}; contract §4 requires 'safe'",
+            )
+    return problems
