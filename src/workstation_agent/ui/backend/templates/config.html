@@ -66,6 +66,25 @@
   </fieldset>
 
   <fieldset>
+    <legend>ADB (Android Debug Bridge)</legend>
+    <label>adb.exe path:
+      <input type="text" name="adb_binary_path"
+             value="{{ cfg.adb.binary_path if cfg else '' }}"
+             placeholder="leave blank to search PATH and the usual SDK locations">
+      {% if errors.adb_binary_path is defined %}
+        <span class="error">{{ errors.adb_binary_path }}</span>
+      {% endif %}
+    </label>
+    {% if warnings.adb_binary_path is defined %}
+      <p class="error">{{ warnings.adb_binary_path }}</p>
+    {% endif %}
+    <p>Where this workstation's <code>adb.exe</code> lives. Leave blank and the
+      Agent searches <code>PATH</code> and the usual Android SDK install
+      locations. A path set here wins outright — if it does not exist the adb
+      tools report that rather than silently using a different adb.</p>
+  </fieldset>
+
+  <fieldset>
     <legend>Updates</legend>
     <label>Enabled:
       <input type="checkbox" name="update_enabled" value="true" {% if cfg and cfg.update.enabled %}checked{% endif %}>

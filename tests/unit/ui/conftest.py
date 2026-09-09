@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal, overload
 
 import pytest
 from starlette.testclient import TestClient
@@ -109,6 +109,36 @@ class FakeAuditReader:
 # Fixture helpers
 # ---------------------------------------------------------------------------
 
+@overload
+def make_client(
+    config_store: Any = ...,
+    mcp_host: Any = ...,
+    audit_reader: Any = ...,
+    log_dir: Path | None = ...,
+    tmp_path: Path | None = ...,
+    network_mcp: Any = ...,
+    network_mcp_factory: Any = ...,
+    on_network_mcp_change: Any = ...,
+    *,
+    return_ctx: Literal[False] = ...,
+) -> TestClient: ...
+
+
+@overload
+def make_client(
+    config_store: Any = ...,
+    mcp_host: Any = ...,
+    audit_reader: Any = ...,
+    log_dir: Path | None = ...,
+    tmp_path: Path | None = ...,
+    network_mcp: Any = ...,
+    network_mcp_factory: Any = ...,
+    on_network_mcp_change: Any = ...,
+    *,
+    return_ctx: Literal[True],
+) -> tuple[TestClient, BackendContext]: ...
+
+
 def make_client(  # noqa: PLR0913, PLR0917 -- one param per injected BackendContext field
     config_store: Any = None,
     mcp_host: Any = None,
@@ -116,19 +146,37 @@ def make_client(  # noqa: PLR0913, PLR0917 -- one param per injected BackendCont
     log_dir: Path | None = None,
     tmp_path: Path | None = None,
     network_mcp: Any = None,
-) -> TestClient:
-    """Build a TestClient with a fully-injected BackendContext."""
+    network_mcp_factory: Any = None,
+    on_network_mcp_change: Any = None,
+    *,
+    return_ctx: bool = False,
+) -> TestClient | tuple[TestClient, BackendContext]:
+    """Build a TestClient with a fully-injected BackendContext.
+
+    Overloaded on ``return_ctx`` rather than returning a bare union: dozens of
+    existing call sites do ``make_client(...).get(...)``, and a union return
+    would make every one of them a type error for the sake of the handful that
+    want the context too.
+
+    ``return_ctx`` hands back the context as well, for the tests that need to
+    inspect what a request did to it -- ``POST /network-mcp/settings`` replaces
+    ``ctx.network_mcp`` with the endpoint it started, and asserting on that is
+    the difference between "the page said it started it" and "it started it".
+    """
     ctx = BackendContext(
         config_store=config_store or FakeConfigStore(),
-        mcp_host=mcp_host or FakeMCPHost(),
+        mcp_host=mcp_host if mcp_host is not None else FakeMCPHost(),
         audit_reader=audit_reader or FakeAuditReader(),
         log_dir=log_dir or (tmp_path / "logs" if tmp_path else Path.cwd() / ".logs_test"),
         network_mcp=network_mcp,
+        network_mcp_factory=network_mcp_factory,
+        on_network_mcp_change=on_network_mcp_change,
     )
     app = create_app(ctx)
     # Wrap with loopback spoof so the middleware passes in tests
     wrapped = _LoopbackASGI(app)
-    return TestClient(wrapped, raise_server_exceptions=True)
+    client = TestClient(wrapped, raise_server_exceptions=True)
+    return (client, ctx) if return_ctx else client
 
 
 @pytest.fixture

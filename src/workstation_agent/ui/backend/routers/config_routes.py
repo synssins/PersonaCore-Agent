@@ -6,6 +6,7 @@ Copyright (c) 2024 PersonaCore-Agent contributors. See LICENSE for details.
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import TYPE_CHECKING, Annotated
 
 from fastapi import APIRouter, Depends, Form, Request
@@ -14,6 +15,7 @@ from fastapi.responses import HTMLResponse
 from workstation_agent.config.schema import (
     DEFAULT_ALWAYS_PROMPT_TOOLS,
     DEFAULT_NEVER_PROMPT_TOOLS,
+    AdbConfig,
     AgentConfig,
 )
 from workstation_agent.ui.backend.app import BackendContext, get_context, templates
@@ -46,6 +48,76 @@ def _confirmation_tool_names(cfg: AgentConfig | None) -> list[str]:
     return sorted(names)
 
 
+def _settings_page(
+    request: Request,
+    cfg: AgentConfig | None,
+    *,
+    errors: dict[str, str] | None = None,
+    warnings: dict[str, str] | None = None,
+    saved: bool = False,
+) -> HTMLResponse:
+    """Shared ``config.html`` render for every ``GET``/``POST /config`` outcome.
+
+    Every branch of this router used to build the same eight-key context dict
+    by hand. Adding one key meant editing six copies, and missing one produced
+    a template that renders a blank field instead of failing -- so the copies
+    are gone.
+
+    ``warnings`` is distinct from ``errors`` on purpose: an error means nothing
+    was saved, a warning means the save went through and there is still
+    something the operator should know (an ``adb.exe`` path that is not there
+    yet, for instance). Conflating them would either block a legitimate save or
+    hide a real problem.
+    """
+    return templates.TemplateResponse(
+        request,
+        "config.html",
+        {
+            "cfg": cfg,
+            "errors": errors or {},
+            "warnings": warnings or {},
+            "saved": saved,
+            "confirmation_tools": _confirmation_tool_names(cfg),
+            "policy_errors": {},
+            "policy_saved": False,
+        },
+    )
+
+
+def _adb_path_warning(binary_path: str) -> str | None:
+    """Why the operator should look again at the ``adb.exe`` path they just saved.
+
+    Not an error, and deliberately not a refusal: an operator may well point
+    the Agent at an ADB they are about to install, and the value is still
+    correct then. But a configured path that is not there is *not* silently
+    replaced by one found on ``PATH`` -- the adb family raises
+    ``AdbNotFoundError`` instead (see ``plugins/adb``) -- so saying nothing
+    would leave the adb tools broken with the reason buried in a plugin's
+    error message.
+
+    ``OSError`` is caught because ``is_file`` reaches the filesystem: a path on
+    a disconnected network share, or one the Agent cannot traverse, raises
+    rather than returning ``False``, and a settings page must not 500 over a
+    field it was only trying to be helpful about.
+    """
+    if not binary_path:
+        return None
+    try:
+        exists = Path(binary_path).is_file()
+    except OSError as exc:
+        return (
+            f"Saved, but the adb path could not be checked ({exc}). The adb tools "
+            "will report a clearer error if it turns out to be unreachable."
+        )
+    if exists:
+        return None
+    return (
+        "Saved, but there is no file at that adb path. The adb tools will refuse "
+        "to run rather than quietly using a different adb — clear the field to "
+        "search PATH and the usual SDK locations instead."
+    )
+
+
 @router.get("", response_class=HTMLResponse)
 async def config_get(
     request: Request,
@@ -61,18 +133,7 @@ async def config_get(
             log.exception("config GET: failed to load config")
             errors["_global"] = str(exc)
 
-    return templates.TemplateResponse(
-        request,
-        "config.html",
-        {
-            "cfg": cfg,
-            "errors": errors,
-            "saved": False,
-            "confirmation_tools": _confirmation_tool_names(cfg),
-            "policy_errors": {},
-            "policy_saved": False,
-        },
-    )
+    return _settings_page(request, cfg, errors=errors)
 
 
 @router.post("", response_class=HTMLResponse, response_model=None)
@@ -96,6 +157,8 @@ async def config_post(  # noqa: PLR0913, PLR0917
     # Update
     update_enabled: Annotated[str, Form(alias="update_enabled")] = "",
     update_channel: Annotated[str, Form(alias="update_channel")] = "stable",
+    # ADB
+    adb_binary_path: Annotated[str, Form(alias="adb_binary_path")] = "",
 ) -> HTMLResponse:
     """Process configuration form submission with Pydantic validation."""
     errors: dict[str, str] = {}
@@ -107,35 +170,13 @@ async def config_post(  # noqa: PLR0913, PLR0917
     update_on = bool(update_enabled)
 
     if ctx.config_store is None:
-        errors["_global"] = "Config store not available"
-        return templates.TemplateResponse(
-            request,
-            "config.html",
-            {
-                "cfg": cfg,
-                "errors": errors,
-                "saved": False,
-                "confirmation_tools": _confirmation_tool_names(cfg),
-                "policy_errors": {},
-                "policy_saved": False,
-            },
-        )
+        return _settings_page(request, cfg, errors={"_global": "Config store not available"})
 
     try:
         cfg = ctx.config_store.load()
     except Exception as exc:  # noqa: BLE001
-        errors["_global"] = f"Failed to load current config: {exc}"
-        return templates.TemplateResponse(
-            request,
-            "config.html",
-            {
-                "cfg": cfg,
-                "errors": errors,
-                "saved": False,
-                "confirmation_tools": _confirmation_tool_names(cfg),
-                "policy_errors": {},
-                "policy_saved": False,
-            },
+        return _settings_page(
+            request, cfg, errors={"_global": f"Failed to load current config: {exc}"},
         )
 
     # Validate
@@ -151,18 +192,7 @@ async def config_post(  # noqa: PLR0913, PLR0917
         errors["session_sticky_seconds"] = "Must be positive"
 
     if errors:
-        return templates.TemplateResponse(
-            request,
-            "config.html",
-            {
-                "cfg": cfg,
-                "errors": errors,
-                "saved": False,
-                "confirmation_tools": _confirmation_tool_names(cfg),
-                "policy_errors": {},
-                "policy_saved": False,
-            },
-        )
+        return _settings_page(request, cfg, errors=errors)
 
     # Apply changes
     cfg.llm.base_url = llm_base_url  # type: ignore[assignment]
@@ -177,35 +207,25 @@ async def config_post(  # noqa: PLR0913, PLR0917
     cfg.session.sticky_seconds = session_sticky_seconds
     cfg.update.enabled = update_on
     cfg.update.channel = update_channel
+    # Re-validated rather than assigned: AdbConfig strips whitespace and the
+    # quotes an Explorer "Copy as path" adds, and plain attribute assignment
+    # does not run field validators (AgentConfig does not set
+    # validate_assignment). Assigning the raw string would write `"C:\...\adb.exe"`
+    # -- quotes included -- into config.toml, and the adb plugin would then look
+    # for a file whose name really does start with a quote.
+    cfg.adb = AdbConfig(binary_path=adb_binary_path)
 
     try:
         ctx.config_store.save(cfg)
     except Exception as exc:  # noqa: BLE001
-        errors["_global"] = f"Failed to save config: {exc}"
-        return templates.TemplateResponse(
-            request,
-            "config.html",
-            {
-                "cfg": cfg,
-                "errors": errors,
-                "saved": False,
-                "confirmation_tools": _confirmation_tool_names(cfg),
-                "policy_errors": {},
-                "policy_saved": False,
-            },
-        )
+        return _settings_page(request, cfg, errors={"_global": f"Failed to save config: {exc}"})
 
-    return templates.TemplateResponse(
+    warning = _adb_path_warning(cfg.adb.binary_path)
+    return _settings_page(
         request,
-        "config.html",
-        {
-            "cfg": cfg,
-            "errors": {},
-            "saved": True,
-            "confirmation_tools": _confirmation_tool_names(cfg),
-            "policy_errors": {},
-            "policy_saved": False,
-        },
+        cfg,
+        saved=True,
+        warnings={"adb_binary_path": warning} if warning else None,
     )
 
 
@@ -223,6 +243,7 @@ def _policy_page(
         {
             "cfg": cfg,
             "errors": {},
+            "warnings": {},
             "saved": False,
             "confirmation_tools": _confirmation_tool_names(cfg),
             "policy_errors": policy_errors,

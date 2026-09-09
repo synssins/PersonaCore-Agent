@@ -5,14 +5,100 @@
 <h1>Network MCP Endpoint</h1>
 
 <p>Lets PersonaCore reach this workstation's capability families over the LAN
-  (contract §1-§3). Off unless <code>network_mcp.enabled</code> is turned on
-  in Config.</p>
+  (contract §1-§3). Everything below is set here — you never need to open
+  <code>config.toml</code> or a command prompt.</p>
 
 {% if error %}<p class="error">{{ error }}</p>{% endif %}
 {% if reveal_error %}<p class="error">{{ reveal_error }}</p>{% endif %}
+{% if field_errors._global is defined %}<p class="error">{{ field_errors._global }}</p>{% endif %}
+{% if saved %}<p class="success">Settings saved.{% if notice %} {{ notice }}{% endif %}</p>{% endif %}
+
+<section>
+  <h2>Endpoint</h2>
+
+  {% if not can_configure %}
+    <p class="error">The endpoint's settings cannot be changed from here because the
+      configuration store is unavailable.</p>
+  {% else %}
+  <form method="post" action="/network-mcp/settings">
+    <fieldset>
+      <legend>Serve the endpoint</legend>
+
+      <label>
+        <input type="checkbox" name="enabled" value="true"
+               {% if values.enabled %}checked{% endif %}>
+        Enabled — put this workstation's capability families on the network
+      </label>
+      <p>Saving applies immediately: the endpoint starts, stops or rebinds without
+        restarting the Agent. If that is not possible you will be told so here
+        rather than left guessing.</p>
+
+      <label for="nm-host">Interface to bind:</label>
+      <select id="nm-host" name="bind_host_choice">
+        {% for kind, heading in [
+             ('lan', 'LAN addresses — reachable from PersonaCore'),
+             ('hostname', 'This machine’s names'),
+             ('loopback', 'Loopback — NOT reachable from PersonaCore')] %}
+          {% set group = host_choices | selectattr('kind', 'equalto', kind) | list %}
+          {% if group %}
+          <optgroup label="{{ heading }}">
+            {% for c in group %}
+              <option value="{{ c.value }}"
+                {% if c.value == values.bind_host %}selected{% endif %}>{{ c.label }}</option>
+            {% endfor %}
+          </optgroup>
+          {% endif %}
+        {% endfor %}
+        <option value="{{ other_sentinel }}"
+          {% if not host_is_listed %}selected{% endif %}>Other — type an address below</option>
+      </select>
+      <label>Other address:
+        <input type="text" name="bind_host_other"
+               value="{% if not host_is_listed %}{{ values.bind_host }}{% endif %}"
+               placeholder="192.168.1.42">
+      </label>
+      {% if field_errors.bind_host is defined %}
+        <p class="error">{{ field_errors.bind_host }}</p>
+      {% endif %}
+      <p>This must name one interface on this machine. A wildcard
+        (<code>0.0.0.0</code>, <code>::</code>, <code>*</code>) is refused: it would
+        expose the endpoint on every interface this machine has, including ones you
+        have not thought about.</p>
+      {% if bind_is_loopback %}
+        <p class="error">This is a loopback address. PersonaCore runs on another host
+          and cannot reach it — on that machine, <code>127.0.0.1</code> means
+          PersonaCore itself. Pick a LAN address.</p>
+      {% endif %}
+
+      <label>Port:
+        <input type="number" name="port" min="0" max="65535" value="{{ values.port }}">
+      </label>
+      {% if field_errors.port is defined %}<p class="error">{{ field_errors.port }}</p>{% endif %}
+      {% if values.port == 0 %}
+        <p class="error">Port 0 asks the operating system to pick a free port at every
+          start, so the port changes on each restart and any exported registration
+          goes stale. Set a fixed port.</p>
+      {% endif %}
+    </fieldset>
+    <button type="submit">Save &amp; Apply</button>
+  </form>
+  {% endif %}
+</section>
+
+{% if cert_warning %}
+<section>
+  <h2>Certificate does not cover this address</h2>
+  <p class="error">{{ cert_warning }}</p>
+  <form method="post" action="/network-mcp/regenerate-certificate"
+        onsubmit="return confirm('Regenerating changes the fingerprint. The registration must be re-exported and reinstalled on the Plugins page, or the core will stop connecting. Continue?');">
+    <button type="submit">Regenerate Certificate for this address</button>
+  </form>
+</section>
+{% endif %}
 
 {% if not enabled %}
-  <p>The network MCP endpoint is not running.</p>
+  <p>The network MCP endpoint is not running. Turn it on above to generate its
+    identity and see what to paste into PersonaCore.</p>
 {% elif info %}
 <section>
   <h2>Identity</h2>
@@ -65,13 +151,54 @@
   </form>
 </section>
 
+{% endif %}
+
 <section>
   <h2>Export registration</h2>
-  <p>Run <code>Agent.exe export-registration</code> on this workstation to write
-    <code>workstation-registration.zip</code> for the Plugins page. It carries this
-    fingerprint but never the token.</p>
+  <p>Produces <code>workstation-registration.zip</code> for PersonaCore's Plugins
+    page. It carries this endpoint's URL and fingerprint, and never the token.</p>
+
+  {% if export_error %}<p class="error">{{ export_error }}</p>{% endif %}
+
+  {% if not info %}
+    <p>Switch the endpoint on above first — there is no endpoint identity to
+      describe yet.</p>
+  {% elif export_problems and not export_result %}
+    <p class="error">This registration would not work as things stand:</p>
+    <ul>
+      {% for problem in export_problems %}<li class="error">{{ problem }}</li>{% endfor %}
+    </ul>
+    <p>Fix the endpoint above and export again, or export anyway if you are
+      preparing the registration ahead of time.</p>
+    <form method="post" action="/network-mcp/export-registration">
+      <input type="hidden" name="confirm" value="true">
+      <button type="submit">Export Anyway</button>
+    </form>
+  {% else %}
+    <form method="post" action="/network-mcp/export-registration">
+      <button type="submit">Export Registration</button>
+    </form>
+  {% endif %}
+
+  {% if export_result %}
+    <p class="success">Wrote the registration for
+      <code>{{ export_result.url }}</code> ({{ export_result.tool_names | length }} tools).</p>
+    {% if export_problems %}
+      <p class="error">Exported at your request, with these problems unresolved:</p>
+      <ul>
+        {% for problem in export_problems %}<li class="error">{{ problem }}</li>{% endfor %}
+      </ul>
+    {% endif %}
+  {% endif %}
+
+  {% if have_previous_export %}
+    <p>On this workstation at
+      <code id="nm-export-path">{{ export_path }}</code>
+      <button type="button" data-copy-target="nm-export-path">Copy path</button></p>
+    <p><a href="/network-mcp/registration.zip" download>Download workstation-registration.zip</a>
+      — saves to this browser's downloads folder.</p>
+  {% endif %}
 </section>
-{% endif %}
 
 <script>
   document.querySelectorAll("[data-copy-target]").forEach(function (btn) {

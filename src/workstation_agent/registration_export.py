@@ -27,10 +27,12 @@ does not edit it.
 from __future__ import annotations
 
 import io
+import ipaddress
 import zipfile
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
 from workstation_agent.network_mcp.tools import served_tool_names, validate_tool_names
@@ -324,6 +326,11 @@ def export_registration(
         OSError: if *output_dir* cannot be created or the zip cannot be
             written.
     """
+    # Checked here as well as in export_registration_from_endpoint, and
+    # deliberately *before* the server is built: `info()` generates the
+    # certificate and token if they do not exist yet, and a table that
+    # violates contract §2 should be refused before anything is created on
+    # disk, not after.
     problems = validate_tool_names()
     if problems:
         msg = (
@@ -339,7 +346,55 @@ def export_registration(
     from workstation_agent.network_mcp.server import NetworkMCPServer
 
     server = NetworkMCPServer(config, state_dir=state_dir)
-    info = server.info()
+    return export_registration_from_endpoint(server.info(), output_dir=output_dir)
+
+
+def export_registration_from_endpoint(
+    info: Any,  # noqa: ANN401 — duck-typed NetworkEndpointInfo, never imported here
+    *,
+    output_dir: Path | None = None,
+) -> RegistrationResult:
+    """Write the registration for an endpoint whose live identity is *info*.
+
+    :func:`export_registration` builds a throwaway
+    :class:`~workstation_agent.network_mcp.server.NetworkMCPServer` from a
+    config and exports *that* server's ``info()``. That is right for the CLI,
+    which has no running Agent to ask, but it is wrong for the UI while the
+    endpoint is actually up, for a reason that bites in practice: a server
+    constructed from config reports ``config.port``, and ``port = 0`` means
+    "let the OS pick" — so exporting from config while the real endpoint is
+    listening on an OS-assigned port writes ``https://host:0/mcp``, a
+    registration for an endpoint that does not exist. The same applies to any
+    drift between what is saved and what the running server was constructed
+    with. This entry point takes the live
+    :class:`~workstation_agent.network_mcp.server.NetworkEndpointInfo`
+    instead, so the exported registration describes the endpoint the core will
+    actually reach.
+
+    *info* is duck-typed on purpose: this module must not import the
+    network_mcp server package at module scope (see the module docstring), and
+    the only attributes read are ``url``, ``bind_host``, ``fingerprint`` and
+    ``tool_names``.
+
+    Args:
+        info: The live endpoint identity — ``NetworkMCPServer.info()``.
+        output_dir: Directory to write the zip into. Defaults to the current
+            working directory.
+
+    Returns:
+        The path written and what went into it.
+
+    Raises:
+        RuntimeError, TypeError, ValueError, OSError: exactly as
+            :func:`export_registration` documents.
+    """
+    problems = validate_tool_names()
+    if problems:
+        msg = (
+            "cannot export a registration: the served-tool table violates "
+            "contract §2: " + "; ".join(problems)
+        )
+        raise RuntimeError(msg)
 
     tool_names = served_tool_names()
     # Type-checked before either side is turned into a set: set("abc") ==
@@ -389,3 +444,148 @@ def export_registration(
         url=info.url,
         fingerprint=info.fingerprint,
     )
+
+
+# ---------------------------------------------------------------------------
+# Pre-flight: would this registration actually work on the core?
+# ---------------------------------------------------------------------------
+
+#: Hostnames that resolve to the loopback interface. Checked by name because a
+#: bind_host is a string, not a resolved address, and ``localhost`` is the one
+#: name an operator is likely to type meaning "this machine".
+_LOOPBACK_NAMES: frozenset[str] = frozenset({"localhost", "localhost.localdomain"})
+
+
+def is_loopback_host(host: str) -> bool:
+    """True if *host* names the loopback interface.
+
+    A registration whose ``url`` points at loopback is syntactically perfect
+    and functionally useless: PersonaCore runs on another machine, and
+    ``127.0.0.1`` there means *that* machine. Recognising it is what lets the
+    UI say so before the operator installs a plugin that can never connect.
+    """
+    stripped = host.strip().strip("[]").lower()
+    if not stripped:
+        return False
+    if stripped in _LOOPBACK_NAMES:
+        return True
+    try:
+        return ipaddress.ip_address(stripped).is_loopback
+    except ValueError:
+        return False
+
+
+def san_covers(host: str, sans: object) -> bool:
+    """True if *host* is covered by the certificate SAN entries *sans*.
+
+    Compared two ways, because a SAN carries DNS names and IP addresses as text
+    and the two are not interchangeable: a name matches case-insensitively (DNS
+    is case-insensitive), while an address is parsed on both sides and compared
+    as an address, so ``::1`` matches ``0:0:0:0:0:0:0:1`` and ``[192.168.1.50]``
+    matches ``192.168.1.50``. No wildcard or suffix matching -- a certificate
+    covering ``foo.example`` does not cover ``bar.foo.example``, and guessing
+    otherwise would produce a reassuring UI for a broken endpoint.
+
+    An empty *host* is treated as covered: there is nothing to check, and the
+    schema refuses an empty ``bind_host`` anyway.
+
+    *sans* is typed ``object`` and defended rather than trusted. It reaches
+    here from a duck-typed ``info.certificate_sans``, and the failure mode if
+    it is not the expected sequence is quiet rather than loud: a bare ``str``
+    iterates as single characters, so a SAN of ``"192.168.1.50"`` handed in as
+    a string instead of a one-element tuple would compare ``"1"``, ``"9"``,
+    ``"2"`` ... against the host and report "not covered" for a certificate
+    that covers it perfectly -- pushing the operator to rotate a fingerprint
+    that was fine. Anything that is not a real sequence of entries is treated
+    as no coverage information at all.
+    """
+    stripped = host.strip().strip("[]")
+    if not stripped:
+        return True
+    if isinstance(sans, (str, bytes)) or not isinstance(sans, Sequence):
+        return False
+    entries = [str(s).strip().strip("[]") for s in sans]
+    try:
+        wanted = ipaddress.ip_address(stripped)
+    except ValueError:
+        return any(e.lower() == stripped.lower() for e in entries)
+    for entry in entries:
+        try:
+            if ipaddress.ip_address(entry) == wanted:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def registration_problems(
+    info: Any,  # noqa: ANN401 — duck-typed NetworkEndpointInfo, never imported here
+    *,
+    running: bool | None = None,
+) -> tuple[str, ...]:
+    """Reasons the registration built from *info* would not work, in order.
+
+    Returned as operator-facing sentences rather than codes: every one of them
+    is something the person exporting has to read and decide about, and there
+    is exactly one consumer (the UI's export pre-flight). An empty tuple means
+    "nothing here would stop the core connecting".
+
+    Deliberately advisory, not enforcing -- this function refuses nothing.
+    :func:`export_registration` and the ``export-registration`` CLI keep
+    exporting whatever they are asked to, because a scripted export that
+    suddenly started failing would be a worse regression than a registration
+    the operator was warned about. The UI is what turns these into a
+    confirmation step.
+
+    Args:
+        info: A live ``NetworkMCPServer.info()``.
+        running: Whether the endpoint is actually serving. Defaults to
+            ``info.running``; passed explicitly when the caller knows better
+            than the snapshot does.
+    """
+    problems: list[str] = []
+
+    is_running = bool(getattr(info, "running", False)) if running is None else bool(running)
+    if not is_running:
+        problems.append(
+            "The endpoint is not running, so nothing has bound the address in this "
+            "registration. PersonaCore would install the plugin and then fail to "
+            "connect until the endpoint is switched on.",
+        )
+
+    bind_host = str(getattr(info, "bind_host", "") or "")
+    if is_loopback_host(bind_host):
+        problems.append(
+            f"The endpoint is bound to {bind_host!r}, the loopback interface. A "
+            "registration pointing at loopback is reachable only from this "
+            "workstation -- on PersonaCore's machine that address means "
+            "PersonaCore itself. Choose this machine's LAN address instead.",
+        )
+
+    if getattr(info, "port", None) == 0:
+        problems.append(
+            "The port is 0, which asks the operating system to pick a free port at "
+            "every start. The port written into this registration is the one in use "
+            "right now and will be wrong after the next Agent restart. Set a fixed "
+            "port.",
+        )
+
+    raw_sans = getattr(info, "certificate_sans", ()) or ()
+    # Normalised the same way :func:`san_covers` normalises it, so the message
+    # lists what was actually compared. A bare string would otherwise be joined
+    # character by character into "1, 9, 2, ." and read as a corrupt certificate.
+    sans: Sequence[object] = (
+        raw_sans
+        if not isinstance(raw_sans, (str, bytes)) and isinstance(raw_sans, Sequence)
+        else ()
+    )
+    if not san_covers(bind_host, raw_sans):
+        listed = ", ".join(str(s) for s in sans) or "empty"
+        problems.append(
+            f"The certificate does not cover {bind_host!r} (its SAN is {listed}). "
+            "PersonaCore pins the fingerprint rather than checking the name, so it "
+            "will most likely still connect, but any client that verifies hostnames "
+            "will reject this endpoint.",
+        )
+
+    return tuple(problems)

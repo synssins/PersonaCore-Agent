@@ -53,6 +53,41 @@ class AudioConfig(BaseModel):
     output_device: str | None = None
 
 
+class AdbConfig(BaseModel):
+    """Where this workstation's ``adb`` binary lives.
+
+    The ``adb`` capability family resolves its binary in this order: this
+    setting, then ``PATH``, then the usual Android SDK install locations. The
+    plugin runs in a separate low-integrity process and reads ``[adb]
+    binary_path`` straight out of ``config.toml`` with ``tomllib`` rather than
+    importing this package (see ``plugins/adb/__init__.py``); this entry exists
+    so the settings UI has somewhere to write that key, and so the operator
+    never has to open the TOML file to set it.
+
+    Empty means "not configured -- search ``PATH`` and the SDK locations".
+    It is deliberately ``str`` and not ``str | None``: ``config.store`` skips
+    ``None`` values when merging into the TOML document, so a ``None`` would
+    leave a previously-written ``binary_path`` sitting in the file forever and
+    an operator who cleared the field in the UI would find the old path still
+    in force. An empty string is written, and the plugin already treats a
+    blank value as unset.
+    """
+
+    binary_path: str = ""
+
+    @field_validator("binary_path")
+    @classmethod
+    def _strip(cls, v: str) -> str:
+        """Trim surrounding whitespace and the quotes a Windows copy-path adds.
+
+        "Copy as path" in Explorer yields ``"C:\\...\\adb.exe"`` -- quotes
+        included -- and pasting that into the settings field is the single most
+        likely way this value arrives malformed. Stripping them here means the
+        UI, the CLI and a hand-edited file all get the same treatment.
+        """
+        return v.strip().strip('"')
+
+
 class PttConfig(BaseModel):
     """Push-to-talk configuration."""
 
@@ -253,6 +288,7 @@ class AgentConfig(BaseModel):
     wyoming: WyomingConfig = Field(default_factory=WyomingConfig)
     wake: WakeConfig = Field(default_factory=WakeConfig)
     audio: AudioConfig = Field(default_factory=AudioConfig)
+    adb: AdbConfig = Field(default_factory=AdbConfig)
     ptt: PttConfig = Field(default_factory=PttConfig)
     session: SessionConfig = Field(default_factory=SessionConfig)
     update: UpdateConfig = Field(default_factory=UpdateConfig)

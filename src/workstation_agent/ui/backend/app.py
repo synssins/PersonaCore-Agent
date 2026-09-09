@@ -90,8 +90,32 @@ class BackendContext:
 
     network_mcp: Any = field(default=None)
     """workstation_agent.network_mcp.server.NetworkMCPServer (or fake), or
-    None when ``network_mcp.enabled`` is false. Backs the /network-mcp
-    credential surface (contract §3: URL, fingerprint, token, shown once)."""
+    None when no endpoint object exists yet. Backs the /network-mcp
+    credential surface (contract §3: URL, fingerprint, token, shown once).
+
+    **Mutable at runtime.** ``POST /network-mcp/settings`` replaces this with a
+    server built from the newly-saved config, so enabling the endpoint from
+    the UI brings it up without an Agent restart. It is therefore *not* a
+    reliable proxy for "the endpoint is enabled" — a stopped server is kept
+    here after the operator switches the endpoint off, so the page can still
+    show its identity. Ask ``.running`` (or the config) for that.
+    """
+
+    network_mcp_factory: Any = field(default=None)
+    """Optional ``Callable[[NetworkMcpConfig], NetworkMCPServer]``.
+
+    ``None`` (production) means the router builds a real
+    :class:`~workstation_agent.network_mcp.server.NetworkMCPServer` wired to
+    :attr:`mcp_host`. Tests inject a factory returning a fake so the endpoint
+    lifecycle can be exercised without binding a socket."""
+
+    on_network_mcp_change: Any = field(default=None)
+    """Optional ``Callable[[NetworkMCPServer | None], None]``.
+
+    Called whenever the router replaces :attr:`network_mcp`, so the
+    composition root's own handle stays in step and a UI-started endpoint is
+    stopped at shutdown like an autostarted one. Absent (tests, or a backend
+    running standalone) the router simply skips the notification."""
 
     log_dir: Path = field(default_factory=lambda: _appdata_root() / "logs")
     """Directory containing rotated JSONL log files."""

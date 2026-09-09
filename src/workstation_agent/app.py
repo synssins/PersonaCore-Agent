@@ -540,6 +540,20 @@ class Application:
             ok=True, detail=f"{info.url} ({len(info.tool_names)} tools)",
         )
 
+    def _set_network_mcp(self, server: Any) -> None:
+        """Adopt an endpoint the UI created, so shutdown still owns it.
+
+        Called from the FastAPI request that started or rebound the endpoint --
+        which runs on this same asyncio loop, so no cross-thread handoff is
+        needed. Assignment only: stopping the *previous* server is the router's
+        job and has already happened by the time this is called.
+        """
+        self._subs.network_mcp = server
+        detail = "stopped"
+        if server is not None and getattr(server, "running", False):
+            detail = "started from the UI"
+        self._subs.started["network_mcp"] = Health(ok=True, detail=detail)
+
     async def _start_audio_pipeline(self, cfg: Any) -> None:
         from workstation_agent.audio.session import AudioSession, SessionMode
         from workstation_agent.audio.sink import Speaker
@@ -716,6 +730,16 @@ class Application:
             audit_reader=_audit.query,
             current_version=_pkg_version(),
             network_mcp=self._subs.network_mcp,
+            # The Network MCP page can now start, stop and rebind the endpoint
+            # (the operator must never have to edit config.toml to bring it
+            # up). Both this backend and the endpoint are tasks on *this*
+            # loop, so the router's `await server.start()` is a plain await --
+            # but the server it creates is a different object from the one
+            # `_start_network_mcp` may have made, and `_shutdown_async` stops
+            # whatever `_subs.network_mcp` holds. Without this callback a
+            # UI-started endpoint would still be listening after the Agent
+            # exits, because nothing here would know it existed.
+            on_network_mcp_change=self._set_network_mcp,
         )
         app = create_app(ctx)
 
