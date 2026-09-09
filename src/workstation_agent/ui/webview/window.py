@@ -187,7 +187,7 @@ class WebviewWindow:
         self._window.load_url(url)
         try:
             self._window.show()
-        except Exception:  # noqa: BLE001
+        except Exception:
             log.debug("window.show() no-op'd", exc_info=True)
         log.debug("Navigated window to %s", url)
 
