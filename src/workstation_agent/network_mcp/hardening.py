@@ -38,6 +38,44 @@ Two properties hold for every row: **the handler returns, it never raises**, and
 **the server is unharmed** — an individual connection is closed but the listener,
 the session manager and every other connection survive.
 
+The one route that is not behind the token
+------------------------------------------
+``POST /enrol/token`` exists so PersonaCore can push the bearer token it minted
+during enrolment (see ``enrolment.py`` for the handshake). It cannot be behind
+the bearer gate, because the token is the thing being established. That is a real
+change to the posture above — "answer ``401`` from the scope and never read the
+body" no longer holds for every path — so it is bounded separately and far more
+tightly, and it answers **exactly one thing**:
+
+============================  ==================================  =========================
+enrolment input               where it is stopped                 answer
+============================  ==================================  =========================
+correct code, Join pending    :meth:`EnrolmentReceiver.redeem`    ``204``, token in force
+wrong code                    ``compare_digest`` on 32-byte       ``401``, as below
+                              digests, never on raw codes
+no Join pending               same comparison, against a random   ``401``, as below
+                              decoy of the same width
+expired window                monotonic deadline                  ``401``, as below
+code already used             the Join is cleared under a lock    ``401``, as below
+malformed / hostile body      :func:`validate_json_body`, then    ``401``, as below
+                              the same comparison anyway
+non-``POST``                  method check                        ``401``, as below
+carries an ``Origin``         header presence check               ``401``, body never read
+oversized ``Content-Length``  header check                        ``401``, body never read
+too many attempts             fixed-window rate limit             ``401``, body never read
+too many in flight            enrolment in-flight counter         ``401``, body never read
+============================  ==================================  =========================
+
+"As below" is literal. Every refusal goes through :meth:`Hardening._refuse`, the
+same helper that answers every bearerless request to every other path, so a
+refused enrolment push is byte-identical to what a stranger gets for ``GET /``:
+``401``, empty body, ``WWW-Authenticate: Bearer``. Nothing in the answer says
+whether a Join is in progress, which is the property contract-side asked for
+explicitly. The body is read **whether or not a Join is pending**, and
+``redeem`` runs its comparison on every path including the malformed one, for
+the same reason: refusing early — because there is no Join, or because the body
+would not parse — would make the timing itself the disclosure.
+
 The four B0 crash classes, mapped
 ---------------------------------
 1. ``compare_digest`` raising ``TypeError`` on non-ASCII ``str``. Gone by
@@ -71,7 +109,13 @@ import logging
 import re
 import secrets
 import time
-from typing import Any, Final
+from collections import deque
+from typing import TYPE_CHECKING, Any, Final
+
+if TYPE_CHECKING:  # pragma: no cover
+    # Type-checking only, so there is no runtime import cycle: ``enrolment``
+    # imports :func:`validate_json_body` from here.
+    from workstation_agent.network_mcp.enrolment import EnrolmentReceiver
 
 log = logging.getLogger(__name__)
 
@@ -110,6 +154,53 @@ DEFAULT_MAX_SESSIONS: Final = 8
 DEFAULT_SESSION_IDLE_TIMEOUT: Final = 300.0
 
 _ALLOWED_METHODS: Final = frozenset({"POST", "GET", "DELETE"})
+
+# -- bounds for the one unauthenticated route -------------------------------
+# Separate constants rather than reuse of the post-authentication ones above,
+# because these bound work done for a peer who has proved nothing. Each is
+# roughly two orders of magnitude tighter than its authenticated counterpart.
+
+#: Body ceiling for an enrolment push. ``{"code": ..., "token": ...}`` with the
+#: widest values ``enrolment.py`` accepts is under 700 bytes; 4 KiB is generous
+#: for a field that may grow and still small enough that the worst an anonymous
+#: peer can make this process hold is ``ENROL_MAX_CONCURRENT`` * 4 KiB.
+ENROL_MAX_BODY_BYTES: Final = 4 * 1024
+
+#: Seconds an enrolment push gets to finish streaming. Shorter than the
+#: authenticated timeout: this body is small and arrives from a core on the same
+#: LAN, so a slow send is a slow-loris rather than a large upload.
+#:
+#: Also, and separately, it must stay **under the core's 10-second read
+#: timeout**. A bound above that would make the worst case a core that gives up
+#: on an enrolment this endpoint was still willing to complete.
+ENROL_BODY_READ_TIMEOUT: Final = 5.0
+
+#: Enrolment pushes read concurrently. The core sends exactly one; anything past
+#: two at once is not the core.
+ENROL_MAX_CONCURRENT: Final = 2
+
+#: Fixed-window rate limit on enrolment pushes: at most this many in any
+#: :data:`ENROL_RATE_WINDOW` seconds, counted across all peers because the
+#: attacker picks their own source address.
+#:
+#: Chosen to leave brute force out of reach without denying the core its one
+#: push: a 300-second window allows ~600 attempts, against a code space of at
+#: least 36**6 given :data:`~workstation_agent.network_mcp.enrolment.MIN_CODE_CHARS`.
+#: A flood *can* delay the core's push into a later window; it cannot exhaust the
+#: window, because the limit refuses without reading a body or allocating.
+ENROL_MAX_ATTEMPTS: Final = 20
+ENROL_RATE_WINDOW: Final = 10.0
+
+#: The answer to a successful enrolment push. The core treats any 2xx as
+#: success and never reads the body, so ``204 No Content`` is the exact thing
+#: being said. A ``3xx`` would be read as a *failure* — the core's client does
+#: not follow redirects — so this route never produces one.
+ENROL_SUCCESS_STATUS: Final = 204
+
+#: The single reason string logged for every enrolment refusal. One string, on
+#: purpose: a log that distinguished "wrong code" from "no Join pending" would
+#: put back, in a file, the disclosure the response shape is careful not to make.
+_ENROL_REASON: Final = "enrolment push refused"
 
 #: A lone surrogate cannot appear as raw bytes in a body that already decoded as
 #: strict UTF-8, so the only way to smuggle one in is a ``\uD800``-``\uDFFF``
@@ -247,6 +338,16 @@ def validate_json_body(  # noqa: PLR0911 — one return per rejected input class
     return None
 
 
+def _has_header(headers: list[tuple[bytes, bytes]], name: bytes) -> bool:
+    """True if *name* appears at all, however many times.
+
+    Distinct from :func:`_single_header`, which treats a duplicate as absent.
+    Used where the *presence* of a header is itself disqualifying, and where
+    "send it twice" must therefore not be a way around the check.
+    """
+    return any(key == name for key, _ in headers)
+
+
 def _single_header(headers: list[tuple[bytes, bytes]], name: bytes) -> bytes | None:
     """Return the sole value of *name*, or None if absent or duplicated.
 
@@ -282,6 +383,14 @@ class Hardening:
             counting against ``max_sessions``. **Must be the value the SDK's
             session manager reaps on**, or the two views of "live session"
             diverge.
+        enrolment: Optional
+            :class:`~workstation_agent.network_mcp.enrolment.EnrolmentReceiver`.
+            When given, ``POST`` to its ``path`` is answered *ahead of* the
+            bearer check — the only route on this endpoint that is. ``None``
+            means the route does not exist at all; a receiver with no pending
+            Join means it behaves as though it does not, which is a different
+            statement and the one that matters, since the two must be
+            indistinguishable from outside.
     """
 
     def __init__(  # noqa: PLR0913 — each argument is a separately justified bound
@@ -296,6 +405,7 @@ class Hardening:
         body_read_timeout: float = DEFAULT_BODY_READ_TIMEOUT,
         max_sessions: int = DEFAULT_MAX_SESSIONS,
         session_idle_timeout: float = DEFAULT_SESSION_IDLE_TIMEOUT,
+        enrolment: EnrolmentReceiver | None = None,
     ) -> None:
         self._app = app
         # Pre-encoded once, at construction, from *our own* token. The token is
@@ -315,6 +425,13 @@ class Hardening:
         #: Session id -> monotonic time of last activity. Mirrors the SDK's own
         #: session map; see :meth:`_session_gate`.
         self._sessions: dict[bytes, float] = {}
+        self._enrolment = enrolment
+        #: Enrolment pushes currently being read. Counted separately from
+        #: ``_in_flight``, which by design only ever counts authenticated work.
+        self._enrol_in_flight = 0
+        #: Monotonic timestamps of recent enrolment attempts, for the fixed
+        #: window rate limit. Bounded by :data:`ENROL_MAX_ATTEMPTS`.
+        self._enrol_attempts: deque[float] = deque()
 
     # -- observability ---------------------------------------------------
 
@@ -454,6 +571,20 @@ class Hardening:
 
         headers: list[tuple[bytes, bytes]] = scope.get("headers", [])
 
+        # --- enrolment, the one route ahead of the token ------------------
+        # Ahead of the bearer check because the token it carries is the token
+        # being established; there is nothing yet to authenticate with. Behind
+        # the transport check because the whole handshake depends on the core
+        # having pinned this endpoint's certificate — a push over plaintext is
+        # not the core, and is refused as 403 with everything else plaintext.
+        #
+        # Everything past this point is unchanged for every other path: the
+        # bearer gate below still runs for /mcp and for anything else, and a
+        # pending Join does not open any of it.
+        if self._enrolment is not None and scope.get("path") == self._enrolment.path:
+            await self._enrol(scope, headers, receive, send)
+            return
+
         # --- authentication, before anything an anonymous peer could map --
         # Ahead of the path and method checks on purpose. Answering 404 for an
         # unknown path and 405 for an unknown method *before* checking the token
@@ -464,11 +595,7 @@ class Hardening:
         authorization = _single_header(headers, b"authorization")
         if not self._token_ok(authorization):
             self._reject_log(scope, 401, "bad or missing bearer token")
-            # Contract §3: 401, no body detail.
-            await _respond(
-                send, 401,
-                extra_headers=[(b"www-authenticate", b"Bearer")],
-            )
+            await self._refuse(send)
             return
 
         if scope.get("path") != self._path:
@@ -540,6 +667,148 @@ class Hardening:
         finally:
             self._in_flight -= 1
 
+    async def _refuse(self, send: Any) -> None:
+        """The single unauthenticated answer this endpoint ever gives.
+
+        Contract §3: ``401``, no body detail. Every caller that refuses without
+        proof of identity goes through here rather than composing its own — the
+        bearer gate, and every enrolment refusal. That is not tidiness: it is how
+        "a wrong pairing code, an expired window and no Join at all are
+        indistinguishable" is *held* rather than merely intended. There is one
+        response to keep identical, so there is nothing to drift.
+        """
+        await _respond(send, 401, extra_headers=[(b"www-authenticate", b"Bearer")])
+
+    def set_token(self, token: str) -> None:
+        """Replace the expected bearer token while the endpoint is serving.
+
+        Called when an enrolment push is accepted, so the token PersonaCore
+        minted is in force for the very next request rather than after a
+        restart. In-flight requests that already cleared the gate are unaffected;
+        anything presenting the previous token from here on gets the same
+        ``401`` as a stranger, which is the intended meaning of enrolling.
+
+        Args:
+            token: Printable-ASCII token.
+                :func:`~workstation_agent.network_mcp.enrolment._acceptable_token`
+                has already established that of anything arriving over the wire.
+
+        Raises:
+            UnicodeEncodeError: if *token* is not ASCII. Deliberately not caught
+                here: a token this cannot encode is one
+                :meth:`_token_ok` could never match, so silently keeping the old
+                one would leave the endpoint claiming an enrolment that did not
+                happen.
+        """
+        self._expected_token = token.encode("ascii")
+
+    # -- enrolment (the one unauthenticated route) ------------------------
+
+    def _enrol_rate_ok(self) -> bool:
+        """Concurrency and fixed-window rate limit for enrolment pushes.
+
+        Checked *before* the body is read, so exceeding either costs this
+        process nothing. Both limits are independent of whether a Join is
+        pending — a limit that only applied mid-enrolment would itself be the
+        disclosure.
+        """
+        if self._enrol_in_flight >= ENROL_MAX_CONCURRENT:
+            return False
+        now = self._now()
+        window = self._enrol_attempts
+        while window and window[0] <= now - ENROL_RATE_WINDOW:
+            window.popleft()
+        if len(window) >= ENROL_MAX_ATTEMPTS:
+            return False
+        window.append(now)
+        return True
+
+    async def _enrol(
+        self, scope: Scope, headers: list[tuple[bytes, bytes]], receive: Any, send: Any,
+    ) -> None:
+        """Answer ``POST /enrol/token``. Returns for every input; never raises.
+
+        Success is the only outcome with its own shape. Everything else — a
+        wrong method, an oversized declaration, a body that never finishes
+        arriving, a malformed body, a wrong code, an expired window, no Join at
+        all — is :meth:`_refuse`, byte for byte.
+        """
+        receiver = self._enrolment
+        if receiver is None:  # pragma: no cover — the caller checked
+            await self._refuse(send)
+            return
+
+        # The method check and the limits come first because they are decided
+        # from the scope alone and cost nothing, and because neither answer
+        # depends on the Join: a peer learns only what it already knew about its
+        # own request rate.
+        # ``Origin`` is refused outright, and its mere presence is enough.
+        #
+        # The SDK's DNS-rebinding protection lives inside the app this route is
+        # answered *in front of*, so this route does not inherit it. The vector
+        # that matters is a page in the owner's browser POSTing here — a JSON
+        # body is reachable cross-origin as a "simple request", and while the
+        # page could not read the reply, a guessed code would still enrol.
+        # PersonaCore is an HTTP client, not a browser: it sends no ``Origin``,
+        # and a browser always sends one on a cross-origin POST. Refusing on
+        # presence costs the core nothing and removes the browser entirely.
+        # ``_has_header`` rather than ``_single_header`` so sending it twice is
+        # not the way around it.
+        if (
+            scope.get("method") != "POST"
+            or _has_header(headers, b"origin")
+            or not self._enrol_rate_ok()
+        ):
+            self._reject_log(scope, 401, _ENROL_REASON)
+            await self._refuse(send)
+            return
+
+        declared = _single_header(headers, b"content-length")
+        if declared is not None and not _within(declared, ENROL_MAX_BODY_BYTES):
+            # 401 rather than the 413 the authenticated path gives: this route
+            # has exactly one refusal, and a 413 here would say "you found the
+            # enrolment route" to anyone who sent a large body.
+            self._reject_log(scope, 401, _ENROL_REASON)
+            await self._refuse(send)
+            return
+
+        self._enrol_in_flight += 1
+        try:
+            raw, status, _reason = await self._drain(
+                receive,
+                max_bytes=ENROL_MAX_BODY_BYTES,
+                read_timeout=ENROL_BODY_READ_TIMEOUT,
+            )
+            if raw is None:
+                if status != _DISCONNECTED:
+                    self._reject_log(scope, 401, _ENROL_REASON)
+                    await self._refuse(send)
+                # status == _DISCONNECTED: the peer is gone; nobody to answer.
+                return
+
+            try:
+                accepted = await receiver.redeem(raw)
+            except Exception:  # pragma: no cover — redeem() is written not to raise
+                # Belt. A receiver that raised would otherwise become a 500 from
+                # uvicorn, which is a response shape this route does not have and
+                # would announce the route's existence.
+                log.exception("network MCP enrolment receiver raised; refusing")
+                accepted = False
+
+            if accepted:
+                # 204, exactly. The core reads the status code and nothing else
+                # — any 2xx is success and it streams the body away without
+                # parsing it — so the precise answer against a tolerant reader
+                # is "succeeded, nothing to say". And never a 3xx: the core's
+                # client has redirects disabled and would read one as a failed
+                # enrolment.
+                await _respond(send, ENROL_SUCCESS_STATUS)
+                return
+            self._reject_log(scope, 401, _ENROL_REASON)
+            await self._refuse(send)
+        finally:
+            self._enrol_in_flight -= 1
+
     def _token_ok(self, authorization: bytes | None) -> bool:
         """Constant-time bearer check on raw bytes.
 
@@ -557,25 +826,42 @@ class Hardening:
             return False
         return secrets.compare_digest(credentials.strip(), self._expected_token)
 
-    async def _drain(self, receive: Any) -> tuple[bytes | None, int, str]:
+    async def _drain(
+        self,
+        receive: Any,
+        *,
+        max_bytes: int | None = None,
+        read_timeout: float | None = None,
+    ) -> tuple[bytes | None, int, str]:
         """Read the body under a byte bound and a time bound.
 
         Returns ``(body, 0, "")`` on success. On failure the body is ``None``
         and the status is either an HTTP status to answer with or
         :data:`_DISCONNECTED`, meaning the peer vanished mid-body and there is
         nobody left to answer.
+
+        Args:
+            receive: The ASGI ``receive`` callable.
+            max_bytes: Byte ceiling; the instance's authenticated bound if
+                omitted. The enrolment route passes its own, much smaller one.
+            read_timeout: Seconds allowed for the whole read; the instance's
+                authenticated bound if omitted. Named for the thing it bounds
+                rather than plain ``timeout``, which ``ASYNC109`` reads as an
+                invitation for the caller to supply its own cancellation.
         """
+        limit = self._max_body_bytes if max_bytes is None else max_bytes
+        deadline = self._body_read_timeout if read_timeout is None else read_timeout
         chunks: list[bytes] = []
         total = 0
         try:
-            async with asyncio.timeout(self._body_read_timeout):
+            async with asyncio.timeout(deadline):
                 while True:
                     message = await receive()
                     if message["type"] == "http.disconnect":
                         return None, _DISCONNECTED, "client disconnected"
                     body: bytes = message.get("body", b"")
                     total += len(body)
-                    if total > self._max_body_bytes:
+                    if total > limit:
                         # Abort mid-stream rather than buffering the rest to
                         # reply politely.
                         return None, 413, "request too large"
@@ -591,6 +877,24 @@ class Hardening:
 
 #: Sentinel status: the peer went away, so no response is possible or wanted.
 _DISCONNECTED: Final = -1
+
+#: The one status this module sends that must carry no ``Content-Length``.
+_NO_CONTENT: Final = 204
+
+
+def _within(declared: bytes, ceiling: int) -> bool:
+    """True if a raw ``Content-Length`` header parses and is within *ceiling*.
+
+    Returns ``False`` for anything unparseable, negative or too large, so the
+    caller has one answer to give rather than three. The authenticated path
+    deliberately keeps its own three-way handling (``400`` vs ``413``), which is
+    useful information to give a peer that has already proved who it is.
+    """
+    try:
+        length = int(declared)
+    except ValueError:
+        return False
+    return 0 <= length <= ceiling
 
 
 def _replaying(raw: bytes, receive: Any) -> Any:
@@ -621,12 +925,17 @@ async def _respond(
     """Send a minimal response and close the connection.
 
     ``Connection: close`` is deliberate: a peer we just rejected does not get to
-    keep a slot on a keep-alive connection.
+    keep a slot on a keep-alive connection. The enrolment success answer uses it
+    too — the core pushes once and is done, and closing means a push cannot hold
+    a connection open past the Join it just consumed.
+
+    ``204`` is framed without ``Content-Length``: RFC 9110 forbids one on a
+    response that cannot have content, and h11 — the parser this endpoint pins —
+    enforces that rather than tolerating it.
     """
-    headers: list[tuple[bytes, bytes]] = [
-        (b"content-length", str(len(body)).encode("ascii")),
-        (b"connection", b"close"),
-    ]
+    headers: list[tuple[bytes, bytes]] = [(b"connection", b"close")]
+    if status != _NO_CONTENT:
+        headers.insert(0, (b"content-length", str(len(body)).encode("ascii")))
     if body:
         headers.append((b"content-type", b"text/plain; charset=utf-8"))
     if extra_headers:

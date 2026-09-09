@@ -154,6 +154,44 @@
 {% endif %}
 
 <section>
+  <h2>Enrol with PersonaCore</h2>
+  <p>Instead of copying the token and fingerprint by hand: in PersonaCore press
+    <strong>+ Add a workstation</strong>, read the pairing code it shows, type it
+    below and press Join. PersonaCore then sends this workstation the token it
+    minted, over this endpoint's own HTTPS connection.</p>
+
+  {% if join_error %}<p class="error">{{ join_error }}</p>{% endif %}
+  {% if join_notice %}<p class="success">{{ join_notice }}</p>{% endif %}
+
+  {% if not can_join %}
+    <p>Switch the endpoint on above first — PersonaCore needs somewhere to send
+      the token.</p>
+  {% elif join %}
+    <p class="success">A join is open. It closes in about
+      {{ join.expires_in | round | int }} seconds if PersonaCore has not sent the
+      token by then.
+      {% if join.attempts %}
+        <br><strong>{{ join.attempts }}</strong> attempt(s) have been made against
+        this join so far. If PersonaCore has not finished, something else on the
+        network is trying codes — cancel and start again.
+      {% endif %}
+    </p>
+    <form method="post" action="/network-mcp/join/cancel">
+      <button type="submit">Cancel Join</button>
+    </form>
+  {% else %}
+    <form method="post" action="/network-mcp/join">
+      <label for="nm-code">Pairing code from PersonaCore:</label>
+      <!-- Always rendered empty, on every outcome including failures: a code
+           echoed back into the page is a code in a screenshot. -->
+      <input type="text" id="nm-code" name="code" value=""
+             autocomplete="off" spellcheck="false" placeholder="code from the console">
+      <button type="submit">Join</button>
+    </form>
+  {% endif %}
+</section>
+
+<section>
   <h2>Export registration</h2>
   <p>Produces <code>workstation-registration.zip</code> for PersonaCore's Plugins
     page. It carries this endpoint's URL and fingerprint, and never the token.</p>

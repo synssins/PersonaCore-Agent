@@ -8,6 +8,7 @@ from pydantic import ValidationError
 from workstation_agent.config.schema import (
     AgentConfig,
     LlmConfig,
+    PluginsConfig,
     SessionConfig,
     WyomingConfig,
     default,
@@ -78,3 +79,20 @@ def test_agent_config_round_trip() -> None:
     restored = AgentConfig.model_validate(data)
     assert restored.wyoming.port == cfg.wyoming.port
     assert restored.session.mode == cfg.session.mode
+
+
+def test_allow_unsigned_defaults_to_false() -> None:
+    """``plugins.allow_unsigned`` must never default to ``True``.
+
+    This is the Ed25519 signature bypass: a plugin that fails verification
+    is spawned anyway when it is on. It has a UI toggle
+    (``/plugins`` — see ``plugins_routes.py``) that requires deliberate
+    confirmation to turn on and persists frictionlessly when turned back
+    off, but nothing about that toggle stops the *default* from silently
+    becoming unsafe if someone edits this schema later. Guard it explicitly:
+    a fresh install, an unconfigured ``PluginsConfig()``, and a bare
+    ``AgentConfig()`` must all start with signature verification enabled.
+    """
+    assert PluginsConfig().allow_unsigned is False
+    assert AgentConfig().plugins.allow_unsigned is False
+    assert default().plugins.allow_unsigned is False

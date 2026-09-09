@@ -7,16 +7,54 @@ from __future__ import annotations
 
 import contextlib
 import logging
-from typing import Annotated, Any
+from typing import TYPE_CHECKING, Annotated, Any
 
 from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse
 
+from workstation_agent.mcp_host.loader import TRUSTED_PUBKEYS, discover, verify
 from workstation_agent.ui.backend.app import BackendContext, get_context, templates
+
+if TYPE_CHECKING:
+    from workstation_agent.config.schema import AgentConfig
 
 log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/plugins", tags=["plugins"])
+
+_TRUTHY = {"true", "1", "yes", "on"}
+
+
+def _signature_overview(cfg: AgentConfig | None) -> dict[str, Any]:
+    """Compute the real, current signature-verification picture.
+
+    Calls :func:`loader.discover` and :func:`loader.verify` directly against
+    whatever plugins are actually installed, verified under *cfg*'s current
+    ``allow_unsigned``. Deliberately independent of whether an ``MCPHost`` is
+    running: the toggle's banner and confirmation text describe what would
+    really happen, not a static description of the setting, and this stays
+    accurate even before any host has started.
+    """
+    allow_unsigned = cfg.plugins.allow_unsigned if cfg is not None else False
+    affected: list[dict[str, str]] = []
+    try:
+        manifests = discover()
+    except Exception:
+        log.exception("plugin discovery failed while building signature overview")
+        manifests = []
+    for manifest in manifests:
+        try:
+            result = verify(manifest, TRUSTED_PUBKEYS, allow_unsigned=allow_unsigned)
+        except Exception:
+            log.exception("verify failed for plugin=%s", manifest.id)
+            continue
+        if result.status in {"unsigned", "quarantined"}:
+            affected.append({
+                "id": manifest.id,
+                "name": manifest.name,
+                "status": result.status,
+            })
+    return {"allow_unsigned": allow_unsigned, "affected": affected}
 
 
 def _update_plugin_config(ctx: BackendContext, plugin_id: str, **kwargs: object) -> None:
@@ -49,8 +87,72 @@ async def plugins_list(
             cfg = ctx.config_store.load()
 
     return templates.TemplateResponse(
-        request, "plugins.html", {"plugins": plugins, "cfg": cfg, "errors": {}},
+        request,
+        "plugins.html",
+        {"plugins": plugins, "cfg": cfg, "errors": {}, "sig": _signature_overview(cfg)},
     )
+
+
+@router.post("/signature-verification/enable")
+async def signature_verification_enable(
+    ctx: Annotated[BackendContext, Depends(get_context)],
+) -> RedirectResponse:
+    """Turn signature verification back on (the safe direction).
+
+    Returning to the safe state is frictionless by design: no confirmation,
+    one click. Only *disabling* verification (allowing unsigned plugins)
+    requires the deliberate confirmation step below.
+    """
+    if ctx.config_store is not None:
+        cfg = ctx.config_store.load()
+        cfg.plugins.allow_unsigned = False
+        ctx.config_store.save(cfg)
+    log.info("signature verification re-enabled (allow_unsigned=False)")
+    return RedirectResponse(url="/plugins", status_code=303)
+
+
+@router.post("/signature-verification/disable", response_model=None)
+async def signature_verification_disable(
+    request: Request,
+    ctx: Annotated[BackendContext, Depends(get_context)],
+    confirm: Annotated[str, Form()] = "",
+) -> HTMLResponse | RedirectResponse:
+    """Allow unsigned plugins to run — the dangerous direction.
+
+    The gate is server-side, not a client-side ``confirm()``: a request that
+    omits ``confirm=true`` (the first click, or a script posting straight to
+    this endpoint) never touches the config. It instead re-renders the page
+    with the real, current list of plugins this would newly let run
+    unverified, and a second form carrying ``confirm=true`` that the operator
+    must submit deliberately.
+    """
+    cfg = None
+    if ctx.config_store is not None:
+        with contextlib.suppress(Exception):
+            cfg = ctx.config_store.load()
+
+    if confirm.strip().lower() not in _TRUTHY:
+        plugins: list[Any] = []
+        if ctx.mcp_host is not None:
+            with contextlib.suppress(Exception):
+                plugins = await ctx.mcp_host.plugins()
+        return templates.TemplateResponse(
+            request,
+            "plugins.html",
+            {
+                "plugins": plugins,
+                "cfg": cfg,
+                "errors": {},
+                "sig": _signature_overview(cfg),
+                "signature_confirm_pending": True,
+            },
+        )
+
+    if ctx.config_store is not None and cfg is not None:
+        cfg.plugins.allow_unsigned = True
+        ctx.config_store.save(cfg)
+    log.warning("signature verification disabled (allow_unsigned=True) — unsigned plugins allowed")
+    return RedirectResponse(url="/plugins", status_code=303)
 
 
 @router.post("/{plugin_id}/enable")
@@ -124,6 +226,7 @@ async def plugin_install_file(
                     "install": "Unsigned plugin installation requires explicit acknowledgment. "
                     "Set acknowledged=true to proceed.",
                 },
+                "sig": _signature_overview(cfg),
             },
             status_code=400,
         )

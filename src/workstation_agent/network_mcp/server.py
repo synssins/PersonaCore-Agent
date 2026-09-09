@@ -39,7 +39,13 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final
 
 from workstation_agent.network_mcp.certs import CertificateInfo, ensure_certificate
-from workstation_agent.network_mcp.credentials import ensure_token
+from workstation_agent.network_mcp.credentials import ensure_token, store_token
+from workstation_agent.network_mcp.enrolment import (
+    DEFAULT_JOIN_TTL,
+    EnrolmentError,
+    EnrolmentReceiver,
+    JoinStatus,
+)
 from workstation_agent.network_mcp.hardening import (
     MAX_HEADER_BYTES,
     Hardening,
@@ -124,6 +130,11 @@ class NetworkMCPServer:
         self._task: asyncio.Task[None] | None = None
         self._port: int = config.port
         self._hardening: Hardening | None = None
+        #: The enrolment window and the receiver for the token PersonaCore
+        #: pushes into it. Built here rather than in :meth:`_build_app` so a Join
+        #: is not silently dropped by a stop/start, and held only in memory so
+        #: it *is* dropped by a restart — see ``enrolment.py``.
+        self._enrolment = EnrolmentReceiver(apply_token=self._accept_pushed_token)
 
     # -- lifecycle -------------------------------------------------------
 
@@ -282,6 +293,105 @@ class NetworkMCPServer:
         )
         return self._cert
 
+    # -- enrolment (contract amendment: the core pushes us a token) --------
+
+    def begin_join(
+        self, code: str, *, ttl_seconds: float = DEFAULT_JOIN_TTL,
+    ) -> JoinStatus:
+        """Open the enrolment window PersonaCore will push a token into.
+
+        The owner reads a pairing code off the core's console, types it here and
+        presses Join; the core then pushes the token it minted to
+        ``POST /enrol/token`` on *this* endpoint, over HTTPS, pinned to the
+        fingerprint the Agent supplied. See ``enrolment.py`` for the handshake.
+
+        **The reachability checks are the point of doing this here** rather than
+        in the UI. A window opened around an endpoint that is stopped, or bound
+        to loopback, is a window nothing can reach: the owner would type the
+        code, watch a countdown, and be told nothing until it expired. Saying so
+        now is the difference between a five-second correction and a five-minute
+        mystery.
+
+        Args:
+            code: The pairing code the core is showing.
+            ttl_seconds: How long the window stays open.
+
+        Returns:
+            The pending window's :class:`~...enrolment.JoinStatus`. It carries no
+            code.
+
+        Raises:
+            EnrolmentError: if the endpoint cannot receive a push, or the code is
+                not one that can secure a window. The message is written to be
+                shown to the owner verbatim.
+        """
+        if not self.running:
+            msg = (
+                "The endpoint is not running, so PersonaCore has nothing to push the "
+                "token to. Switch it on, wait for it to report that it is listening, "
+                "then join."
+            )
+            raise EnrolmentError(msg)
+
+        from workstation_agent.registration_export import is_loopback_host
+
+        host = self._config.bind_host
+        if is_loopback_host(host):
+            msg = (
+                f"The endpoint is bound to {host}, which is this machine only. "
+                f"PersonaCore runs elsewhere and cannot reach it to push the token. "
+                f"Bind a LAN address first, then join."
+            )
+            raise EnrolmentError(msg)
+
+        return self._enrolment.open_join(code, ttl_seconds=ttl_seconds)
+
+    def cancel_join(self) -> None:
+        """Close any pending enrolment window. Safe when there is none."""
+        self._enrolment.cancel_join()
+
+    def join_status(self) -> JoinStatus | None:
+        """The pending enrolment window, or ``None``. Never carries the code."""
+        return self._enrolment.status()
+
+    def _accept_pushed_token(self, token: str) -> bool:
+        """Install a token PersonaCore pushed. Returns True once it is in force.
+
+        Persist first, then swap. The order is load-bearing in both directions:
+
+        * If the write fails, nothing has changed — the previous token still
+          works, the Join stays open, and the core is refused rather than told a
+          success it would immediately persist against.
+        * If the write succeeds, a restart reads the same value back
+          (:func:`ensure_token` reads this file), so the core's stored token and
+          ours cannot disagree across a reboot.
+
+        The token itself is never logged, and never reaches the audit database:
+        no path from here writes an audit row, which is deliberate. That
+        database truncates ``args_json`` to 200 characters, and truncation is
+        not redaction — a 64-character token would survive it whole.
+        """
+        try:
+            store_token(token, self._state_dir)
+        except (OSError, ValueError):
+            # No exc_info: a traceback from the write path can carry the path but
+            # a ValueError's message here would be about the value.
+            log.error(  # noqa: TRY400 — see above; a traceback is the leak risk
+                "network MCP enrolment: the pushed token could not be stored, "
+                "so the push was refused. Check that the endpoint's state "
+                "directory is writable.",
+            )
+            return False
+
+        self._token = token
+        if self._hardening is not None:
+            self._hardening.set_token(token)
+        log.info(
+            "network MCP enrolment: a token issued by PersonaCore is now the "
+            "bearer this endpoint requires",
+        )
+        return True
+
     # -- the ASGI app ----------------------------------------------------
 
     def _build_app(self, token: str) -> Any:
@@ -386,6 +496,11 @@ class NetworkMCPServer:
             # reaps with, so the two views of "live session" cannot disagree.
             max_sessions=self._config.max_sessions,
             session_idle_timeout=self._config.session_idle_seconds,
+            # The one route ahead of the bearer gate. Always mounted, never
+            # "enabled": whether it answers depends solely on whether a Join is
+            # pending, and with none it refuses exactly as an unknown path does.
+            # Mounting it conditionally would make its presence observable.
+            enrolment=self._enrolment,
         )
         return self._hardening
 

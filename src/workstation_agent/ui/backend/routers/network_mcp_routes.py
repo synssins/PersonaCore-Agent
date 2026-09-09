@@ -25,6 +25,19 @@ again -- no config file, no command line:
   pre-flight (:func:`registration_problems`) reads the *live* endpoint, so a
   registration for a stopped endpoint, or one pointing at loopback, is
   reported before it is written rather than discovered on the core.
+* **Opening the enrolment window.** ``POST /network-mcp/join`` takes the pairing
+  code the owner read off PersonaCore's console and hands it to
+  :meth:`NetworkMCPServer.begin_join`; the core then pushes the token it minted
+  to the endpoint's own ``POST /enrol/token``. See
+  ``network_mcp/enrolment.py`` for the handshake and why the code lives in
+  memory only.
+
+  **The code is never echoed back into the page and never logged**, here or
+  anywhere below. The field is rendered empty on every outcome, including the
+  failures — a re-rendered form that helpfully preserves what the owner typed is
+  a pairing code sitting in a page, in a webview, in a screenshot. Nor does any
+  of this reach the audit database, whose ``args_json`` is *truncated* to 200
+  characters, which is not the same thing as redacted.
 """
 
 from __future__ import annotations
@@ -40,6 +53,7 @@ from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from pydantic import ValidationError
 
 from workstation_agent.config.schema import NetworkMcpConfig
+from workstation_agent.network_mcp.enrolment import EnrolmentError
 from workstation_agent.registration_export import (
     REGISTRATION_ZIP_NAME,
     export_registration_from_endpoint,
@@ -219,6 +233,24 @@ def _consume_reveals(info: Any) -> tuple[bool, bool, str | None]:  # noqa: ANN40
         )
 
 
+def _join_status(server: Any) -> Any:  # noqa: ANN401
+    """The pending enrolment window, or ``None``.
+
+    ``getattr`` rather than attribute access for the same reason ``_read_info``
+    uses it: ``ctx.network_mcp`` is whatever was injected, and a stub without
+    this method must render a page without a Join section rather than 500 the
+    whole settings screen.
+    """
+    status = getattr(server, "join_status", None)
+    if not callable(status):
+        return None
+    try:
+        return status()
+    except Exception:
+        log.warning("network-mcp: join_status() failed", exc_info=True)
+        return None
+
+
 def _render(  # noqa: PLR0913 — one parameter per independent page outcome
     request: Request,
     ctx: BackendContext,
@@ -230,6 +262,8 @@ def _render(  # noqa: PLR0913 — one parameter per independent page outcome
     export_result: Any = None,  # noqa: ANN401
     export_problems: tuple[str, ...] = (),
     export_error: str | None = None,
+    join_error: str | None = None,
+    join_notice: str | None = None,
 ) -> HTMLResponse:
     """Render ``network_mcp.html`` for every outcome this router produces.
 
@@ -305,6 +339,12 @@ def _render(  # noqa: PLR0913 — one parameter per independent page outcome
             "export_error": export_error,
             "export_path": str(last_export),
             "have_previous_export": have_export,
+            # enrolment. ``join`` never carries the pairing code, and no
+            # template variable holds it: see this module's docstring.
+            "join": _join_status(ctx.network_mcp),
+            "join_error": join_error,
+            "join_notice": join_notice,
+            "can_join": callable(getattr(ctx.network_mcp, "begin_join", None)),
         },
     )
 
@@ -615,6 +655,77 @@ async def regenerate_certificate(
         with contextlib.suppress(Exception):
             ctx.network_mcp.regenerate_certificate()
         log.info("network-mcp: certificate regenerated")
+    return RedirectResponse(url="/network-mcp", status_code=303)
+
+
+# ---------------------------------------------------------------------------
+# Enrolment: opening the window PersonaCore pushes a token into
+# ---------------------------------------------------------------------------
+
+
+@router.post("/join", response_class=HTMLResponse, response_model=None)
+async def join_post(
+    request: Request,
+    ctx: Annotated[BackendContext, Depends(get_context)],
+    code: Annotated[str, Form(alias="code")] = "",
+) -> HTMLResponse:
+    """Open the enrolment window for the pairing code the owner typed.
+
+    Declared as ``str`` with a default for the same reason every other field on
+    this page is: FastAPI answers a missing form field with a 422 JSON body,
+    which is a dead end in a webview with no way back to the form.
+
+    Nothing here logs, echoes or stores *code*. It goes straight to
+    :meth:`NetworkMCPServer.begin_join`, which keeps it in memory as bytes for
+    the length of the window and nowhere else.
+    """
+    server = ctx.network_mcp
+    begin = getattr(server, "begin_join", None)
+    if server is None or not callable(begin):
+        return _render(
+            request,
+            ctx,
+            join_error=(
+                "There is no endpoint to enrol yet. Switch it on above, then join."
+            ),
+        )
+
+    try:
+        begin(code)
+    except EnrolmentError as exc:
+        # The receiver writes these to be read by the owner, so the message is
+        # passed through as-is rather than wrapped in framing of our own.
+        return _render(request, ctx, join_error=str(exc))
+    except Exception as exc:  # noqa: BLE001 — reported on the page, never raised
+        log.warning("network-mcp: could not open the enrolment window: %s", exc)
+        return _render(
+            request,
+            ctx,
+            join_error=f"Could not open the enrolment window: {exc}",
+        )
+
+    # Deliberately no code, no length, no prefix in this line.
+    log.info("network-mcp: enrolment window opened from the UI")
+    return _render(
+        request,
+        ctx,
+        join_notice=(
+            "Waiting for PersonaCore to send the token. Finish adding this "
+            "workstation there; this page will show it once it arrives."
+        ),
+    )
+
+
+@router.post("/join/cancel")
+async def join_cancel(
+    ctx: Annotated[BackendContext, Depends(get_context)],
+) -> RedirectResponse:
+    """Close the enrolment window without waiting for it to expire."""
+    cancel = getattr(ctx.network_mcp, "cancel_join", None)
+    if callable(cancel):
+        with contextlib.suppress(Exception):
+            cancel()
+        log.info("network-mcp: enrolment window closed from the UI")
     return RedirectResponse(url="/network-mcp", status_code=303)
 
 

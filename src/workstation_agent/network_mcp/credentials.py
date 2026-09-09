@@ -41,10 +41,17 @@ def _harden(path: Path) -> None:
     symbol may or may not be there, and a static import of a symbol that is not
     there is a lie that both type checkers correctly object to.
 
-    Deliberately not fatal. A token file with default ACLs is still far better
-    than no endpoint at all, and the operator is told.
+    Deliberately not fatal — including the *import*. This runs immediately after
+    the atomic ``replace`` that commits a new token, so anything raising here
+    would leave the token on disk while the caller reported a failure: the next
+    start would demand a token PersonaCore was told we had refused, which is an
+    endpoint nobody can reach. Nothing past the commit is allowed to fail.
     """
-    module = importlib.import_module("workstation_agent.security.dpapi")
+    try:
+        module = importlib.import_module("workstation_agent.security.dpapi")
+    except Exception:  # noqa: BLE001 — see above; nothing past the commit may raise
+        log.warning("security.dpapi unavailable; %s is not ACL-hardened", path.name)
+        return
     harden = getattr(module, "harden_file", None)
     if harden is None:
         log.warning("security.harden_file unavailable; %s is not ACL-hardened", path.name)
@@ -87,8 +94,7 @@ def ensure_token(state_dir: Path | None = None, *, rotate: bool = False) -> str:
 
     directory.mkdir(parents=True, exist_ok=True)
     token = secrets.token_hex(_TOKEN_BYTES)
-    path.write_text(token, encoding="ascii")
-    _harden(path)
+    _write_token(directory, token)
     if rotate:
         log.warning(
             "network MCP bearer token rotated. PersonaCore's 'workstation_token' "
@@ -97,3 +103,57 @@ def ensure_token(state_dir: Path | None = None, *, rotate: bool = False) -> str:
     else:
         log.info("network MCP bearer token generated at %s", path)
     return token
+
+
+def _write_token(directory: Path, token: str) -> None:
+    """Write *token* into *directory* atomically, then harden it.
+
+    Atomic because there are now two writers — first-run generation and an
+    enrolment push — and a token file caught half-written is a token file the
+    next start reads back as the whole truth. ``Path.replace`` is atomic on
+    NTFS, so a reader sees either the previous token or the new one.
+    """
+    path = directory / _TOKEN_FILE_NAME
+    tmp = directory / (_TOKEN_FILE_NAME + ".tmp")
+    tmp.write_text(token, encoding="ascii")
+    tmp.replace(path)
+    _harden(path)
+
+
+def store_token(token: str, state_dir: Path | None = None) -> None:
+    """Persist an externally issued bearer token, replacing any stored one.
+
+    This is how the token PersonaCore mints during enrolment survives an Agent
+    restart. Contract §11 item 8 requires that stopping and starting the Agent
+    brings the endpoint back without the owner touching PersonaCore, and after
+    enrolment the value the core holds is this one — so it has to be on disk
+    before the push is answered, not merely in memory.
+
+    The value is **never logged**, here or anywhere: the line below records that
+    a token was stored and where the file is, and nothing about the token.
+
+    Args:
+        token: The token the core pushed. Must be printable ASCII with no
+            spaces — the band
+            :func:`~workstation_agent.network_mcp.enrolment._acceptable_token`
+            has already established for anything arriving over the wire.
+        state_dir: Directory holding the token file. Defaults to
+            :data:`DEFAULT_STATE_DIR`.
+
+    Raises:
+        ValueError: if *token* is outside that band. Checked here as well as at
+            the door, because this function writes an ASCII file that
+            :func:`ensure_token` reads back as ASCII: a value that cannot make
+            that round trip must not reach the disk, whatever called us.
+        OSError: if the file cannot be written.
+    """
+    if not token or not token.isascii() or not token.isprintable() or " " in token:
+        msg = "a bearer token must be non-empty printable ASCII containing no spaces"
+        raise ValueError(msg)
+    directory = state_dir if state_dir is not None else DEFAULT_STATE_DIR
+    directory.mkdir(parents=True, exist_ok=True)
+    _write_token(directory, token)
+    log.info(
+        "network MCP bearer token replaced by an enrolment push (stored at %s)",
+        directory / _TOKEN_FILE_NAME,
+    )

@@ -8,6 +8,46 @@
 {% if errors._global is defined %}<p class="error">{{ errors._global }}</p>{% endif %}
 
 <section>
+  <h2>Signature Verification</h2>
+  {% if sig.allow_unsigned %}
+    <p class="error"><strong>OFF &mdash; unsigned and tampered plugins are allowed to run.</strong>
+      This is what normally stops a substituted plugin from running; plugins can execute shell
+      commands, read and write files, and drive attached devices.</p>
+  {% else %}
+    <p class="success"><strong>ON &mdash; unsigned or tampered plugins are quarantined, not run.</strong></p>
+  {% endif %}
+
+  {% if sig.affected %}
+    <p>Currently affected: {% for a in sig.affected %}{{ a.name }} ({{ a.status }}){% if not loop.last %}, {% endif %}{% endfor %}.</p>
+  {% else %}
+    <p>No installed plugin is currently unsigned or quarantined.</p>
+  {% endif %}
+
+  <p class="info">Takes effect the next time a plugin loads &mdash; reload it below, or restart the
+    Agent. A plugin that is already running keeps whatever this setting was when it last started.</p>
+
+  {% if signature_confirm_pending %}
+    <form method="post" action="/plugins/signature-verification/disable">
+      <p class="error">Turning this off lets any plugin run without a valid signature, including
+        one that has been tampered with or substituted, and plugins can run shell commands, read
+        and write files, and control attached devices.{% if sig.affected %} It immediately stops
+        quarantining: {% for a in sig.affected %}{{ a.name }}{% if not loop.last %}, {% endif %}{% endfor %}.{% endif %}</p>
+      <input type="hidden" name="confirm" value="true">
+      <button type="submit">Yes, allow unsigned plugins</button>
+    </form>
+  {% elif sig.allow_unsigned %}
+    <form method="post" action="/plugins/signature-verification/enable">
+      <button type="submit">Turn signature verification back on</button>
+    </form>
+  {% else %}
+    <form method="post" action="/plugins/signature-verification/disable"
+          onsubmit="return confirm('This allows unsigned and tampered plugins to run. Continue?');">
+      <button type="submit">Allow Unsigned Plugins&hellip;</button>
+    </form>
+  {% endif %}
+</section>
+
+<section>
   <h2>Installed Plugins</h2>
   {% if plugins %}
   <table>
