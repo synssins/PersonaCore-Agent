@@ -159,6 +159,41 @@ async def test_the_join_sends_this_endpoint_s_real_fingerprint(endpoint, tmp_pat
     body = json.loads(seen["request"].content)
     assert body["tls_fingerprint"] == info.fingerprint
     assert body["url"] == f"https://192.168.1.50:{info.port}/mcp"
+    # One certificate covers the whole bound set (its SAN does), so the pin on
+    # the singular field and the pin on the entry are the same real value --
+    # this endpoint's, read off a certificate that exists on disk rather than
+    # off a fake.
+    assert body["urls"] == [
+        {"url": body["url"], "tls_fingerprint": info.fingerprint},
+    ]
+
+
+async def test_a_ranking_reaches_the_wire_in_the_owners_order(endpoint, tmp_path):
+    """Against a running endpoint and a real certificate, not a stand-in.
+
+    The order asserted is neither alphabetical nor the endpoint's own, so any
+    layer that sorts shows up here as a different list rather than as a list
+    that happens to still be right.
+    """
+    server, info = endpoint
+    factory, seen = fake_core(info, tmp_path)
+
+    await join.join_and_report(
+        "192.168.1.150:8053",
+        CODE,
+        ["fd00::5", "desk.lan", "192.168.1.50"],
+        endpoint=server,
+        client_factory=factory,
+    )
+
+    body = json.loads(seen["request"].content)
+    assert [entry["url"] for entry in body["urls"]] == [
+        f"https://[fd00::5]:{info.port}/mcp",
+        f"https://desk.lan:{info.port}/mcp",
+        f"https://192.168.1.50:{info.port}/mcp",
+    ]
+    assert body["url"] == body["urls"][0]["url"]
+    assert all(entry["tls_fingerprint"] == info.fingerprint for entry in body["urls"])
 
 
 async def test_a_refused_join_leaves_no_window_open_on_the_socket(endpoint, tmp_path):

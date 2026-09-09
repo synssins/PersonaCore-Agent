@@ -212,6 +212,16 @@ def _disambiguated(originals: Sequence[str], shown: Sequence[str]) -> list[str]:
 #: Sentinel value for the "type an address the list did not offer" option.
 _OTHER = "__other__"
 
+#: Rank labels for the ranked listen-address picker, in rank order.
+#:
+#: Spelled out rather than rendered as "1.", "2." because the rank is the whole
+#: of what the control communicates and an ordinal reads as a position where a
+#: bare number reads as a count. Beyond this list :func:`_listen_slots` falls
+#: back to ``11th``, ``12th`` — a machine with eleven bound addresses is not a
+#: shape worth a rule of its own, and the fallback is right for every value it
+#: can reach here (the ``-teen`` exceptions are all inside the list).
+_ORDINALS: Final = ("1st", "2nd", "3rd", "4th", "5th", "6th", "7th", "8th", "9th", "10th")
+
 
 def _token_identity(token: str) -> str:
     """A stand-in for the token that is safe to keep in the reveal-state file.
@@ -658,10 +668,123 @@ def _refuse_listen_address(typed: str, choices: Sequence[dict[str, str]]) -> str
     if not offered:
         return _no_listen_address_message(None)
     return (
-        f"This endpoint is not answering on the address that was submitted, so "
-        f"PersonaCore would be sent somewhere it cannot reach this workstation. "
-        f"It is answering on {offered}. Choose one of those and join again."
+        f"This endpoint is not answering on the address that was submitted "
+        f"({typed.strip()}), so PersonaCore would be sent somewhere it cannot reach "
+        f"this workstation. It is answering on {offered}. Choose one of those and "
+        f"join again."
     )
+
+
+def _refuse_listen_addresses(
+    typed: Sequence[str], choices: Sequence[dict[str, str]],
+) -> str | None:
+    """:func:`_refuse_listen_address`, applied to **every** address submitted.
+
+    The set does not weaken the gate; it multiplies it. A hand-made POST
+    carrying a good first address and ``127.0.0.1`` third would, without this,
+    put a loopback into ``urls`` and tell the core to fall back to dialling
+    itself — a refusal the owner never sees because the *preferred* address
+    connected. Every entry is somewhere the core may end up connecting, so
+    every entry gets the check the single one always got.
+
+    **The picker having offered only valid addresses is not a reason to skip
+    it.** A form field is attacker-supplied regardless of what the control
+    offered; the ranked ``<select>`` set constrains a browser being operated
+    normally and constrains nothing else, exactly as the single dropdown did.
+
+    The **first** offending address is named and the rest of the check stops
+    there: reporting three at once would be three problems to read for what is
+    one correction at a time, and the owner re-submits the whole ranking anyway.
+
+    Returns:
+        The refusal, or ``None`` if every entry is one this endpoint is serving.
+    """
+    for entry in typed:
+        refusal = _refuse_listen_address(entry, choices)
+        if refusal is not None:
+            return refusal
+    return None
+
+
+def _ranked_listen_addresses(submitted: Sequence[str]) -> list[str]:
+    """The owner's ranking, cleaned of blanks and repeats, **order untouched**.
+
+    The ranked control posts one ``listen_address`` per rank slot, in rank
+    order, with an empty value for a slot left at "not used" — so the raw list
+    is already the preference order and this drops what is not a choice rather
+    than deciding what the order is. **There is no sort here and there must not
+    be one**: this is the last place the owner's order could be lost before it
+    reaches ``join.listen_urls``, and a sorted list still looks deliberate.
+
+    De-duplication keeps the *first* occurrence, by the same
+    :func:`~workstation_agent.config.schema._host_key` the bind selection uses,
+    so ``::1`` and ``[::1]`` are one address and the higher rank is the one that
+    survives. ``join.listen_urls`` de-duplicates again after resolving each to a
+    URL, which catches the pair this cannot — a bare host and the same host with
+    the endpoint's own port written out.
+    """
+    from workstation_agent.config.schema import _host_key  # noqa: PLC0415
+
+    ranked: list[str] = []
+    seen: set[str] = set()
+    for raw in submitted:
+        entry = raw.strip()
+        if not entry:
+            continue
+        key = _host_key(entry)
+        if key in seen:
+            continue
+        seen.add(key)
+        ranked.append(entry)
+    return ranked
+
+
+def _listen_slots(
+    choices: Sequence[dict[str, str]], picked: Sequence[str],
+) -> list[dict[str, Any]]:
+    """The ranked picker's rows: one rank slot per address this endpoint serves.
+
+    **Why slots and not a multi-select.** An HTML ``<select multiple>`` submits
+    its selected values in *document* order, never in the order they were
+    clicked, so a multi-select cannot express "this one first" at all — the
+    preference would be lost in the browser, before the POST, and every layer
+    below would faithfully preserve an order that was already wrong. That is a
+    silent failure: the form works, the enrolment succeeds, and the core dials
+    whichever address happened to be listed first on the page.
+
+    So the control is turned inside out. Instead of one control listing the
+    addresses, there is one control per **rank** — "1st (preferred)", "2nd",
+    "3rd" — and each names an address or "not used". Document order is then
+    *identical* to preference order, which turns the trap into the mechanism:
+    the browser's own submission order is the answer, and no JavaScript, no
+    hidden index field and no re-sorting step is involved in preserving it.
+    That matters on a page with no script of its own; a drag-to-reorder list
+    would have been prettier and would not work at all with scripting off.
+
+    The ranking is visible in the control rather than in help text: the rank is
+    the label on each row, and the owner reads their own order top to bottom.
+
+    There are exactly as many slots as there are addresses, because ranking more
+    positions than there are things to rank offers a choice that cannot be made.
+
+    *picked* is the ranking to pre-select — the owner's own on a re-render after
+    a refusal, so a correction costs one edit rather than a re-ranking. With
+    nothing picked the first slot defaults to the first address (the endpoint's
+    own preferred one, ``urls[0]``) and the rest to "not used", which is the
+    single-address behaviour this page has always had.
+    """
+    chosen = list(picked)
+    if not chosen and choices:
+        chosen = [choices[0]["value"]]
+    return [
+        {
+            "index": rank,
+            "ordinal": _ORDINALS[rank] if rank < len(_ORDINALS) else f"{rank + 1}th",
+            "preferred": rank == 0,
+            "selected": chosen[rank] if rank < len(chosen) else "",
+        }
+        for rank in range(len(choices))
+    ]
 
 
 def _render(  # noqa: PLR0913 — one parameter per independent page outcome
@@ -677,7 +800,7 @@ def _render(  # noqa: PLR0913 — one parameter per independent page outcome
     export_error: str | None = None,
     join_error: str | None = None,
     join_notice: str | None = None,
-    join_values: dict[str, str] | None = None,
+    join_values: dict[str, Any] | None = None,
     remove_error: str | None = None,
     remove_notice: str | None = None,
     uncovered: tuple[str, ...] = (),
@@ -793,10 +916,19 @@ def _render(  # noqa: PLR0913 — one parameter per independent page outcome
             "join_notice": _bounded(join_notice),
             "join_values": {
                 "core_address": (join_values or {}).get("core_address", ""),
-                "listen_address": (join_values or {}).get("listen_address", ""),
+                # The owner's *ranking*, not a single value: a refusal must come
+                # back with the order they built still in it, or correcting one
+                # address costs them the whole ranking.
+                "listen_addresses": list(
+                    (join_values or {}).get("listen_addresses", ()) or (),
+                ),
             },
             "can_join": callable(getattr(ctx.network_mcp, "begin_join", None)),
             "listen_choices": listen_choices,
+            "listen_slots": _listen_slots(
+                listen_choices,
+                list((join_values or {}).get("listen_addresses", ()) or ()),
+            ),
             # Rendered only when there is nothing to choose, so the owner never
             # meets an empty dropdown with no explanation beside it.
             "listen_empty": (
@@ -1332,13 +1464,24 @@ async def join_post(
     ctx: Annotated[BackendContext, Depends(get_context)],
     code: Annotated[str, Form(alias="code")] = "",
     core_address: Annotated[str, Form(alias="core_address")] = "",
-    listen_address: Annotated[str, Form(alias="listen_address")] = "",
+    listen_address: Annotated[list[str], Form(alias="listen_address")] = [],  # noqa: B006
 ) -> HTMLResponse:
     """Run the whole Join: address in, pairing code in, enrolled row out.
 
     Every field is declared as ``str`` with a default for the same reason every
     other field on this page is: FastAPI answers a missing form field with a 422
     JSON body, which is a dead end in a webview with no way back to the form.
+    The mutable default on *listen_address* is FastAPI's own convention for a
+    repeated field, the same one ``settings_post``'s ``bind_hosts`` uses.
+
+    **The field is repeated, and its order is the owner's preference order.**
+    The ranked picker posts one ``listen_address`` per rank slot in rank order —
+    see :func:`_listen_slots` for why the control is shaped that way and what a
+    plain multi-select would have lost. Nothing here re-orders it; the list goes
+    to ``join_and_report`` as submitted, minus blanks and repeats, and comes out
+    the far end as the ``urls`` array in that same order. A single value still
+    arrives as a one-element list, so a browser or a script posting the one
+    field this route has always accepted behaves exactly as it did.
 
     **This calls ``join_core`` and never ``begin_join``, and calling both would
     be a defect.** ``join_core`` opens the enrolment window itself, inside the
@@ -1375,28 +1518,33 @@ async def join_post(
             ),
         )
 
-    # The core's address and the chosen listen address go back into the form on
-    # every failure so a refusal costs one correction rather than three. The
+    # Blanks (an unused rank slot) and repeats dropped, order untouched.
+    ranked = _ranked_listen_addresses(listen_address)
+
+    # The core's address and the chosen ranking go back into the form on every
+    # failure so a refusal costs one correction rather than a re-ranking. The
     # pairing code is not among them and there is no key for it to occupy.
-    typed = {"core_address": core_address, "listen_address": listen_address}
+    typed: dict[str, Any] = {"core_address": core_address, "listen_addresses": ranked}
 
     # Checked **before the window opens**, and it is the only check there is:
-    # see :func:`_refuse_listen_address` for why neither the dropdown nor
-    # ``begin_join`` covers this. *core_address* deliberately gets no gate of
-    # its own here -- ``join.core_enrol_url`` runs first thing inside the call,
-    # ahead of the window, and already refuses an empty address, an unparseable
-    # authority, a scheme that is not http(s), an address naming no host, and
-    # one carrying userinfo, each with its own operator-facing sentence. A
-    # second set of rules out here could only agree with those or contradict
-    # them, and the second is the likelier outcome over time.
-    refusal = _refuse_listen_address(listen_address, _listen_choices(_read_info(server)[0]))
+    # see :func:`_refuse_listen_address` for why neither the picker nor
+    # ``begin_join`` covers this, and :func:`_refuse_listen_addresses` for why
+    # every entry gets it and not only the preferred one. *core_address*
+    # deliberately gets no gate of its own here -- ``join.core_enrol_url`` runs
+    # first thing inside the call, ahead of the window, and already refuses an
+    # empty address, an unparseable authority, a scheme that is not http(s), an
+    # address naming no host, and one carrying userinfo, each with its own
+    # operator-facing sentence. A second set of rules out here could only agree
+    # with those or contradict them, and the second is the likelier outcome
+    # over time.
+    refusal = _refuse_listen_addresses(ranked, _listen_choices(_read_info(server)[0]))
     if refusal is not None:
         log.warning("network-mcp: a Join named an address this endpoint is not serving")
         return _render(request, ctx, join_error=refusal, join_values=typed)
 
     try:
         result = await join_and_report(
-            core_address, code, listen_address, endpoint=server,
+            core_address, code, ranked, endpoint=server,
         )
     except EnrolmentError as exc:
         # Written by whoever refused — the core, the receiver, or the address
