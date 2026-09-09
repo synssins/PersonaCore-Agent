@@ -3,7 +3,9 @@
 #
 # Produces ``dist/Agent/Agent.exe`` alongside every data file the app
 # needs at runtime: UI backend templates + static files, systray assets,
-# and all six first-party plugin manifests + signatures.
+# and every first-party plugin's manifest + signature + code — plus, since
+# 0.1.0-alpha.9's ``No module named 'serial'``, the third-party packages
+# those plugins import (see the plugin section below).
 #
 # Build with:
 #
@@ -24,8 +26,59 @@ datas = [
     (str(SRC / "ui" / "systray" / "assets"), "workstation_agent/ui/systray/assets"),
 ]
 
-# Bundled first-party plugins — ship manifest + signature + __main__.py for
-# every plugin under src/workstation_agent/plugins/.
+# ---------------------------------------------------------------------------
+# Bundled first-party plugins.
+#
+# Three things have to be true for a bundled plugin to work in the frozen
+# app.  Until 0.1.0-alpha.9 only the first was, and the second was the defect
+# a real install hit:
+#
+#   1. The plugin's files must exist ON DISK under
+#      ``_internal/workstation_agent/plugins/<id>/``.  That on-disk copy is
+#      what the Ed25519 signature is checked against: ``mcp_host.loader``'s
+#      ``signing_message`` -> ``_covered_files`` resolves the manifest's
+#      ``entry = ["-m", "workstation_agent.plugins.<id>"]`` with
+#      ``importlib.util.find_spec`` and hashes every importable file under
+#      ``spec.submodule_search_locations``.  Shipping the four files as
+#      ``datas`` is what puts them there, and that part always worked.
+#
+#   2. The plugin's DEPENDENCIES must be in the bundle.  Copying a file as
+#      data does not add it to PyInstaller's module graph, so no bundled
+#      plugin's imports were ever analysed and their third-party packages
+#      were simply absent from ``dist/Agent/_internal``.  ``serial`` was the
+#      first family to notice, because it is the first one that imports
+#      something outside the standard library at module scope:
+#      ``ModuleNotFoundError: No module named 'serial'`` from
+#      ``plugins/serial/__main__.py`` on the owner's machine.  ``devices``
+#      carried the same latent bug (``devices_list`` reaches for
+#      ``serial.tools.list_ports`` inside a function).  The fix is to name
+#      each plugin's modules in ``hiddenimports`` below, so Analysis walks
+#      them and drags in whatever they import — driven off the SAME
+#      directory scan as the ``datas`` loop, so the next family to grow a
+#      dependency is covered without editing this file.
+#
+#   3. The copy that is IMPORTED must be the copy that is VERIFIED.  A
+#      hiddenimport also lands the module itself in the PYZ, and
+#      PyInstaller's frozen importer sits ahead of the filesystem path
+#      finder on ``sys.meta_path`` — so the PYZ copy would win every import
+#      while ``verify()`` went on hashing the on-disk copy.  The two could
+#      then be edited apart: arbitrary code executing under a ``valid``
+#      signature.  So after Analysis every ``workstation_agent.plugins.*``
+#      module is stripped back out of ``a.pure`` (see below).  Their
+#      dependencies, collected by then, stay.
+#
+# Net effect: the PYZ's ``workstation_agent.plugins`` namespace is byte-for-
+# byte what it was before this change (empty), the on-disk tree is what it
+# was before, and only the dependency closure grew.
+# ---------------------------------------------------------------------------
+
+PLUGIN_PKG = "workstation_agent.plugins"
+
+#: Directory names under ``src/workstation_agent/plugins/`` that are plugins.
+plugin_ids: list[str] = []
+#: Module names handed to Analysis so each plugin's imports get followed.
+plugin_modules: list[str] = []
+
 for plugin_dir in sorted((SRC / "plugins").iterdir()):
     if not plugin_dir.is_dir():
         continue
@@ -36,6 +89,23 @@ for plugin_dir in sorted((SRC / "plugins").iterdir()):
         src_file = plugin_dir / name
         if src_file.exists():
             datas.append((str(src_file), dest))
+
+    # Only a directory with an ``__init__.py`` is an importable package, and
+    # only ``__main__.py`` is what ``-m <package>`` actually executes — the
+    # module that hit the ModuleNotFoundError.  Both are named explicitly:
+    # nothing in the app imports either statically, so neither would be
+    # reached by following imports from the entry script.
+    if not (plugin_dir / "__init__.py").exists():
+        continue
+    plugin_ids.append(plugin_dir.name)
+    plugin_modules.append(f"{PLUGIN_PKG}.{plugin_dir.name}")
+    if (plugin_dir / "__main__.py").exists():
+        plugin_modules.append(f"{PLUGIN_PKG}.{plugin_dir.name}.__main__")
+
+print(  # noqa: T201 — build-log evidence that the scan found every plugin
+    f"workstation_agent.spec: analysing {len(plugin_ids)} bundled plugin(s) "
+    f"for their dependencies: {', '.join(plugin_ids)}",
+)
 
 hiddenimports = [
     "workstation_agent",
@@ -75,6 +145,11 @@ hiddenimports = [
     "mcp.types",
     "sse_starlette",
     "sse_starlette.sse",
+    # Bundled plugins — see the long comment above the plugin scan.  These are
+    # here ONLY so Analysis follows their imports; the modules themselves are
+    # removed from the PYZ again after Analysis so the on-disk, signature-
+    # covered copy stays the only importable one.
+    *plugin_modules,
 ]
 
 block_cipher = None
@@ -139,6 +214,57 @@ a = Analysis(  # noqa: F821
     cipher=block_cipher,
     noarchive=False,
 )
+
+
+# ---------------------------------------------------------------------------
+# Keep the bundled plugins OUT of the PYZ (requirement 3 above).
+#
+# ``hiddenimports`` got Analysis to follow every plugin's imports, which is
+# the whole point — ``pyserial`` and friends are now in the bundle.  But it
+# also queued the plugin modules themselves for the PYZ, and a PYZ copy would
+# be imported in preference to the on-disk copy that ``mcp_host.loader``
+# hashes.  Dropping them here leaves exactly one copy of every plugin in the
+# shipped app: ``_internal/workstation_agent/plugins/<id>/*.py``, which is
+# both the copy ``runpy.run_module`` executes and the copy ``verify()``
+# digests.  They cannot diverge, because there is nothing to diverge from.
+#
+# Only the plugin modules are dropped.  Everything they pulled in — ``serial``,
+# ``serial.tools.list_ports``, ``serial.serialwin32`` … — is an ordinary
+# third-party module elsewhere in ``a.pure`` and stays.
+# ---------------------------------------------------------------------------
+
+
+def _is_bundled_plugin_module(module_name: str) -> bool:
+    """True for ``workstation_agent.plugins`` and anything beneath it."""
+    return module_name == PLUGIN_PKG or module_name.startswith(PLUGIN_PKG + ".")
+
+
+_kept_pure = [entry for entry in a.pure if not _is_bundled_plugin_module(entry[0])]
+_dropped_pure = sorted(entry[0] for entry in a.pure if _is_bundled_plugin_module(entry[0]))
+a.pure.clear()
+a.pure.extend(_kept_pure)
+
+print(  # noqa: T201 — build-log evidence that the strip actually happened
+    f"workstation_agent.spec: kept {len(_dropped_pure)} plugin module(s) out of "
+    f"the PYZ so the on-disk signed copy is the only importable one: "
+    f"{', '.join(_dropped_pure)}",
+)
+
+# A plugin whose files never made it into ``datas`` would be stripped from the
+# PYZ and absent from disk — i.e. silently unshippable.  Fail the build rather
+# than ship that.
+_shipped_dests = {dest for _src, dest in datas}
+_missing_on_disk = [
+    plugin_id
+    for plugin_id in plugin_ids
+    if f"workstation_agent/plugins/{plugin_id}" not in _shipped_dests
+]
+if _missing_on_disk:
+    msg = (
+        "bundled plugins removed from the PYZ but not shipped as datas — "
+        f"they would be missing from the frozen app entirely: {_missing_on_disk}"
+    )
+    raise RuntimeError(msg)
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)  # noqa: F821
 
