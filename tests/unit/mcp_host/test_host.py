@@ -978,3 +978,79 @@ async def test_never_prompt_cannot_widen_a_gate_denial(isolated_audit_db):
 
     rows = audit_mod.query(audit_mod.AuditQuery(event="tool_denied"), db_path=isolated_audit_db)
     assert any(r.code == "denied" for r in rows)
+
+
+# ---------------------------------------------------------------------------
+# §5.6 stripping must not be able to delete the envelope it is cleaning
+# ---------------------------------------------------------------------------
+
+
+def _conform(payload: dict) -> dict:
+    result = host_mod.conform_result({
+        "content": [{"type": "text", "text": json.dumps(payload, separators=(",", ": "))}],
+        "isError": False,
+    })
+    return json.loads(result.content[0]["text"])
+
+
+def test_a_token_spliced_across_two_fields_cannot_delete_the_structure():
+    """SECURITY REGRESSION: the stripper used to run over the rendered envelope.
+
+    ``_ANGLE_PIPE_TOKEN`` is the one pattern with a wildcard body, so against a
+    serialised object it can match ACROSS two fields — the body swallowing the
+    ``","stderr": "`` between them — and substituting it away deleted the JSON
+    structure, leaving text that was no longer an envelope.  Any family whose
+    output an attacker influences can reach this on purpose: ``shell_run``
+    controls both streams and ``adb_logcat`` carries whatever the device
+    logged.  Stripping per decoded value makes the splice impossible.
+    """
+    out = _conform({"ok": True, "stdout": "tail <|im_", "stderr": "x|> head"})
+    assert out["ok"] is True
+    assert set(out) == {"ok", "stdout", "stderr"}
+
+
+@pytest.mark.parametrize(
+    ("left", "right"),
+    [
+        ("<|im_", "|>"),
+        ("prefix <|", "|> suffix"),
+        ("<|a", "b|>"),
+        ("<|", "|>"),
+    ],
+)
+def test_no_split_token_pair_can_damage_the_envelope(left, right):
+    out = _conform({"ok": True, "a": left, "b": right})
+    assert set(out) == {"ok", "a", "b"}
+
+
+def test_a_real_token_inside_one_field_is_still_stripped():
+    out = _conform({"ok": True, "stdout": "hi <|im_start|> there"})
+    assert "<|im_start|>" not in out["stdout"]
+    assert out["stdout"] == "hi  there"
+
+
+def test_a_field_the_stripper_cannot_finish_is_withheld_alone():
+    deep = "<|im_" * 40 + "start" + "|>" * 40
+    out = _conform({"ok": True, "stdout": deep, "exit_code": 0})
+    assert out["stdout"] == host_mod._UNSTRIPPABLE
+    assert out["exit_code"] == 0
+    assert out["ok"] is True
+
+
+def test_nested_values_are_stripped_too():
+    out = _conform({"ok": True, "entries": [{"name": "a<|im_start|>b"}]})
+    assert out["entries"][0]["name"] == "ab"
+
+
+def test_plain_text_is_still_stripped_as_one_piece():
+    """No JSON structure to damage, so the old behaviour is the right one."""
+    result = host_mod.conform_result({
+        "content": [{"type": "text", "text": "hello <|im_start|> world"}],
+        "isError": False,
+    })
+    assert result.content[0]["text"] == "hello  world"
+
+
+def test_the_ok_key_is_still_filled_in_for_a_family_that_forgot_it():
+    out = _conform({"stdout": "fine"})
+    assert out["ok"] is True

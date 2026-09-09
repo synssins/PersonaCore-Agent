@@ -306,23 +306,60 @@ def failure_result(code: str, reason: str, *, is_error: bool) -> ToolResultImpl:
     )
 
 
-def _conform_text_block(block: dict[str, Any], *, ok: bool) -> dict[str, Any]:
-    """Strip special tokens, guarantee ``ok``, and cap one text block."""
-    text = strip_special_tokens(str(block.get("text", "")))
+def _strip_json_values(value: Any) -> Any:
+    """Apply §5.6 stripping to every string inside a decoded JSON structure."""
+    if isinstance(value, str):
+        return strip_special_tokens(value)
+    if isinstance(value, dict):
+        return {k: _strip_json_values(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_strip_json_values(v) for v in value]
+    return value
 
-    # §5.2: "where structure matters a JSON object rendered as text ... Every
-    # family's result object carries `ok`".  A family that renders a JSON
-    # object without `ok` is a defect; rather than passing it through, fill
-    # it in.  Plain (non-JSON) text is a legitimate §5.2 result and is left
-    # exactly as it is.
-    stripped = text.lstrip()
-    if stripped.startswith("{"):
+
+def _conform_text_block(block: dict[str, Any], *, ok: bool) -> dict[str, Any]:
+    """Strip special tokens, guarantee ``ok``, and cap one text block.
+
+    **Stripping happens per JSON value, not over the serialised text**, and
+    that is a correctness requirement rather than a tidiness one.
+
+    :data:`_ANGLE_PIPE_TOKEN` is the one pattern with a wildcard body
+    (``<\\|[^<>|]{0,64}\\|>``).  Run against a *rendered* envelope it can match
+    **across two fields**: a family that returns
+    ``{"stdout": "tail <|im_", "stderr": "x|> head"}`` renders to a string in
+    which the match spans the ``","stderr": "`` between them, and substituting
+    it away deletes the JSON structure — leaving text that is no longer an
+    envelope at all.  Any family whose output an attacker can influence could
+    reach this deliberately; ``shell_run`` controls both streams, and
+    ``adb_logcat`` carries whatever the device logged.
+
+    Decoding first makes the splice impossible: each string is cleaned in
+    isolation, the structure is rebuilt by ``json.dumps`` rather than being
+    edited as text, and a value the stripper could not finish is withheld on
+    its own instead of taking the envelope with it.  Plain (non-JSON) text has
+    no structure to damage, so it is stripped as one piece exactly as before.
+
+    §5.2: "where structure matters a JSON object rendered as text ... Every
+    family's result object carries ``ok``".  A family that renders a JSON
+    object without ``ok`` is a defect; rather than passing it through, fill it
+    in.
+    """
+    raw_text = str(block.get("text", ""))
+
+    parsed: Any = None
+    if raw_text.lstrip().startswith("{"):
         try:
-            parsed = json.loads(text)
+            parsed = json.loads(raw_text)
         except (json.JSONDecodeError, RecursionError):
             parsed = None
-        if isinstance(parsed, dict) and "ok" not in parsed:
-            text = json.dumps({"ok": ok, **parsed}, separators=(",", ": "))
+
+    if isinstance(parsed, dict):
+        cleaned = _strip_json_values(parsed)
+        if "ok" not in cleaned:
+            cleaned = {"ok": ok, **cleaned}
+        text = json.dumps(cleaned, separators=(",", ": "))
+    else:
+        text = strip_special_tokens(raw_text)
 
     return {**block, "type": "text", "text": _cap_text(text)}
 

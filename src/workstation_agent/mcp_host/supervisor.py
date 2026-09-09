@@ -98,10 +98,69 @@ class ResourceLimits:
 
     max_memory_mb: int = 512
     max_job_memory_mb: int = 768
-    max_active_processes: int = 4
+    #: Was 4, which made contract §5.4 physically impossible.  §5.4 requires a
+    #: family to run **eight concurrent jobs**, and every job is at least one
+    #: process inside this same Job Object — plus the plugin process itself,
+    #: which occupies a slot.  Eight jobs therefore need nine slots as an
+    #: arithmetic floor, and at four the ninth ``CreateProcess`` failed long
+    #: before the contract's limit was reached.  Nine is that floor and no
+    #: more; a plugin that actually hosts jobs needs the entry in
+    #: :data:`PLUGIN_LIMIT_FLOORS` as well, because a shell is not a leaf
+    #: process.
+    max_active_processes: int = 9
     #: Optional per-job user-mode time limit in 100-ns units (LIMIT_JOB_TIME).
     #: ``None`` means "unlimited"; supervisor doesn't set the flag.
     job_user_time_100ns: int | None = None
+
+
+#: Per-plugin **floors**, applied element-wise in :meth:`PluginSupervisor.spawn`.
+#:
+#: ``host._spawn`` constructs a bare ``ResourceLimits()`` for every plugin and
+#: has no way to express "this family's model needs N processes" — and the
+#: requirement is a property of the plugin, not of the caller, so this is where
+#: it belongs.  Applied as ``max`` and never as a replacement: a caller that
+#: asks for more than the floor keeps what it asked for, and no entry here can
+#: ever lower a limit.
+#:
+#: ``shell_files_jobs`` hosts §5.4's job model.  Eight concurrent jobs, each a
+#: ``powershell.exe`` or ``cmd.exe`` that itself starts the program the caller
+#: asked for (and often a helper), is realistically three processes per job:
+#: 1 + 8x3 = 25, and 32 leaves headroom while still being a real bound on a
+#: fork bomb.  768 MB of job memory does not fit eight PowerShell processes
+#: (~100 MB resident each) plus what they run, so that rises with it.
+PLUGIN_LIMIT_FLOORS: dict[str, ResourceLimits] = {
+    "shell_files_jobs": ResourceLimits(
+        max_memory_mb=512,
+        max_job_memory_mb=2048,
+        max_active_processes=32,
+    ),
+}
+
+
+def apply_limit_floor(plugin_id: str, limits: ResourceLimits) -> ResourceLimits:
+    """Raise *limits* to :data:`PLUGIN_LIMIT_FLOORS` for *plugin_id*.
+
+    Element-wise ``max``, so this can only ever loosen a limit toward what the
+    plugin needs and never tighten one the caller chose.  ``job_user_time_100ns``
+    is left alone: ``None`` there means "no limit", so a ``max`` over it would
+    invert the meaning.
+    """
+    floor = PLUGIN_LIMIT_FLOORS.get(plugin_id)
+    if floor is None:
+        return limits
+    raised = ResourceLimits(
+        max_memory_mb=max(limits.max_memory_mb, floor.max_memory_mb),
+        max_job_memory_mb=max(limits.max_job_memory_mb, floor.max_job_memory_mb),
+        max_active_processes=max(limits.max_active_processes, floor.max_active_processes),
+        job_user_time_100ns=limits.job_user_time_100ns,
+    )
+    if raised != limits:
+        log.info(
+            "raised resource limits for plugin_id=%s to its declared floor: %s",
+            plugin_id,
+            raised,
+        )
+    return raised
 
 
 @dataclass
@@ -237,7 +296,7 @@ class PluginSupervisor:
         resource_limits: ResourceLimits | None = None,
     ) -> SubprocessHandle:
         """Spawn ``entry_cmd`` under a Job Object with a low-integrity token."""
-        limits = resource_limits or ResourceLimits()
+        limits = apply_limit_floor(plugin_id, resource_limits or ResourceLimits())
         env = build_child_env(plugin_id)
 
         job = _create_job_object(limits)

@@ -38,6 +38,7 @@ import contextlib
 import itertools
 import json
 import logging
+import threading
 from typing import IO, TYPE_CHECKING, Any
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -87,7 +88,7 @@ class MCPStdioClient:
     def __init__(self, *, default_timeout: float = _DEFAULT_TIMEOUT) -> None:
         self._stdin: IO[bytes] | None = None
         self._stdout: IO[bytes] | None = None
-        self._reader_task: asyncio.Task[None] | None = None
+        self._reader_thread: threading.Thread | None = None
         self._pending: dict[int, asyncio.Future[Any]] = {}
         self._notifications: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self._id_gen = itertools.count(1)
@@ -99,59 +100,98 @@ class MCPStdioClient:
     # -- connection -----------------------------------------------------------
 
     async def connect(self, stdin: IO[bytes], stdout: IO[bytes]) -> None:
-        """Attach to already-open pipe streams and start the reader task."""
-        if self._reader_task is not None:
+        """Attach to already-open pipe streams and start the reader thread."""
+        if self._reader_thread is not None:
             msg = "MCPStdioClient already connected"
             raise MCPProtocolError(msg)
         self._stdin = stdin
         self._stdout = stdout
         self._loop = asyncio.get_running_loop()
-        self._reader_task = asyncio.create_task(self._reader(), name="mcp-stdio-reader")
+        self._reader_thread = threading.Thread(
+            target=self._read_forever,
+            name="mcp-stdio-reader",
+            daemon=True,
+        )
+        self._reader_thread.start()
 
     async def close(self) -> None:
-        """Cancel the reader, fail every outstanding request, close streams."""
+        """Stop the reader, fail every outstanding request, close streams."""
         if self._closed:
             return
         self._closed = True
-        if self._reader_task is not None:
-            self._reader_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await self._reader_task
-        for fut in self._pending.values():
-            if not fut.done():
-                fut.set_exception(MCPProtocolError("client closed"))
-        self._pending.clear()
+        # Closing stdout is what stops the reader: it is parked in a blocking
+        # readline() and there is nothing to cancel.  Streams are closed BEFORE
+        # the pending futures are failed so a line already in flight cannot
+        # resolve one after it has been failed.
         for stream in (self._stdin, self._stdout):
             if stream is not None:
                 with contextlib.suppress(Exception):
                     stream.close()
+        self._fail_pending("client closed")
 
     # -- reader ---------------------------------------------------------------
 
-    async def _reader(self) -> None:
-        assert self._stdout is not None
-        loop = asyncio.get_running_loop()
+    def _read_forever(self) -> None:
+        """Blocking read loop, on a thread of its own.
+
+        **This must not run on the default executor**, and that is the whole
+        point of the method.  It used to be
+        ``await loop.run_in_executor(None, self._stdout.readline)`` in a task,
+        which parks one shared executor worker *for the entire life of the
+        plugin* — a blocking read that never returns until the plugin says
+        something is not a unit of work, it is a dedicated thread wearing a
+        borrowed one.
+
+        ``ThreadPoolExecutor``'s default size is ``min(32, cpu_count + 4)``, so
+        on an 8-core machine the loop's default executor has 12 workers and the
+        host could hold **at most 12 plugins open at once**.  The twelfth
+        bundled plugin took the last worker; its ``initialize`` then needed a
+        worker for ``stdin.write`` and queued behind twelve reads that would
+        never finish, so the request never reached the child, the child sat
+        waiting on stdin, and the whole start-up deadlocked.  Worse, the
+        30-second request timeout did not save it: the write was queued, not
+        running, and ``close()``'s ``await self._reader_task`` then waited on a
+        task blocked in an uncancellable executor call.  The symptom was a
+        suite that stopped dead in an unrelated test with the event loop parked
+        in ``GetQueuedCompletionStatus``.
+
+        The ceiling scaled with the machine, which is the nastiest part: a
+        4-core CI box has 8 workers and would have failed with the eight
+        plugins that shipped long before the twelfth arrived.
+        """
+        stdout = self._stdout
+        loop = self._loop
+        if stdout is None or loop is None:  # pragma: no cover - connect() sets both
+            return
         try:
-            while True:
-                raw = await loop.run_in_executor(None, self._stdout.readline)
+            while not self._closed:
+                raw = stdout.readline()
                 if not raw:
                     break
-                try:
-                    msg = json.loads(raw)
-                except json.JSONDecodeError:
-                    log.warning("received non-JSON line from plugin: %r", raw[:120])
-                    continue
-                self._dispatch(msg)
-        except asyncio.CancelledError:
-            raise
+                loop.call_soon_threadsafe(self._on_line, raw)
         except Exception:
-            log.exception("MCP reader crashed")
+            if not self._closed:
+                log.debug("MCP reader stopped on a pipe error", exc_info=True)
         finally:
-            # EOF or error: fail every outstanding request.
-            for fut in self._pending.values():
-                if not fut.done():
-                    fut.set_exception(MCPProtocolError("plugin stdout closed"))
-            self._pending.clear()
+            # EOF or error: fail every outstanding request, on the loop thread
+            # so `_pending` is only ever touched from one thread.
+            with contextlib.suppress(RuntimeError):
+                loop.call_soon_threadsafe(self._fail_pending, "plugin stdout closed")
+
+    def _on_line(self, raw: bytes) -> None:
+        """Handle one line, on the event loop thread."""
+        try:
+            msg = json.loads(raw)
+        except json.JSONDecodeError:
+            log.warning("received non-JSON line from plugin: %r", raw[:120])
+            return
+        self._dispatch(msg)
+
+    def _fail_pending(self, reason: str) -> None:
+        for fut in self._pending.values():
+            if not fut.done():
+                fut.set_exception(MCPProtocolError(reason))
+        self._pending.clear()
 
     def _dispatch(self, msg: dict[str, Any]) -> None:
         # Response

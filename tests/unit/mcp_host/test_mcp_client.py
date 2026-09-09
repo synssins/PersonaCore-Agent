@@ -10,9 +10,11 @@ protocol/remote errors, and closed-client behaviour without the plugin.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import io
 import json
 import os
+import queue
 from pathlib import Path
 
 import pytest
@@ -262,3 +264,96 @@ async def test_reader_ignores_non_json_lines() -> None:
     msg = await asyncio.wait_for(client._notifications.get(), timeout=2.0)
     assert msg["method"] == "notifications/x"
     await client.close()
+
+
+# ---------------------------------------------------------------------------
+# The reader must not consume a shared executor worker
+# ---------------------------------------------------------------------------
+
+
+class _BlockingPipe:
+    """A pipe whose ``readline`` blocks until a line is pushed into it.
+
+    Models the real thing: a plugin that has not spoken yet leaves the host's
+    reader parked indefinitely.
+    """
+
+    def __init__(self) -> None:
+        self._lines: queue.Queue[bytes] = queue.Queue()
+        self.closed = False
+
+    def push(self, line: bytes) -> None:
+        self._lines.put(line)
+
+    def readline(self) -> bytes:
+        while not self.closed:
+            try:
+                return self._lines.get(timeout=0.05)
+            except queue.Empty:
+                continue
+        return b""
+
+    def write(self, _data: bytes) -> int:
+        return 0
+
+    def flush(self) -> None:
+        return
+
+    def close(self) -> None:
+        self.closed = True
+
+
+@pytest.mark.asyncio
+async def test_more_clients_than_executor_workers_still_all_work():
+    """REGRESSION: a silent plugin must not consume a shared executor worker.
+
+    The reader used to be ``await loop.run_in_executor(None, readline)``, which
+    parks one worker of the loop's *default* ``ThreadPoolExecutor`` for the
+    whole life of the plugin.  That pool is ``min(32, cpu_count + 4)`` -- 12 on
+    an 8-core box -- so the host could hold at most that many plugins open, and
+    the one that took the last worker deadlocked: its own ``stdin.write`` was
+    queued behind reads that would never finish, so the request never reached
+    the child and the child sat waiting on stdin.  The ceiling scaled with the
+    machine, so a 4-core CI box would have hit it at eight plugins.
+
+    A tiny executor here makes the property testable without needing a
+    hundred-core machine: with the bug, the third client cannot complete a
+    request; without it, all eight can.
+    """
+    loop = asyncio.get_running_loop()
+    tiny = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+    loop.set_default_executor(tiny)
+    try:
+        clients = []
+        pipes = []
+        for _ in range(8):
+            pipe = _BlockingPipe()
+            client = MCPStdioClient()
+            await client.connect(pipe, pipe)  # type: ignore[arg-type]
+            clients.append(client)
+            pipes.append(pipe)
+
+        # Every client must be able to complete a request even though all of
+        # them are simultaneously parked on a read that has not answered yet.
+        for i, (client, pipe) in enumerate(zip(clients, pipes, strict=True)):
+            task = asyncio.create_task(client.ping(timeout=5.0))
+            await asyncio.sleep(0)
+            pipe.push(json.dumps({"jsonrpc": "2.0", "id": 1, "result": {}}).encode() + b"\n")
+            assert await asyncio.wait_for(task, timeout=5.0) == {}, f"client {i} did not answer"
+
+        for client in clients:
+            await client.close()
+    finally:
+        loop.set_default_executor(concurrent.futures.ThreadPoolExecutor())
+        tiny.shutdown(wait=False)
+
+
+@pytest.mark.asyncio
+async def test_close_does_not_block_on_a_reader_that_is_mid_read():
+    """``close()`` used to ``await`` the reader task, which was itself blocked
+    in an executor call that cannot be cancelled."""
+    pipe = _BlockingPipe()
+    client = MCPStdioClient()
+    await client.connect(pipe, pipe)  # type: ignore[arg-type]
+    await asyncio.wait_for(client.close(), timeout=5.0)
+    assert pipe.closed

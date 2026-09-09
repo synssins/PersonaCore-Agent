@@ -1,0 +1,74 @@
+id = "shell_files_jobs"
+name = "Shell, Files and Jobs"
+version = "0.1.0"
+runtime = "python"
+entry = ["-m", "workstation_agent.plugins.shell_files_jobs"]
+declared_permissions = [
+  # Contract §6's internal names are `family.verb`; `family_verb` is only the
+  # wire spelling the network endpoint translates to (network_mcp/tools.py's
+  # `internal_name` vs `name`).  `host.invoke` receives the dotted form on
+  # every real call path, so every `tool:` and `args:` entry below is dotted.
+  "tool:shell.run",
+  "tool:files.list",
+  "tool:files.read",
+  "tool:files.write",
+  "tool:jobs.wait",
+  "tool:jobs.output",
+  "tool:jobs.list",
+  "tool:jobs.kill",
+
+  # Which job-id namespace this plugin owns.  Job ids here are
+  # `j-shell-<hex>`; the adb family's are `j-adb-<hex>`.  A plugin cannot see
+  # another plugin's jobs, so a complete `jobs_*` needs the host to route a
+  # call by the id's prefix and to fan `jobs_list` out across every plugin
+  # carrying a `jobs:` entry.  That host change does not exist yet; this line
+  # is the signed statement it will read, so making it is pure routing rather
+  # than a job-id format migration.  The gate ignores this prefix — every
+  # reader of declared_permissions filters for `tool:`, `args:`, `path:`,
+  # `cmd:` or `domain:` — so it changes no permission decision.
+  "jobs:shell",
+
+  # Declared roots (§6: files_* "are confined to the declared roots: a path
+  # outside is denied").  LocalLow is first because it is the one a
+  # low-integrity plugin can WRITE to — it carries a Low mandatory label,
+  # while Documents and Downloads are readable and not writable — so it is
+  # also what shell.run uses as its default working directory.
+  "path:%USERPROFILE%\\AppData\\LocalLow\\WorkstationAgent",
+  "path:%USERPROFILE%\\Documents",
+  "path:%USERPROFILE%\\Downloads",
+
+  # What each argument IS.  args:<tool>:<mode>[:[!]<name>=<class>,...]
+  # mode is read|action; class is ws_path|ws_command|web_target|foreign|opaque;
+  # "!" marks the argument required.  Default-deny: a tool with no entry here
+  # is refused, and so is a call carrying an argument no entry names.  The
+  # names and the modes match network_mcp/tools.py's schemas exactly — an
+  # argument declared here that the schema does not offer is dead weight, and
+  # one the schema offers that is not declared here is a refused call.
+  "args:shell.run:action:!command=ws_command,cwd=ws_path,shell=opaque,wait_s=opaque",
+  "args:files.list:read:!path=ws_path",
+  "args:files.read:read:!path=ws_path,from_byte=opaque,max_bytes=opaque",
+  "args:files.write:action:!path=ws_path,!content=opaque,append=opaque",
+  "args:jobs.wait:read:!job_id=opaque,wait_s=opaque",
+  "args:jobs.output:read:!job_id=opaque,from_byte=opaque,max_bytes=opaque",
+  "args:jobs.list:read",
+  "args:jobs.kill:action:!job_id=opaque",
+]
+
+# There is deliberately NO `cmd:` allowlist above, and `command_outside_
+# allowlist` is listed as CONFIRMABLE rather than left to the hard guard.
+# `permissions._command_outside_allowlist` treats an empty allowlist as "every
+# command is outside it" (the same inversion `path:` uses), so every shell.run
+# reaches the confirmation prompt and none reaches it silently.  That is §7's
+# "Always prompt: shell_run", expressed in the one file the signature covers.
+#
+# `outside_declared_paths` is deliberately NOT listed, which leaves it to the
+# hard guard: §6 says a path outside the roots is `denied`, not "confirmable",
+# and files_write must not be approvable outside them at a prompt.
+#
+# §7 also puts files_write on the always-prompt list.  There is no manifest
+# condition that expresses "always, regardless of arguments" — that list is an
+# Agent setting and belongs to the confirmation subtask, not here.
+confirmable_conditions = ["command_outside_allowlist"]
+
+[compat]
+min_host_version = "0.1.0"

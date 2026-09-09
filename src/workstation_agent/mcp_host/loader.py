@@ -425,6 +425,39 @@ def _plugin_dir_files(plugin_dir: Path) -> list[tuple[str, Path]]:
     ]
 
 
+def unresolved_entry_modules(entry: list[str]) -> list[str]:
+    """Return the ``-m`` modules in *entry* that ``find_spec`` cannot resolve.
+
+    Exists for the **signer**, and the reason is a footgun that produced a
+    silently-wrong signature.  :func:`_covered_files` labels each digest with
+    the module-relative name when a ``-m`` entry resolves, and falls back to
+    plugin-dir-relative labels when it does not.  Both are legitimate — the
+    fallback is how an external plugin under ``%APPDATA%`` gets covered at all
+    — but they are *different messages* for the same files.
+
+    Sign a bundled plugin from a git worktree, where the venv's editable
+    install points at the main checkout, and the module is unresolvable: the
+    signer takes the fallback and signs over ``__init__.py`` while the verifier,
+    running where the package *is* importable, computes
+    ``workstation_agent.plugins.<id>/__init__.py``.  The signature is written,
+    the signer's own verify passes (it resolves the same wrong way), and the
+    plugin quarantines for everyone else.  Nothing in the output says so.
+
+    So the signer asks this first and refuses rather than guessing.
+    """
+    unresolved: list[str] = []
+    it = iter(entry)
+    for arg in it:
+        if arg != "-m":
+            continue
+        module_name = next(it, None)
+        if module_name is None:
+            break
+        if not _resolve_module_files(module_name):
+            unresolved.append(module_name)
+    return unresolved
+
+
 def _covered_files(entry: list[str], plugin_dir: Path) -> list[tuple[str, Path]]:
     """Resolve entry command to the ``(label, path)`` pairs the signature covers.
 

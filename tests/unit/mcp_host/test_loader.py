@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-import contextlib
 import hashlib
 import importlib.metadata
 from pathlib import Path
 
+import pytest
 from nacl.signing import SigningKey
 
+from tests.fakes.gen_test_keypair import copy_plugin, sign_plugin_copy
 from workstation_agent.mcp_host import loader
 
 _HELLO_WORLD_DIR = (
@@ -250,16 +251,6 @@ def test_discover_entry_point_source(tmp_path, monkeypatch):
     assert any(m.id == "ep_plugin" for m in manifests)
 
 
-def _sign_hello_world_bundle(pubkey_bytes: bytes, signing_key: SigningKey) -> None:
-    """Re-sign the bundled hello_world plugin with *signing_key* and register pubkey."""
-    manifests = loader._discover_bundled()
-    hw = next(m for m in manifests if m.id == "hello_world")
-    signed = signing_key.sign(loader.signing_message(hw))
-    hw.signature_file.write_bytes(signed.signature)
-    if pubkey_bytes not in loader.TRUSTED_PUBKEYS:
-        loader.TRUSTED_PUBKEYS.append(pubkey_bytes)
-
-
 def test_entry_file_paths_resolves_module_and_package():
     """_entry_file_paths for hello_world returns both __init__.py and __main__.py."""
     paths = loader._entry_file_paths(
@@ -348,64 +339,48 @@ def test_entry_file_paths_hashes_all_py_when_entry_has_no_files(tmp_path):
     assert py_files == {"a.py", "b.py", "c.py"}, f"got {py_files}"
 
 
-def test_entry_file_hashing_includes_module_files():
-    """Tampering with __main__.py of a signed plugin flips verify → 'invalid'."""
+@pytest.mark.parametrize("filename", ["__main__.py", "__init__.py"])
+def test_tampering_with_any_covered_module_flips_verify_to_invalid(tmp_path, filename):
+    """Tampering with a signed plugin's code flips verify → 'invalid'.
+
+    Operates on a **copy**.  These two tests used to sign the tracked
+    ``hello_world`` in place and then write ``# tampered`` into its
+    ``__init__.py`` / ``__main__.py``, restoring both in a ``finally``.  A
+    ``finally`` does not run when the session is killed — a pytest-timeout, a
+    ``^C`` — so an interrupted run left a tracked plugin's *source* with a
+    tamper marker in it and its signature rewritten, which is both a dirty
+    working tree and a booby trap for the next run.
+    """
     signing_key = SigningKey.generate()
-    pubkey = bytes(signing_key.verify_key)
+    copy = copy_plugin(_HELLO_WORLD_DIR, tmp_path)
+    pubkey = sign_plugin_copy(copy, signing_key)
 
-    original_sig = (_HELLO_WORLD_DIR / "signature.sig").read_bytes()
-    main_path = _HELLO_WORLD_DIR / "__main__.py"
-    original_main = main_path.read_bytes()
-    try:
-        # Sign the plugin fresh with the test key.
-        _sign_hello_world_bundle(pubkey, signing_key)
+    good = loader.verify(copy, [pubkey], allow_unsigned=False)
+    assert good.status == "valid", good.reason
 
-        # Sanity check: unmodified plugin verifies.
-        hw = next(m for m in loader._discover_bundled() if m.id == "hello_world")
-        good = loader.verify(hw, [pubkey], allow_unsigned=False)
-        assert good.status == "valid", good.reason
+    target = copy.plugin_dir / filename
+    target.write_bytes(target.read_bytes() + b"\n# tampered\n")
 
-        # Tamper: change one byte in __main__.py.
-        main_path.write_bytes(original_main + b"\n# tampered\n")
+    tampered = loader.verify(copy, [pubkey], allow_unsigned=False)
+    assert tampered.status == "invalid", (
+        f"expected invalid after {filename} tamper, got {tampered.status}"
+    )
 
-        tampered = loader.verify(hw, [pubkey], allow_unsigned=False)
-        assert tampered.status == "invalid", (
-            f"expected invalid after __main__.py tamper, got {tampered.status}"
+
+def test_a_test_run_never_modifies_a_tracked_plugin_signature():
+    """The canary is committed as the sentinel and must stay that way.
+
+    ``hello_world`` and ``claude_code_bridge`` are deliberately unsigned, and
+    several tests need a *real* signature to check against.  Signing them in
+    place made ``git status`` show a modified plugin signature after a run, and
+    a half-restored one made an unrelated hang look like a code bug.
+    """
+    for plugin_id in ("hello_world", "claude_code_bridge"):
+        sig = _HELLO_WORLD_DIR.parent / plugin_id / "signature.sig"
+        assert sig.read_bytes() == b"UNSIGNED", (
+            f"{plugin_id}/signature.sig was rewritten by a test; it is committed "
+            f"as the UNSIGNED sentinel and tests must sign a copy instead"
         )
-    finally:
-        main_path.write_bytes(original_main)
-        (_HELLO_WORLD_DIR / "signature.sig").write_bytes(original_sig)
-        with contextlib.suppress(ValueError):
-            loader.TRUSTED_PUBKEYS.remove(pubkey)
-
-
-def test_entry_file_hashing_covers_package_init_and_main():
-    """Tampering with __init__.py of a signed plugin flips verify → 'invalid'."""
-    signing_key = SigningKey.generate()
-    pubkey = bytes(signing_key.verify_key)
-
-    original_sig = (_HELLO_WORLD_DIR / "signature.sig").read_bytes()
-    init_path = _HELLO_WORLD_DIR / "__init__.py"
-    original_init = init_path.read_bytes()
-    try:
-        _sign_hello_world_bundle(pubkey, signing_key)
-
-        hw = next(m for m in loader._discover_bundled() if m.id == "hello_world")
-        good = loader.verify(hw, [pubkey], allow_unsigned=False)
-        assert good.status == "valid", good.reason
-
-        # Tamper: change one byte in __init__.py.
-        init_path.write_bytes(original_init + b"\n# tampered\n")
-
-        tampered = loader.verify(hw, [pubkey], allow_unsigned=False)
-        assert tampered.status == "invalid", (
-            f"expected invalid after __init__.py tamper, got {tampered.status}"
-        )
-    finally:
-        init_path.write_bytes(original_init)
-        (_HELLO_WORLD_DIR / "signature.sig").write_bytes(original_sig)
-        with contextlib.suppress(ValueError):
-            loader.TRUSTED_PUBKEYS.remove(pubkey)
 
 
 def test_discover_deduplication(tmp_path, monkeypatch):
@@ -439,3 +414,88 @@ def test_discover_deduplication(tmp_path, monkeypatch):
     combined = loader.discover()
     ids = [m.id for m in combined]
     assert ids.count("dup_plugin") <= 1
+
+
+# ---------------------------------------------------------------------------
+# The signer must not silently sign the wrong message
+# ---------------------------------------------------------------------------
+
+
+def test_unresolved_entry_modules_reports_an_unimportable_m_entry():
+    assert loader.unresolved_entry_modules(["-m", "no.such.module.anywhere"]) == [
+        "no.such.module.anywhere",
+    ]
+
+
+def test_unresolved_entry_modules_is_empty_for_an_importable_one():
+    assert loader.unresolved_entry_modules(
+        ["-m", "workstation_agent.plugins.hello_world"],
+    ) == []
+
+
+@pytest.mark.parametrize("entry", [[], ["-m"], ["plugin.py"]])
+def test_unresolved_entry_modules_ignores_entries_with_no_module(entry):
+    assert loader.unresolved_entry_modules(entry) == []
+
+
+def test_the_two_label_schemes_really_do_produce_different_messages(tmp_path):
+    """Why the signer refuses rather than warns.
+
+    A ``-m`` entry that resolves is labelled module-relative; one that does not
+    falls back to plugin-dir-relative.  Same files, different signed message —
+    so a signature produced under one scheme is invalid under the other, which
+    is exactly what happened when a bundled plugin was signed from a worktree
+    whose venv had the package installed from a different checkout.  The signer
+    could not notice: its own verify step resolved the same wrong way.
+    """
+    copy = copy_plugin(_HELLO_WORLD_DIR, tmp_path)  # entry=[] -> directory scan
+    dir_scan = [label for label, _ in loader._covered_files(copy.entry, copy.plugin_dir)]
+    module = [
+        label
+        for label, _ in loader._covered_files(
+            ["-m", "workstation_agent.plugins.hello_world"], copy.plugin_dir,
+        )
+    ]
+    assert dir_scan != module
+    assert all("/" not in label for label in dir_scan)
+    assert all(label.startswith("workstation_agent.plugins.") for label in module)
+
+
+def test_the_signer_refuses_when_it_cannot_import_the_entry_module(tmp_path):
+    """The footgun, closed: refuse rather than write a signature valid nowhere."""
+    # Loaded by path: `scripts/` is deliberately not a package (ruff's
+    # per-file-ignores exempt it from INP001), so there is nothing to import
+    # by name and a sys.path insert would only hide that from the type checker.
+    import importlib.util
+
+    script = Path(__file__).resolve().parents[3] / "scripts" / "sign_plugin.py"
+    spec = importlib.util.spec_from_file_location("_sign_plugin_under_test", script)
+    assert spec is not None
+    assert spec.loader is not None
+    signer = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(signer)
+
+    copy = copy_plugin(_HELLO_WORLD_DIR, tmp_path)
+    toml = copy.plugin_dir / "plugin.toml"
+    toml.write_text(
+        toml.read_text(encoding="utf-8").replace(
+            'entry = ["-m", "workstation_agent.plugins.hello_world"]',
+            'entry = ["-m", "no.such.module.anywhere"]',
+        ),
+        encoding="utf-8",
+    )
+    before = (copy.plugin_dir / "signature.sig").read_bytes()
+
+    line = signer.sign_plugin(
+        copy.plugin_dir, SigningKey.generate(), replace_sentinel=True,
+    )
+    assert line.startswith("FAIL"), line
+    assert "cannot import no.such.module.anywhere" in line
+    assert (copy.plugin_dir / "signature.sig").read_bytes() == before, (
+        "a refused signing must not have written anything"
+    )
+
+    ok = signer.sign_plugin(
+        copy.plugin_dir, SigningKey.generate(), replace_sentinel=True, allow_dir_scan=True,
+    )
+    assert ok.startswith("OK"), ok

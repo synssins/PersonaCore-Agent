@@ -31,6 +31,11 @@ Safety rails:
 * The private key is never echoed.  The derived *public* key is printed so the
   operator can confirm which identity signed.
 * Every signature written is verified before the script exits non-zero/zero.
+* Signing is **refused** when this interpreter cannot import the plugin's ``-m``
+  entry, because the signature would then be computed over directory-relative
+  names while the loader checks module-relative ones.  That produced a
+  silently-invalid signature once already; ``--allow-dir-scan`` is the opt-in
+  for genuinely out-of-tree plugins.
 """
 
 from __future__ import annotations
@@ -77,6 +82,7 @@ def sign_plugin(
     signing_key: SigningKey,
     *,
     replace_sentinel: bool = False,
+    allow_dir_scan: bool = False,
 ) -> str:
     """Sign the plugin at *plugin_dir*; return a one-line status for the caller."""
     toml_path = plugin_dir / "plugin.toml"
@@ -90,6 +96,25 @@ def sign_plugin(
     manifest = _loader._parse_toml(toml_path, source="signing")  # noqa: SLF001
     if manifest is None:
         return f"FAIL  {plugin_dir.name}: plugin.toml did not parse"
+
+    # REFUSE rather than sign the wrong message.  A `-m` entry the signing
+    # interpreter cannot import makes `_covered_files` fall back to
+    # plugin-dir-relative labels, and the verifier — running somewhere the
+    # package IS importable — computes module-relative ones.  The signature is
+    # then valid nowhere except here, and this script's own verify step agrees
+    # with itself, so nothing catches it.  This has already happened once, when
+    # a bundled plugin was signed from a git worktree whose venv had the
+    # package installed from a different checkout.
+    unresolved = _loader.unresolved_entry_modules(manifest.entry)
+    if unresolved and not allow_dir_scan:
+        joined = ", ".join(unresolved)
+        return (
+            f"FAIL  {plugin_dir.name}: this interpreter cannot import {joined}, so the "
+            f"signature would cover directory-relative names while the loader checks "
+            f"module-relative ones. Run with the package importable "
+            f"(PYTHONPATH=src, or an editable install of THIS checkout), or pass "
+            f"--allow-dir-scan if this really is an out-of-tree plugin."
+        )
 
     message = _loader.signing_message(manifest)
     signature = signing_key.sign(message).signature
@@ -119,6 +144,14 @@ def main() -> int:
         help=f"hex-encoded Ed25519 private key file (default: ${_ENV_VAR})",
     )
     p.add_argument(
+        "--allow-dir-scan",
+        action="store_true",
+        help=(
+            "permit signing a plugin whose -m entry this interpreter cannot import "
+            "(correct only for out-of-tree plugins; see sign_plugin())"
+        ),
+    )
+    p.add_argument(
         "--replace-sentinel",
         action="store_true",
         help="also sign plugins whose signature.sig currently holds the UNSIGNED sentinel",
@@ -138,7 +171,10 @@ def main() -> int:
     for target in targets:
         try:
             line = sign_plugin(
-                target.resolve(), signing_key, replace_sentinel=args.replace_sentinel,
+                target.resolve(),
+                signing_key,
+                replace_sentinel=args.replace_sentinel,
+                allow_dir_scan=args.allow_dir_scan,
             )
         except Exception as exc:  # noqa: BLE001
             line = f"FAIL  {target.name}: {exc}"
