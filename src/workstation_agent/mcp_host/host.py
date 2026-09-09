@@ -86,6 +86,13 @@ _STRIP_PASSES = 8
 #: §5.3 — text results are capped by the Agent at 60,000 characters.
 MAX_RESULT_CHARS = 60_000
 
+#: What replaces content the stripper could not finish cleaning.  A refusal,
+#: not a best effort: see :func:`strip_special_tokens`.
+_UNSTRIPPABLE = (
+    "[withheld: this output nests chat-template special tokens more deeply than "
+    "the Agent unwinds, so it could not be made safe to display]"
+)
+
 
 def strip_special_tokens(text: str) -> str:
     """Remove chat-template special tokens from untrusted content (§5.6).
@@ -96,6 +103,19 @@ def strip_special_tokens(text: str) -> str:
     ``<|im_start|>`` behind.  Repeating until the text stops changing (with
     a hard bound, so a pathological input cannot spin here) removes the
     reassembled token too.
+
+    **Exhausting the pass budget is a refusal, not a partial result.**  The
+    loop is bounded because each pass only deletes, so an unbounded version
+    terminates but takes O(n) passes over an O(n) string — a 60,000-character
+    adversarial input would spin here, trading a silent failure for a CPU
+    denial of service that nobody needs (no legitimate content nests these
+    eight deep).  Returning the partially-stripped text on exhaustion, though,
+    makes "I could not finish" indistinguishable from "there was nothing to
+    strip", and the caller cannot tell the difference.  So the budget is kept
+    and the result is *checked*: if tokens genuinely survive after the last
+    allowed pass, the content is withheld and a warning is logged.  Text that
+    reached a fixed point on the last allowed pass is clean and is returned
+    normally — exhaustion alone is not the failure, surviving tokens are.
     """
     if not text:
         return text
@@ -105,41 +125,114 @@ def strip_special_tokens(text: str) -> str:
         if stripped == current:
             return current
         current = stripped
+    if _ANGLE_PIPE_TOKEN.search(current) or _BRACKET_TOKEN.search(current):
+        log.warning(
+            "special-token stripping did not converge in %d passes; withholding content",
+            _STRIP_PASSES,
+        )
+        return _UNSTRIPPABLE
     return current
 
 
-def _cap_text(text: str) -> str:
-    """Apply §5.3's 60,000-character cap with its stated trailing marker."""
-    if len(text) <= MAX_RESULT_CHARS:
+#: §5.3's trailing marker, as a template.  The rendered marker counts toward
+#: the cap it announces — see :func:`_truncate_to`.
+_CAP_MARKER = "[... {n} more characters; use jobs_output to page ...]"
+
+
+def _truncate_to(text: str, limit: int) -> str:
+    """Truncate *text* so the result — marker included — is at most *limit*.
+
+    The marker's length depends on the number it reports, which depends on
+    where the cut lands, which depends on the marker's length.  Sizing the
+    marker for the worst case (``n`` = the whole length) breaks that circle in
+    a single pass and makes ``len(result) <= limit`` provable rather than
+    approximate: the real ``n`` is never larger than the worst case, so the
+    real marker is never longer than the one budgeted for.
+    """
+    if len(text) <= limit:
         return text
-    remaining = len(text) - MAX_RESULT_CHARS
-    return (
-        text[:MAX_RESULT_CHARS]
-        + f"[... {remaining} more characters; use jobs_output to page ...]"
-    )
+    worst = _CAP_MARKER.format(n=len(text))
+    if limit <= len(worst):
+        # No room for text and marker both.  The marker is the more useful of
+        # the two — it says the content was cut — but it must still fit.
+        return worst[:limit]
+    keep = limit - len(worst)
+    return text[:keep] + _CAP_MARKER.format(n=len(text) - keep)
 
 
-#: Anything path-shaped.  The drive-letter alternative deliberately does NOT
-#: require a following separator: ``C:secret.txt`` is the drive-*relative*
-#: form and is just as much an absolute-path leak as ``C:\secret.txt``.
-_ABS_PATH = re.compile(r"(?:[A-Za-z]:|\\\\|(?<![\w.])/)[^\s'\"]*")
+def _cap_text(text: str) -> str:
+    """Apply §5.3's 60,000-character cap, **marker included**.
+
+    The marker counts toward the cap.  Slicing to 60,000 and *then* appending
+    a ~70-character marker used to yield a 60,070-character result — over the
+    cap it claims to enforce, and over the cap this function's own caller
+    re-applies, which cut the marker in half and appended a second one
+    reporting a nonsense remainder.  Landing at or under 60,000 makes a
+    second application of this cap a no-op.
+    """
+    return _truncate_to(text, MAX_RESULT_CHARS)
+
+
+#: Anything path-shaped.  The drive-letter alternative deliberately does not
+#: require a following *separator* — ``C:secret.txt`` is the drive-relative
+#: form and leaks just as much as ``C:\secret.txt`` — but it does require at
+#: least one following non-space character.  Without that it also matched the
+#: bare ``adb:`` or ``Authorization:`` that begins many plugin messages,
+#: turning "adb: failed to install" into "ad<path> failed to install" and,
+#: worse, destroying the credential keyword before :data:`_CREDENTIAL_KV`
+#: could key on it.  A drive-relative path never has a space after the colon;
+#: a prose label always does.
+_ABS_PATH = re.compile(r"(?:[A-Za-z]:[^\s'\"]+|\\\\[^\s'\"]*|(?<![\w.])/[^\s'\"]*)")
+
+_REASON_LIMIT = 300
+
+_REDACTED = "[redacted]"
+
+#: ``key: value`` / ``key=value`` where the key names a credential.  The value
+#: pattern is "the rest of the line", not ``\S+`` — with ``\S+`` a line like
+#: ``Authorization: Bearer eyJhbGci….verysecret`` matched only the word
+#: ``Bearer`` and left the token itself sitting in the output.  A credential
+#: key means everything after it on that line is the credential.
+_CREDENTIAL_KV = re.compile(
+    r"(?i)\b(authorization|auth[-_]?token|access[-_]?token|refresh[-_]?token|"
+    r"id[-_]?token|bearer|api[-_]?key|apikey|secret|password|passwd|pwd|"
+    r"session[-_]?id|cookie|set-cookie|x-api-key)\b\s*[:=]\s*.+",
+)
+
+#: A bare ``Bearer <token>`` anywhere in the line.
+_BEARER = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{8,}")
+
+#: A long run of credential-shaped characters with no spaces.  Deliberately
+#: long (40) so ordinary text — package names, class names, hashes of a dozen
+#: characters — survives, while a 32-byte token rendered as hex (64 chars) or
+#: base64 (43 chars) does not.
+_LONG_OPAQUE = re.compile(r"(?<![\w./-])[A-Za-z0-9._~+/=-]{40,}(?![\w./-])")
 
 
 def sanitise_reason(text: str) -> str:
     """Make an arbitrary error message safe to hand back as a §5.2 ``reason``.
 
     §5.2: "The Agent never returns a stack trace, an absolute path outside a
-    declared root, or the token."  An exception message from a plugin is
-    none of those things by construction, so all three are removed rather
-    than hoped for: only the first line survives (a traceback is multi-line),
-    anything path-shaped is replaced, and the result is bounded.
+    declared root, **or the token**."  An exception message from a plugin is
+    untrusted content like any other, so all three are removed rather than
+    hoped for: only the first line survives (a traceback is multi-line),
+    anything credential-shaped is replaced, anything path-shaped is replaced,
+    and the result is bounded.
+
+    Credentials are scrubbed **before** paths.  Otherwise the path pattern
+    consumes the ``Authorization:`` keyword and leaves the credential pattern
+    nothing to key on.  Nothing leaks by going in this order: a credential
+    value that happens to contain a path is replaced wholesale.
     """
     first_line = str(text).splitlines()[0] if text else ""
-    redacted = _ABS_PATH.sub("<path>", first_line)
+    redacted = _CREDENTIAL_KV.sub(lambda m: f"{m.group(1)}={_REDACTED}", first_line)
+    redacted = _BEARER.sub(f"Bearer {_REDACTED}", redacted)
+    redacted = _LONG_OPAQUE.sub(_REDACTED, redacted)
+    redacted = _ABS_PATH.sub("<path>", redacted)
     redacted = strip_special_tokens(redacted)
-    limit = 300
-    if len(redacted) > limit:
-        redacted = redacted[:limit] + "…"
+    if len(redacted) > _REASON_LIMIT:
+        # The ellipsis counts, exactly as the cap marker does in _truncate_to.
+        redacted = redacted[: _REASON_LIMIT - 1] + "…"
     return redacted or "the tool failed without a message"
 
 

@@ -2018,14 +2018,45 @@ def test_binary_content_never_travels() -> None:
 
 
 def test_oversized_text_is_capped_with_the_stated_marker() -> None:
-    """§5.3's 60,000-character cap and its exact trailing marker."""
+    """§5.3's 60,000-character cap, marker included, never overshoots it.
+
+    The marker's own length depends on the number it reports, which depends
+    on where the cut lands.  ``conform_result`` sizes the marker for the
+    worst case up front, so the rendered result — text plus marker — never
+    exceeds the cap it announces (previously it landed ~70 characters over).
+    """
     r = conform_result(
         {"content": [{"type": "text", "text": "x" * (MAX_RESULT_CHARS + 10)}],
          "isError": False},
     )
     text = r.content[0]["text"]
-    assert text.startswith("x" * MAX_RESULT_CHARS)
-    assert text.endswith("[... 10 more characters; use jobs_output to page ...]")
+    assert len(text) <= MAX_RESULT_CHARS
+    assert "more characters; use jobs_output to page ..." in text
+    assert text.startswith("x")
+    assert not text.startswith("x" * MAX_RESULT_CHARS), (
+        "the marker must eat into the 60,000-character budget, not sit past it"
+    )
+
+
+@pytest.mark.parametrize("length", [0, 1, MAX_RESULT_CHARS - 1, MAX_RESULT_CHARS,
+                                     MAX_RESULT_CHARS + 1, MAX_RESULT_CHARS + 70, 200_000])
+def test_cap_text_never_overshoots_the_cap(length: int) -> None:
+    """Mutation target for defect 1: reinstating the naive slice-then-append
+    overshoots the cap for any length past it.
+    """
+    assert len(host_mod._cap_text("y" * length)) <= MAX_RESULT_CHARS
+
+
+def test_a_capped_result_is_a_no_op_under_a_second_capping() -> None:
+    """Landing at or under the cap means re-applying the cap changes nothing.
+
+    This is why defect 1 mattered beyond arithmetic: a plugin that capped its
+    own output to something over 60,000 would have that marker cut in half by
+    a second application of this same function, appending a second, nonsense
+    marker.
+    """
+    capped = host_mod._cap_text("y" * 200_000)
+    assert host_mod._cap_text(capped) == capped
 
 
 def test_reason_never_carries_a_stack_trace_or_a_path() -> None:
@@ -2041,6 +2072,95 @@ def test_reason_never_carries_a_stack_trace_or_a_path() -> None:
     assert "C:\\Users" not in clean
     assert "secret.txt" not in clean
     assert "<path>" in clean
+
+
+def test_reason_is_never_over_the_stated_limit() -> None:
+    """Mutation target for defect 3: the ellipsis must count toward the cap.
+
+    A naive ``text[:300] + "…"`` lands at 301 characters — one over the limit
+    it is meant to enforce.
+    """
+    clean = sanitise_reason("word " * 1000)
+    assert len(clean) == host_mod._REASON_LIMIT
+    assert clean.endswith("…")
+
+
+def test_a_short_reason_is_left_alone() -> None:
+    assert sanitise_reason("short message") == "short message"
+
+
+def test_reason_scrubs_a_bearer_token() -> None:
+    """Mutation target for defect 4: §5.2 forbids returning "the token"."""
+    leaky = 'adb: failed running curl -H "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.abcdef"'
+    clean = sanitise_reason(leaky)
+    assert "eyJhbGciOiJIUzI1NiJ9.abcdef" not in clean
+    assert "adb" in clean, "the adb: prefix must survive, not be eaten as a path"
+
+
+def test_reason_scrubs_a_credential_key_value_pair() -> None:
+    clean = sanitise_reason("login failed: password=hunter2fortyTwoWithExtraCharacters")
+    assert "hunter2" not in clean
+
+
+def test_reason_scrubs_a_long_opaque_token_with_no_keyword() -> None:
+    token = "a" * 45
+    clean = sanitise_reason(f"upload failed: {token}")
+    assert token not in clean
+
+
+def test_credentials_are_scrubbed_before_paths_so_the_keyword_survives() -> None:
+    """Ordering matters: the path pattern must not consume ``Authorization:``
+    before the credential pattern gets a chance to key on it.
+    """
+    leaky = "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.abcdefghijklmnop"
+    clean = sanitise_reason(leaky)
+    assert "eyJhbGciOiJIUzI1NiJ9" not in clean
+    assert "[redacted]" in clean
+
+
+def test_the_path_pattern_does_not_eat_a_bare_prefix_like_adb_colon() -> None:
+    """Mutation target: the drive-letter alternative needs a non-space tail.
+
+    Without it, ``[A-Za-z]:`` with a zero-length tail matches the bare
+    ``adb:`` that begins many device-tool messages, turning "adb: failed to
+    install app.apk" into "ad<path> failed to install app.apk" — not the
+    plain English §11 item 6 requires.
+    """
+    clean = sanitise_reason("adb: failed to install app.apk")
+    assert "<path>" not in clean
+    assert clean == "adb: failed to install app.apk"
+
+
+def test_a_drive_relative_path_is_still_caught() -> None:
+    """The fix narrows the match; it must not stop catching real paths."""
+    clean = sanitise_reason("cannot read C:secrets.txt")
+    assert "<path>" in clean
+    assert "secrets.txt" not in clean
+
+
+def test_strip_special_tokens_withholds_content_that_never_converges() -> None:
+    """Mutation target for defect 2: exhaustion must be a refusal.
+
+    Forty levels of nesting outlast the 8-pass budget, so the naive
+    implementation returns partially-stripped text that still contains a
+    special token. The fix must detect that and withhold instead.
+    """
+    deep = "<|im_" * 40 + "start" + "|>" * 40
+    out = strip_special_tokens(deep)
+    assert out == host_mod._UNSTRIPPABLE
+    assert not host_mod._ANGLE_PIPE_TOKEN.search(out)
+
+
+def test_strip_special_tokens_still_returns_normally_when_it_converges_in_time() -> None:
+    """Exhaustion alone is not the failure; surviving tokens are.
+
+    Text that needs exactly the pass budget must come back stripped, not
+    withheld, or the refusal fires on legitimate content.
+    """
+    nested = "<|im_" * 4 + "start" + "|>" * 4
+    out = strip_special_tokens(nested)
+    assert out != host_mod._UNSTRIPPABLE
+    assert not host_mod._ANGLE_PIPE_TOKEN.search(out)
 
 
 # ---------------------------------------------------------------------------
