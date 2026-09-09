@@ -255,13 +255,39 @@
              value="{{ join_values.core_address }}"
              autocomplete="off" spellcheck="false" placeholder="192.168.1.150:8053">
 
-      <label for="nm-listen-address">Reach this workstation at:</label>
-      <select id="nm-listen-address" name="listen_address">
-        {% for c in listen_choices %}
-          <option value="{{ c.value }}"
-            {% if join_values.listen_address == c.value or (not join_values.listen_address and loop.first) %}selected{% endif %}>{{ c.label }}</option>
+      <fieldset>
+        <legend>Reach this workstation at</legend>
+        {# One control per RANK, not one control listing the addresses. A
+           <select multiple> submits its values in document order and never in
+           the order they were clicked, so it cannot express "try this one
+           first" at all -- the preference would be lost in the browser, before
+           the POST, and everything below would faithfully carry an order that
+           was already wrong. Here document order IS preference order, so the
+           browser's own submission order is the answer and no script is
+           involved in keeping it. See _listen_slots. #}
+        {% for slot in listen_slots %}
+          <label for="{% if slot.preferred %}nm-listen-address{% else %}nm-listen-address-{{ slot.index }}{% endif %}">{{ slot.ordinal }}{% if slot.preferred %} — tried first{% endif %}:</label>
+          <select id="{% if slot.preferred %}nm-listen-address{% else %}nm-listen-address-{{ slot.index }}{% endif %}"
+                  name="listen_address">
+            {# "Not used" is absent from the first slot on purpose: a ranking
+               with nothing in first place is not a ranking, and offering it
+               would let the owner build a selection that only join.py can
+               refuse, one screen later. #}
+            {% if not slot.preferred %}
+              <option value="" {% if not slot.selected %}selected{% endif %}>— not used —</option>
+            {% endif %}
+            {% for c in listen_choices %}
+              <option value="{{ c.value }}"
+                {% if slot.selected == c.value %}selected{% endif %}>{{ c.label }}</option>
+            {% endfor %}
+          </select>
         {% endfor %}
-      </select>
+      </fieldset>
+      <p>PersonaCore reaches this workstation at <strong>one</strong> of these at a
+        time — they are alternative ways in to the same machine, not several
+        machines. It tries the <strong>1st</strong> first and falls back down the
+        list, so put the address it should normally use at the top. Leave a rank
+        at <em>not used</em> to leave that address out.</p>
       <p>Only addresses this endpoint is actually answering on are listed, and
         loopback addresses are left out on purpose: <code>127.0.0.1</code> means
         PersonaCore itself on the machine PersonaCore runs on, so telling it to

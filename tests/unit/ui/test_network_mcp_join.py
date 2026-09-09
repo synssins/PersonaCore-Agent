@@ -38,6 +38,7 @@ from workstation_agent.network_mcp import join as join_module
 from workstation_agent.network_mcp.credentials import ensure_token
 from workstation_agent.network_mcp.enrolment import EnrolmentError, JoinStatus
 from workstation_agent.network_mcp.join import CoreRefusedError
+from workstation_agent.network_mcp.listeners import endpoint_url
 
 CODE = "PAIR-4417"
 CORE = "192.168.1.150:8053"
@@ -80,8 +81,11 @@ class FakeEndpoint:
 
     def info(self):
         return _Info(
-            url=f"https://{self.bind_hosts[0]}:8765/mcp",
-            urls=tuple(f"https://{h}:8765/mcp" for h in self.bind_hosts),
+            # ``endpoint_url``, not an f-string of our own: the real endpoint
+            # brackets an IPv6 literal, and a fake that does not would show the
+            # picker a label the product never produces.
+            url=endpoint_url(self.bind_hosts[0], 8765),
+            urls=tuple(endpoint_url(h, 8765) for h in self.bind_hosts),
             bind_host=self.bind_hosts[0],
             bind_hosts=self.bind_hosts,
             port=8765,
@@ -589,6 +593,221 @@ def test_an_address_the_picker_did_offer_is_not_refused(tmp_path, monkeypatch):
     )
 
     assert "joined as workstation-front-desk" in response.text
+
+
+# ---------------------------------------------------------------------------
+# The ranking: a set of addresses, in the order the owner put them
+# ---------------------------------------------------------------------------
+
+
+def join_form(text: str) -> str:
+    """Just the Join form, so the bind-address controls above cannot match."""
+    _, _, after = text.partition('action="/network-mcp/join"')
+    form, _, _ = after.partition("</form>")
+    return form
+
+
+def test_the_picker_ranks_rather_than_multi_selecting(tmp_path):
+    """A ``<select multiple>`` submits in document order, never click order, so
+    it cannot express a preference at all. One control per rank can, and the
+    rank is the label rather than help text."""
+    endpoint = FakeEndpoint(tmp_path, bind_hosts=(LAN, "10.0.0.7", "fd00::5"))
+    client = make_client(tmp_path=tmp_path, network_mcp=endpoint)
+
+    form = join_form(client.get("/network-mcp").text)
+
+    assert "multiple" not in form, "a multi-select would lose the order in the browser"
+    assert form.count('name="listen_address"') == 3, "one rank slot per address"
+    assert "1st — tried first" in form
+    assert "2nd" in form
+    assert "3rd" in form
+
+
+def test_the_first_rank_cannot_be_left_unused(tmp_path):
+    """A ranking with nothing in first place is not a ranking."""
+    endpoint = FakeEndpoint(tmp_path, bind_hosts=(LAN, "10.0.0.7"))
+    client = make_client(tmp_path=tmp_path, network_mcp=endpoint)
+
+    form = join_form(client.get("/network-mcp").text)
+    first, _, rest = form.partition('id="nm-listen-address-1"')
+
+    assert "— not used —" not in first
+    assert "— not used —" in rest
+
+
+def test_the_default_ranking_is_the_one_preferred_address(tmp_path):
+    """What this page has always done, unchanged: the endpoint's own preferred
+    address, and nothing else unless the owner adds it."""
+    endpoint = FakeEndpoint(tmp_path, bind_hosts=(LAN, "10.0.0.7"))
+    client = make_client(tmp_path=tmp_path, network_mcp=endpoint)
+
+    form = join_form(client.get("/network-mcp").text)
+    first, _, rest = form.partition('id="nm-listen-address-1"')
+
+    assert re.search(rf'value="{re.escape(LAN)}"\s+selected', first)
+    assert not re.search(r'value="10\.0\.0\.7"\s+selected', first)
+    assert re.search(r'value=""\s+selected', rest), "later ranks default to not used"
+
+
+def test_a_ranking_reaches_the_core_in_the_owners_order(tmp_path, monkeypatch):
+    """The property this feature turns on, from the form to the wire.
+
+    The order posted is not the endpoint's own order and not alphabetical, so a
+    sort or a silent re-ordering anywhere between here and ``httpx`` shows up
+    as a different list rather than as a list that happens to still be right.
+    """
+    sink: list[dict] = []
+    core_answers(monkeypatch, accepting(sink))
+    endpoint = FakeEndpoint(tmp_path, bind_hosts=(LAN, "10.0.0.7", "fd00::5"))
+    client = make_client(tmp_path=tmp_path, network_mcp=endpoint)
+
+    response = client.post(
+        "/network-mcp/join",
+        data={
+            "code": CODE,
+            "core_address": CORE,
+            "listen_address": ["fd00::5", LAN, "10.0.0.7"],
+        },
+    )
+
+    assert response.status_code == 200
+    assert [entry["url"] for entry in sink[0]["urls"]] == [
+        "https://[fd00::5]:8765/mcp",
+        f"https://{LAN}:8765/mcp",
+        "https://10.0.0.7:8765/mcp",
+    ]
+    assert sink[0]["url"] == "https://[fd00::5]:8765/mcp", "the preferred one, still singular"
+
+
+def test_an_unused_rank_slot_drops_out_without_reordering_the_rest(tmp_path, monkeypatch):
+    sink: list[dict] = []
+    core_answers(monkeypatch, accepting(sink))
+    endpoint = FakeEndpoint(tmp_path, bind_hosts=(LAN, "10.0.0.7", "fd00::5"))
+    client = make_client(tmp_path=tmp_path, network_mcp=endpoint)
+
+    client.post(
+        "/network-mcp/join",
+        data={
+            "code": CODE,
+            "core_address": CORE,
+            "listen_address": ["10.0.0.7", "", "fd00::5"],
+        },
+    )
+
+    assert [entry["url"] for entry in sink[0]["urls"]] == [
+        "https://10.0.0.7:8765/mcp",
+        "https://[fd00::5]:8765/mcp",
+    ]
+
+
+def test_every_submitted_address_is_checked_and_not_only_the_preferred_one(tmp_path):
+    """The gate is per entry. A good first address and a loopback third would
+    otherwise put "dial yourself" into ``urls`` as a fallback the owner never
+    sees, because the preferred address connects."""
+    endpoint = FakeEndpoint(tmp_path, bind_hosts=(LAN,))
+    client = make_client(tmp_path=tmp_path, network_mcp=endpoint)
+
+    response = client.post(
+        "/network-mcp/join",
+        data={"code": CODE, "core_address": CORE, "listen_address": [LAN, "127.0.0.1"]},
+    )
+
+    assert response.status_code == 200
+    assert "not an address another machine can be reached at" in response.text
+    assert endpoint.codes == [], "refused before the window opens"
+
+
+def test_an_address_the_endpoint_does_not_serve_is_refused_wherever_it_is_ranked(
+    tmp_path,
+):
+    """The picker constrains a browser and constrains nothing else."""
+    endpoint = FakeEndpoint(tmp_path, bind_hosts=(LAN, "10.0.0.7"))
+    client = make_client(tmp_path=tmp_path, network_mcp=endpoint)
+
+    response = client.post(
+        "/network-mcp/join",
+        data={
+            "code": CODE,
+            "core_address": CORE,
+            "listen_address": [LAN, "10.0.0.7", "203.0.113.9"],
+        },
+    )
+
+    assert "not answering on the address that was submitted (203.0.113.9)" in response.text
+    assert endpoint.codes == [], "refused before the window opens"
+
+
+def test_a_refusal_hands_the_ranking_back_rather_than_the_default(tmp_path):
+    """A correction must cost one edit, not a re-ranking."""
+    endpoint = FakeEndpoint(tmp_path, bind_hosts=(LAN, "10.0.0.7", "fd00::5"))
+    client = make_client(tmp_path=tmp_path, network_mcp=endpoint)
+
+    response = client.post(
+        "/network-mcp/join",
+        data={
+            "code": CODE,
+            "core_address": CORE,
+            "listen_address": ["fd00::5", "10.0.0.7", "203.0.113.9"],
+        },
+    )
+
+    form = join_form(response.text)
+    first, _, rest = form.partition('id="nm-listen-address-1"')
+    second, _, _third = rest.partition('id="nm-listen-address-2"')
+    assert re.search(r'value="fd00::5"\s+selected', first)
+    assert re.search(r'value="10\.0\.0\.7"\s+selected', second)
+    assert 'name="code"' in form, "and the form is still there to correct"
+    assert CODE not in response.text, "but never the code"
+
+
+def test_the_ranking_that_comes_back_after_a_refusal_still_carries_no_code(tmp_path):
+    endpoint = FakeEndpoint(tmp_path, bind_hosts=(LAN,))
+    client = make_client(tmp_path=tmp_path, network_mcp=endpoint)
+
+    response = client.post(
+        "/network-mcp/join",
+        data={"code": CODE, "core_address": CORE, "listen_address": [LAN, "203.0.113.9"]},
+    )
+
+    assert CODE not in response.text
+    assert 'value=""' in join_form(response.text), "the code field is rendered empty"
+
+
+def test_a_ranking_that_repeats_an_address_keeps_the_higher_rank(tmp_path, monkeypatch):
+    """An obvious intent, so it is honoured rather than refused: first wins,
+    because first is the higher preference."""
+    sink: list[dict] = []
+    core_answers(monkeypatch, accepting(sink))
+    endpoint = FakeEndpoint(tmp_path, bind_hosts=(LAN, "10.0.0.7"))
+    client = make_client(tmp_path=tmp_path, network_mcp=endpoint)
+
+    client.post(
+        "/network-mcp/join",
+        data={"code": CODE, "core_address": CORE, "listen_address": [LAN, "10.0.0.7", LAN]},
+    )
+
+    assert [entry["url"] for entry in sink[0]["urls"]] == [
+        f"https://{LAN}:8765/mcp",
+        "https://10.0.0.7:8765/mcp",
+    ]
+
+
+def test_one_address_posted_the_old_way_is_unchanged(tmp_path, monkeypatch):
+    """A single ``listen_address`` -- a script, a bookmark, a one-address
+    machine -- still sends ``url`` and a ``urls`` of exactly that one."""
+    sink: list[dict] = []
+    core_answers(monkeypatch, accepting(sink))
+    client = make_client(tmp_path=tmp_path, network_mcp=FakeEndpoint(tmp_path))
+
+    client.post(
+        "/network-mcp/join",
+        data={"code": CODE, "core_address": CORE, "listen_address": LAN},
+    )
+
+    assert sink[0]["url"] == f"https://{LAN}:8765/mcp"
+    assert sink[0]["urls"] == [
+        {"url": f"https://{LAN}:8765/mcp", "tls_fingerprint": "sha256:" + "ab" * 32},
+    ]
 
 
 def test_an_empty_listen_address_is_left_to_join_pys_own_sentence(tmp_path):

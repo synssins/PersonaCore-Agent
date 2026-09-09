@@ -9,18 +9,51 @@ rather than guessed at, and each is cited where it is used.
 The call this module makes
 --------------------------
 ``POST http://<core-address>/enrol/workstation``, **plaintext HTTP, carrying no
-credential of any kind**, with exactly these seven fields and no others::
+credential of any kind**, with exactly these eight fields and no others::
 
-    {"code", "display_name", "url", "tls_fingerprint",
+    {"code", "display_name", "url", "urls", "tls_fingerprint",
      "agent_version", "contract_version", "tools"}
 
 The core holds those names in a ``frozenset`` (``REQUEST_FIELDS``) and calls
-``_refuse_unknown_fields``, so an eighth field is a ``400`` rather than an
+``_refuse_unknown_fields``, so a ninth field is a ``400`` rather than an
 ignored key — and a field whose name contains ``token`` or ``secret`` gets a
 refusal written specifically to say *do not send one*. **There is deliberately
 no token in this direction.** The core mints the token itself and pushes it back
 over our own TLS, pinned to the fingerprint this request supplies. Adding a
 credential here would not harden the leg; it would break it.
+
+``urls``, and why ``url`` stays beside it
+-----------------------------------------
+This endpoint binds a *set* of addresses (see ``listeners.py``), and until the
+core grew ``urls`` the owner had to pick exactly one of them to advertise —
+which threw away every other way of reaching the same machine. ``urls`` carries
+all of them, and ``url`` carries the first of them:
+
+* **``urls`` is the owner's whole selection, in the owner's preference order.**
+  First is tried first. Nothing between the click and this dict re-orders it,
+  and *nothing anywhere sorts it* — a sort is how a preference order silently
+  becomes an alphabetical one that still looks deliberate. Each entry is a
+  complete URL (IPv6 bracketed, so ``[fd00::5]`` and never ``fd00::5``) carrying
+  its own ``tls_fingerprint``.
+* **``url`` is still sent, and is always ``urls[0]["url"]``.** It stays because
+  the core still reads it — it is the address the core prefers — and because an
+  Agent that predates ``urls`` must keep enrolling against a core that has it.
+  :func:`build_request` derives it from the list rather than taking it as a
+  second argument, so the two cannot disagree.
+
+**One certificate, one pin, repeated per entry.** ``certs.py`` issues a *single*
+certificate whose SAN covers the whole bound set (``ensure_certificate``'s
+``bind_hosts``), so today every entry's ``tls_fingerprint`` is the same string —
+this endpoint's. The field is nonetheless per-entry rather than hoisted, because
+that is the shape the core reads and because it is what makes a per-address
+certificate later (a CA-issued one for the DNS name, the self-signed one for the
+literal) a change to :func:`address_entries` and not a change to the protocol.
+
+**A machine is the unit; its addresses are alternatives for reaching it.** One
+connection per machine, tried in the owner's order. That is the model this
+payload describes, and it is deliberately *not* the model of a core whose
+supervisor holds one child per address — under which sending three addresses
+would make one workstation appear as three machines.
 
 Two things the core derives and we must not send: the plugin name
 (``workstation-<slug>``, from the display name) and the secret name
@@ -149,7 +182,7 @@ from workstation_agent.network_mcp.tools import served_tool_names
 from workstation_agent.registration_export import CONTRACT_VERSION, agent_version
 
 if TYPE_CHECKING:  # pragma: no cover
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
 
 log = logging.getLogger(__name__)
 
@@ -201,6 +234,19 @@ MAX_RESPONSE_BYTES: Final = 64 * 1024
 
 #: Nesting ceiling applied to the core's answer before it is walked.
 _MAX_JSON_DEPTH: Final = 8
+
+#: The one sentence for "nothing was chosen to advertise".
+#:
+#: Both :func:`listen_url` and :func:`listen_urls` end here, and the router's
+#: :func:`~...ui.backend.routers.network_mcp_routes._refuse_listen_address`
+#: deliberately passes an empty value through rather than answering it, so that
+#: the owner meets one wording of this and not three. Written as a constant
+#: because two functions raising the *same* sentence typed twice is two
+#: sentences the day one of them is edited.
+_NO_LISTEN_ADDRESS: Final = (
+    "Choose the address PersonaCore should reach this workstation at. It has "
+    "to be an address on the network the core is on."
+)
 
 #: The file the enrolled-core rows live in, beside ``token`` and ``server.crt``.
 _ENROLLED_FILE_NAME: Final = "enrolled.json"
@@ -503,7 +549,7 @@ def core_enrol_url(core_address: str) -> str:
 
 
 def listen_url(listen_address: str, *, default_port: int) -> str:
-    """The ``url`` field: this endpoint's own externally reachable address.
+    """One address → one complete URL. See :func:`listen_urls` for the set.
 
     *listen_address* is what the operator picked from the P13 multi-bind set — a
     host, a ``host:port``, a bracketed IPv6 literal, or a full ``https://…/mcp``
@@ -525,11 +571,7 @@ def listen_url(listen_address: str, *, default_port: int) -> str:
     """
     typed = listen_address.strip()
     if not typed:
-        msg = (
-            "Choose the address PersonaCore should reach this workstation at. It has "
-            "to be an address on the network the core is on."
-        )
-        raise EnrolmentError(msg)
+        raise EnrolmentError(_NO_LISTEN_ADDRESS)
 
     try:
         parts = urlsplit(_as_url(typed, scheme="https"))
@@ -552,6 +594,69 @@ def listen_url(listen_address: str, *, default_port: int) -> str:
     authority = f"[{host}]" if _is_ipv6(host) else host
     authority = f"{authority}:{port if port is not None else default_port}"
     return f"https://{authority}/mcp"
+
+
+def listen_urls(
+    listen_addresses: str | Sequence[str], *, default_port: int,
+) -> list[str]:
+    """The ``urls`` field's addresses: every one the owner picked, **in their order**.
+
+    *listen_addresses* is the owner's selection as they ranked it. A bare string
+    is the one-address case and is not a special case anywhere below: it becomes
+    a one-element list, and a single choice therefore produces ``url`` set and
+    ``urls`` carrying that same one, exactly as before this field existed.
+
+    **Nothing here sorts.** The order in is the order out, because the order is
+    the *preference* — first is what the core tries first — and it is the one
+    part of this selection that a later reader cannot reconstruct if it is lost.
+    An alphabetical list is indistinguishable from a deliberate one at a glance,
+    which is why a sort added "for tidiness" would survive review and change
+    which address a machine is reached on.
+
+    Two things are dropped, and neither reorders what is left:
+
+    * **Blank entries**, so an unfilled rank in the picker is "not used" rather
+      than an error the owner has to go and clear.
+    * **Repeats**, compared *after* resolution to a URL so that ``192.168.1.50``
+      and ``192.168.1.50:8443`` on the endpoint's own port are recognised as the
+      one address they are. The **first** occurrence is the one kept, because
+      first is the higher preference and dropping it in favour of the later one
+      would quietly demote the address the owner put at the top.
+
+    Raises:
+        EnrolmentError: if nothing here is an address to advertise — the same
+            sentence :func:`listen_url` raises, from the same constant.
+    """
+    typed = [listen_addresses] if isinstance(listen_addresses, str) else list(listen_addresses)
+    picked = [entry for entry in typed if entry.strip()]
+    if not picked:
+        raise EnrolmentError(_NO_LISTEN_ADDRESS)
+
+    urls: list[str] = []
+    for entry in picked:
+        url = listen_url(entry, default_port=default_port)
+        if url not in urls:
+            urls.append(url)
+    return urls
+
+
+def address_entries(urls: Sequence[str], *, tls_fingerprint: str) -> list[dict[str, str]]:
+    """The ``urls`` field: ``[{"url": ..., "tls_fingerprint": ...}, ...]``.
+
+    Shaped like :func:`tool_entries` because the core's other repeated field is
+    shaped that way: a list of objects, one per thing, each carrying what the
+    core needs to act on that thing. Here that is the address to dial and the
+    certificate to expect at it.
+
+    **The pin is per entry and today it is the same value in every entry**, and
+    that is not an oversight to tidy up. ``certs.py`` issues one certificate
+    whose SAN covers the whole bound set, so there is exactly one fingerprint to
+    give — see this module's docstring. Repeating it is what lets a future
+    per-address certificate be a change here and nowhere else.
+
+    Order is :func:`listen_urls`' order, untouched.
+    """
+    return [{"url": url, "tls_fingerprint": tls_fingerprint} for url in urls]
 
 
 def _as_url(typed: str, *, scheme: str) -> str:
@@ -607,25 +712,43 @@ def build_request(
     *,
     pairing_code: str,
     display_name: str,
-    url: str,
+    urls: Sequence[str],
     tls_fingerprint: str,
 ) -> dict[str, Any]:
-    """The complete request body — exactly the core's seven fields.
+    """The complete request body — exactly the core's eight fields.
 
     Written out as a literal rather than assembled key by key, so that the set
     of keys is visible in one glance and comparable against the core's
-    ``REQUEST_FIELDS``. An eighth key here is a ``400``, not a dropped field.
+    ``REQUEST_FIELDS``. A ninth key here is a ``400``, not a dropped field.
+
+    *urls* is the owner's selection in the owner's order, from
+    :func:`listen_urls`. **``url`` is derived from it rather than passed in
+    beside it**: it is defined as the first of the set, and a signature that
+    took both would let a caller send a preferred address that is not in the
+    list it also sent — a disagreement the core has no way to resolve and no
+    reason to expect. Nothing here re-orders *urls*; see :func:`listen_urls`
+    for why a sort would be a silent defect rather than a tidy-up.
 
     The fingerprint is passed through as given: the core's ``normalise_fingerprint``
     accepts both the bare 64 hex digits and the ``sha256:``-prefixed spelling
     ``certs.fingerprint_of`` produces, lowercases it, and stores the prefixed
     form. Normalising it a second time here would be a second implementation of
     a rule we already satisfy.
+
+    Raises:
+        EnrolmentError: if *urls* is empty. There is no address to enrol with,
+            and a body with ``url: ""`` would be refused by the core in words
+            about a malformed URL rather than in words about a missing choice.
     """
+    chosen = list(urls)
+    if not chosen:
+        raise EnrolmentError(_NO_LISTEN_ADDRESS)
     return {
         "code": pairing_code,
         "display_name": display_name,
-        "url": url,
+        # Always ``urls[0]``, never a second opinion about it. See above.
+        "url": chosen[0],
+        "urls": address_entries(chosen, tls_fingerprint=tls_fingerprint),
         "tls_fingerprint": tls_fingerprint,
         "agent_version": agent_version(),
         "contract_version": CONTRACT_VERSION,
@@ -668,7 +791,7 @@ class JoinResult:
 async def join_core(  # noqa: PLR0913 — three positional are the frozen interface
     core_address: str,
     pairing_code: str,
-    listen_address: str,
+    listen_addresses: str | Sequence[str],
     *,
     display_name: str | None = None,
     endpoint: JoinEndpoint | None = None,
@@ -678,9 +801,14 @@ async def join_core(  # noqa: PLR0913 — three positional are the frozen interf
 
     The three positional arguments are the whole of what the operator supplies:
     the address they typed, the pairing code they read off the core's console,
-    and the address they picked for this machine. Everything else — the display
-    name, the fingerprint, the versions, the tool list — is derived here, because
-    the standing product rule is that no setting is ever configured by hand.
+    and the addresses they picked for this machine **in the order they want them
+    tried**. Everything else — the display name, the fingerprint, the versions,
+    the tool list — is derived here, because the standing product rule is that
+    no setting is ever configured by hand.
+
+    A machine is the unit here and its addresses are alternatives for reaching
+    it: one enrolment, one connection, several ways in, tried in the owner's
+    order. See the module docstring for how that lands in ``url`` and ``urls``.
 
     Returns ``None`` on success. The core's answer is recorded (see
     :func:`list_enrolled_cores`) rather than returned, so the caller cannot come
@@ -709,8 +837,10 @@ async def join_core(  # noqa: PLR0913 — three positional are the frozen interf
             or a full URL; ``http`` unless ``https`` is written explicitly.
         pairing_code: The code the core is showing. Never logged, never stored,
             never put in an exception.
-        listen_address: The address this workstation should be reached at, from
-            the operator's pick of this machine's bound addresses.
+        listen_addresses: The addresses this workstation should be reached at,
+            from the operator's pick of this machine's bound addresses, **in
+            their preference order** — first is what the core tries first. A
+            bare string is the one-address case.
         display_name: Overrides :func:`default_display_name`, which is this
             machine's hostname.
         endpoint: The endpoint to enrol. Defaults to the one currently serving.
@@ -730,7 +860,7 @@ async def join_core(  # noqa: PLR0913 — three positional are the frozen interf
     await join_and_report(
         core_address,
         pairing_code,
-        listen_address,
+        listen_addresses,
         display_name=display_name,
         endpoint=endpoint,
         client_factory=client_factory,
@@ -740,7 +870,7 @@ async def join_core(  # noqa: PLR0913 — three positional are the frozen interf
 async def join_and_report(  # noqa: PLR0913 — see join_core
     core_address: str,
     pairing_code: str,
-    listen_address: str,
+    listen_addresses: str | Sequence[str],
     *,
     display_name: str | None = None,
     endpoint: JoinEndpoint | None = None,
@@ -753,12 +883,15 @@ async def join_and_report(  # noqa: PLR0913 — see join_core
     enrol_url = core_enrol_url(core_address)
 
     info = target.info()
-    url = listen_url(listen_address, default_port=int(getattr(info, "port", 0) or 0))
+    # The owner's order, carried straight through: picker → route → here →
+    # ``build_request`` → the wire. There is no re-ordering step in that chain
+    # and there must not be one.
+    urls = listen_urls(listen_addresses, default_port=int(getattr(info, "port", 0) or 0))
     name = display_name if display_name is not None else default_display_name()
     body = build_request(
         pairing_code=pairing_code,
         display_name=name,
-        url=url,
+        urls=urls,
         tls_fingerprint=str(getattr(info, "fingerprint", "")),
     )
 
@@ -1434,6 +1567,7 @@ __all__ = [
     "JoinEndpoint",
     "JoinError",
     "JoinResult",
+    "address_entries",
     "build_request",
     "core_enrol_url",
     "default_display_name",
@@ -1441,6 +1575,7 @@ __all__ = [
     "join_core",
     "list_enrolled_cores",
     "listen_url",
+    "listen_urls",
     "register_endpoint",
     "remove_enrolled_core",
     "slug_of",

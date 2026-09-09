@@ -160,8 +160,8 @@ def endpoint(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-async def test_request_carries_exactly_the_core_s_seven_fields(endpoint):
-    """``REQUEST_FIELDS`` is a frozenset core-side: an eighth key is a 400."""
+async def test_request_carries_exactly_the_core_s_eight_fields(endpoint):
+    """``REQUEST_FIELDS`` is a frozenset core-side: a ninth key is a 400."""
     seen: list[httpx.Request] = []
     await join.join_core(
         "192.168.1.150:8053",
@@ -179,6 +179,7 @@ async def test_request_carries_exactly_the_core_s_seven_fields(endpoint):
         "code",
         "display_name",
         "url",
+        "urls",
         "tls_fingerprint",
         "agent_version",
         "contract_version",
@@ -712,6 +713,203 @@ def test_loopback_is_left_for_the_core_and_the_receiver_to_refuse():
 def test_a_listen_address_that_is_not_one():
     with pytest.raises(EnrolmentError):
         join.listen_url("   ", default_port=8443)
+
+
+# ---------------------------------------------------------------------------
+# The set of addresses, and the owner's order through it
+# ---------------------------------------------------------------------------
+
+
+def test_listen_urls_keeps_the_owners_order_and_does_not_sort_it():
+    """The property this whole feature turns on.
+
+    Alphabetically these sort ``10.0.0.7`` first and ``[fd00::5]`` last; the
+    owner ranked them the other way round. A sort anywhere -- for tidiness, for
+    a stable listing, for anything -- silently rewrites which address the core
+    dials first, and the result still looks deliberate.
+    """
+    assert join.listen_urls(
+        ["fd00::5", "desk.lan", "10.0.0.7"], default_port=8443,
+    ) == [
+        "https://[fd00::5]:8443/mcp",
+        "https://desk.lan:8443/mcp",
+        "https://10.0.0.7:8443/mcp",
+    ]
+
+
+def test_one_address_still_behaves_exactly_as_it_did():
+    """A bare string is the one-address case and not a special case."""
+    assert join.listen_urls("192.168.1.50", default_port=8443) == [
+        "https://192.168.1.50:8443/mcp",
+    ]
+    assert join.listen_urls(["192.168.1.50"], default_port=8443) == [
+        "https://192.168.1.50:8443/mcp",
+    ]
+
+
+def test_an_unused_rank_slot_is_not_an_error():
+    """The picker posts an empty value for a rank left at "not used"."""
+    assert join.listen_urls(
+        ["192.168.1.50", "", "  ", "10.0.0.7"], default_port=8443,
+    ) == [
+        "https://192.168.1.50:8443/mcp",
+        "https://10.0.0.7:8443/mcp",
+    ]
+
+
+def test_a_repeat_keeps_the_higher_rank_not_the_lower():
+    """Compared after resolution, so ``h`` and ``h:<our port>`` are one address.
+
+    The first occurrence survives, because first is the higher preference:
+    dropping it in favour of the later one would quietly demote the address the
+    owner put at the top.
+    """
+    assert join.listen_urls(
+        ["192.168.1.50", "10.0.0.7", "192.168.1.50:8443"], default_port=8443,
+    ) == [
+        "https://192.168.1.50:8443/mcp",
+        "https://10.0.0.7:8443/mcp",
+    ]
+
+
+def test_no_address_at_all_gets_one_wording_of_the_one_problem():
+    with pytest.raises(EnrolmentError, match="Choose the address PersonaCore should reach"):
+        join.listen_urls([], default_port=8443)
+    with pytest.raises(EnrolmentError, match="Choose the address PersonaCore should reach"):
+        join.listen_urls(["", "   "], default_port=8443)
+
+
+def test_every_url_carries_a_pin_and_today_it_is_the_one_certificate():
+    """``certs.ensure_certificate`` issues one certificate whose SAN covers the
+    whole bound set, so there is exactly one fingerprint to give. The field is
+    per entry because that is the shape the core reads."""
+    entries = join.address_entries(
+        ["https://a:1/mcp", "https://b:2/mcp"], tls_fingerprint=FINGERPRINT,
+    )
+    assert entries == [
+        {"url": "https://a:1/mcp", "tls_fingerprint": FINGERPRINT},
+        {"url": "https://b:2/mcp", "tls_fingerprint": FINGERPRINT},
+    ]
+
+
+def test_url_is_always_the_first_of_urls_and_cannot_disagree_with_it():
+    """``url`` is derived, not passed in beside the list, so there is no
+    signature through which a caller can prefer an address it did not send."""
+    body = join.build_request(
+        pairing_code=CODE,
+        display_name="FRONT-DESK",
+        urls=["https://b:2/mcp", "https://a:1/mcp"],
+        tls_fingerprint=FINGERPRINT,
+    )
+    assert body["url"] == "https://b:2/mcp"
+    assert body["urls"][0]["url"] == body["url"]
+
+
+def test_build_request_refuses_an_empty_selection():
+    with pytest.raises(EnrolmentError, match="Choose the address PersonaCore should reach"):
+        join.build_request(
+            pairing_code=CODE,
+            display_name="FRONT-DESK",
+            urls=[],
+            tls_fingerprint=FINGERPRINT,
+        )
+
+
+async def test_a_non_alphabetical_ranking_survives_into_the_request_body(endpoint):
+    """End to end, because this is the property that will silently regress.
+
+    Every layer between the owner's click and the wire preserves order today.
+    The way that breaks is one of them growing a ``sorted()`` -- which no test
+    of a single layer would catch, because each layer would still be internally
+    consistent. This asserts the order that comes out of ``httpx`` is the order
+    that went in, and it is deliberately one no sort would produce.
+    """
+    seen: list[httpx.Request] = []
+    await join.join_core(
+        "192.168.1.150:8053",
+        CODE,
+        ["fd00::5", "desk.lan", "10.0.0.7"],
+        display_name="FRONT-DESK",
+        endpoint=endpoint,
+        client_factory=client_factory(
+            recording_handler(seen, httpx.Response(201, json=accepted())),
+        ),
+    )
+
+    body = json.loads(seen[0].content)
+    assert [entry["url"] for entry in body["urls"]] == [
+        "https://[fd00::5]:8443/mcp",
+        "https://desk.lan:8443/mcp",
+        "https://10.0.0.7:8443/mcp",
+    ]
+    assert body["url"] == "https://[fd00::5]:8443/mcp", "the preferred one, still singular"
+    assert all(entry["tls_fingerprint"] == FINGERPRINT for entry in body["urls"])
+
+
+async def test_ipv6_is_bracketed_in_every_url_the_core_is_given(endpoint):
+    """``fd00::5`` in a URL is not a host and a port; the core cannot dial it."""
+    seen: list[httpx.Request] = []
+    await join.join_core(
+        "192.168.1.150:8053",
+        CODE,
+        ["fd00::5"],
+        endpoint=endpoint,
+        client_factory=client_factory(
+            recording_handler(seen, httpx.Response(201, json=accepted())),
+        ),
+    )
+
+    body = json.loads(seen[0].content)
+    assert body["url"] == "https://[fd00::5]:8443/mcp"
+    assert body["urls"] == [
+        {"url": "https://[fd00::5]:8443/mcp", "tls_fingerprint": FINGERPRINT},
+    ]
+
+
+async def test_one_address_sends_url_and_a_urls_of_exactly_that_one(endpoint):
+    """The behaviour that must not change for a machine with one address."""
+    seen: list[httpx.Request] = []
+    await join.join_core(
+        "192.168.1.150:8053",
+        CODE,
+        "192.168.1.50",
+        endpoint=endpoint,
+        client_factory=client_factory(
+            recording_handler(seen, httpx.Response(201, json=accepted())),
+        ),
+    )
+
+    body = json.loads(seen[0].content)
+    assert body["url"] == "https://192.168.1.50:8443/mcp"
+    assert body["urls"] == [
+        {"url": "https://192.168.1.50:8443/mcp", "tls_fingerprint": FINGERPRINT},
+    ]
+
+
+async def test_the_new_fields_carry_no_credential_either(endpoint):
+    """The pairing code must not reach the payload's new corners.
+
+    Pinned for ``urls`` specifically because it is the field most likely to be
+    built by pasting the request-building code and editing it, and a stray
+    ``code`` in an entry would be a secret sent once per address.
+    """
+    seen: list[httpx.Request] = []
+    await join.join_core(
+        "192.168.1.150:8053",
+        CODE,
+        ["192.168.1.50", "10.0.0.7"],
+        endpoint=endpoint,
+        client_factory=client_factory(
+            recording_handler(seen, httpx.Response(201, json=accepted())),
+        ),
+    )
+
+    body = json.loads(seen[0].content)
+    serialised = json.dumps(body["urls"])
+    assert CODE not in serialised
+    assert not [
+        key for entry in body["urls"] for key in entry if "token" in key or "secret" in key
+    ]
 
 
 def test_the_display_name_defaults_to_the_machine_and_keeps_its_case(monkeypatch):
