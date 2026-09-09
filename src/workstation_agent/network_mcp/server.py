@@ -46,9 +46,14 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final
 
 from workstation_agent.network_mcp.certs import CertificateInfo, ensure_certificate
-from workstation_agent.network_mcp.credentials import ensure_token, store_token
+from workstation_agent.network_mcp.credentials import (
+    DEFAULT_STATE_DIR,
+    ensure_token,
+    store_token,
+)
 from workstation_agent.network_mcp.enrolment import (
     DEFAULT_JOIN_TTL,
+    ENDPOINT_NOT_RUNNING,
     EnrolmentError,
     EnrolmentReceiver,
     JoinStatus,
@@ -285,6 +290,15 @@ class NetworkMCPServer:
             msg = f"network MCP endpoint did not bind within {_BIND_TIMEOUT}s"
             raise RuntimeError(msg)
 
+        # Registered only once the bind has succeeded, and dropped in stop().
+        # ``join.join_core`` opens an enrolment window on whatever is registered
+        # here, and a window is only meaningful on an endpoint that can actually
+        # receive the core's push — so what is registered is an endpoint that is
+        # *serving*, never merely one that was constructed.
+        from workstation_agent.network_mcp.join import register_endpoint
+
+        register_endpoint(self)
+
         info = self.info()
         log.info(
             "network MCP endpoint listening on %s (fingerprint %s, %d tools)",
@@ -363,6 +377,13 @@ class NetworkMCPServer:
         next start would then fail on an address the operator can see nothing
         wrong with.
         """
+        # First, before anything can await: an endpoint that is on its way down
+        # must not be handed a Join. Passing ``self`` means a stop() racing a
+        # start() cannot unregister the endpoint that has just replaced it.
+        from workstation_agent.network_mcp.join import unregister_endpoint
+
+        unregister_endpoint(self)
+
         server, task = self._uvicorn, self._task
         self._uvicorn = self._task = None
         if server is not None:
@@ -387,6 +408,18 @@ class NetworkMCPServer:
     def running(self) -> bool:
         """True while the endpoint is bound and serving."""
         return self._task is not None and not self._task.done()
+
+    @property
+    def state_dir(self) -> Path:
+        """Where the certificate, the key, the token and the enrolled-core rows live.
+
+        Exposed because ``join.py`` writes its listing beside them and must not
+        guess: a listing read from one directory and a token rotated in another
+        is a removal with no effect and no symptom. Resolved rather than
+        returning the constructor's ``None``, so every caller sees the directory
+        actually in use.
+        """
+        return self._state_dir if self._state_dir is not None else DEFAULT_STATE_DIR
 
     # -- operator surface (B5 renders this) -------------------------------
 
@@ -446,6 +479,35 @@ class NetworkMCPServer:
         self._token = ensure_token(self._state_dir, rotate=True)
         return self._token
 
+    def revoke_token(self) -> str:
+        """Rotate the bearer token and put the new one in force **immediately**.
+
+        The difference from :meth:`rotate_token` is the whole reason this exists.
+        That one is the operator's "give me a fresh value to paste into
+        PersonaCore": it changes what the *next* start will demand, deliberately,
+        so the endpoint keeps working while they go and update the secret store.
+        This one is removal — ``join.remove_enrolled_core`` — where the point is
+        that the core being removed stops being able to call, and a rotation that
+        waits for a restart does not do that.
+
+        Same order as :meth:`_accept_pushed_token`: the file first, then the
+        in-memory value, then the live gate. A failure to write leaves the
+        previous token in force everywhere rather than in force on disk and
+        revoked in memory, which is the state a restart would silently undo.
+
+        Returns:
+            The new token. **Not logged**, here or anywhere.
+        """
+        token = ensure_token(self._state_dir, rotate=True)
+        self._token = token
+        if self._hardening is not None:
+            self._hardening.set_token(token)
+        log.warning(
+            "network MCP bearer token revoked and replaced; any core still holding the "
+            "previous token now gets 401 and must enrol again",
+        )
+        return token
+
     def regenerate_certificate(
         self, *, for_hosts: Sequence[str] | None = None,
     ) -> CertificateInfo:
@@ -502,12 +564,7 @@ class NetworkMCPServer:
                 shown to the owner verbatim.
         """
         if not self.running:
-            msg = (
-                "The endpoint is not running, so PersonaCore has nothing to push the "
-                "token to. Switch it on, wait for it to report that it is listening, "
-                "then join."
-            )
-            raise EnrolmentError(msg)
+            raise EnrolmentError(ENDPOINT_NOT_RUNNING)
 
         from workstation_agent.registration_export import is_loopback_host
 
@@ -534,6 +591,17 @@ class NetworkMCPServer:
     def join_status(self) -> JoinStatus | None:
         """The pending enrolment window, or ``None``. Never carries the code."""
         return self._enrolment.status()
+
+    def join_completed(self, join_id: int) -> bool:
+        """True if the enrolment window *join_id* was closed by an accepted push.
+
+        ``join.join_core`` asks this when its outbound POST fails without an
+        answer: the core pushes before it replies, so a token that arrived here
+        settles a question the network left open. See
+        :meth:`~...enrolment.EnrolmentReceiver.completed` for why it is asked by
+        window id rather than by "is a window open".
+        """
+        return self._enrolment.completed(join_id)
 
     def _accept_pushed_token(self, token: str) -> bool:
         """Install a token PersonaCore pushed. Returns True once it is in force.

@@ -21,6 +21,14 @@ Modules:
     :mod:`~workstation_agent.network_mcp.hardening`
         The security boundary: path, method, auth, bounds, caps, and systematic
         hostile-input rejection.
+    :mod:`~workstation_agent.network_mcp.enrolment`
+        The receiver for the bearer token PersonaCore pushes when a workstation
+        joins — step 3 of the handshake.
+    :mod:`~workstation_agent.network_mcp.join`
+        The outbound half of that handshake — step 1. Deliberately **not**
+        re-exported below: it imports ``registration_export``, which imports
+        this package's ``tools``, so pulling it in here would make importing
+        ``registration_export`` first a circular import.
     :mod:`~workstation_agent.network_mcp.server`
         :class:`NetworkMCPServer` — start, stop, and the operator surface.
 """

@@ -47,7 +47,16 @@ REGISTRATION_ZIP_NAME = "workstation-registration.zip"
 MANIFEST_ARCNAME = "workstation/manifest.toml"
 
 _PLUGIN_NAME = "workstation"
-_CONTRACT_VERSION = "2.x"
+
+#: Which contract major this Agent targets, in the core's own ``\d+\.(x|\d+)``
+#: spelling (``contracts/manifest.py:_CONTRACT_RE``).
+#:
+#: Public because the enrolment Join (``network_mcp/join.py``) sends this same
+#: value as its ``contract_version`` field, and the core builds a manifest out
+#: of it: a Join declaring one contract and an exported registration declaring
+#: another would be two answers to a question with one answer.
+CONTRACT_VERSION = "2.x"
+
 _DESCRIPTION = "Acts on the owner's workstation and the devices plugged into it."
 
 #: Contract §3: the *name* of the secret in the core's store, never the
@@ -65,7 +74,7 @@ class RegistrationResult:
     fingerprint: str
 
 
-def _agent_version() -> str:
+def agent_version() -> str:
     """The Agent's version, written into ``manifest.toml``.
 
     Contract §2: "its ``version`` is the Agent's" — regenerated on every
@@ -215,7 +224,7 @@ def build_manifest_text(
             :func:`~workstation_agent.network_mcp.tools.served_tool_names`.
         version: Overrides the Agent version written into the manifest.
             Exposed for tests; production callers leave it as
-            :func:`_agent_version`.
+            :func:`agent_version`.
 
     Raises:
         ValueError: if *fingerprint* is not ``sha256:`` + hex, if
@@ -243,13 +252,13 @@ def build_manifest_text(
         raise ValueError(msg)
     _reject_userinfo(url)
 
-    ver = version if version is not None else _agent_version()
+    ver = version if version is not None else agent_version()
 
     lines: list[str] = [
         "[plugin]",
         f"name            = {_toml_string(_PLUGIN_NAME)}",
         f"version         = {_toml_string(ver)}",
-        f"contract        = {_toml_string(_CONTRACT_VERSION)}",
+        f"contract        = {_toml_string(CONTRACT_VERSION)}",
         'transport       = "http"',
         f"url             = {_toml_string(url)}",
         f"auth_secret     = {_toml_string(_AUTH_SECRET_NAME)}",
