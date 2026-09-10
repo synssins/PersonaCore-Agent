@@ -17,13 +17,6 @@ from pathlib import Path
 
 import pytest
 
-pytestmark = pytest.mark.skipif(
-    os.getenv("CI") == "true",
-    reason="plugin subprocess race on GH Actions py3.12 (task #10)",
-)
-
-import pytest
-
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 # Add the worktree src directory FIRST to prioritize it over the main install
 _WORKTREE_SRC = _REPO_ROOT / "src"
