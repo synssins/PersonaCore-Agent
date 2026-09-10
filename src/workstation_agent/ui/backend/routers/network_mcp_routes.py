@@ -600,6 +600,96 @@ def _listen_choices(info: Any) -> list[dict[str, str]]:  # noqa: ANN401 — see 
     return choices
 
 
+def _endpoint_status(*, enabled: bool, info: Any) -> dict[str, Any]:  # noqa: ANN401 — see _read_info
+    """What the endpoint is doing **now**, as opposed to what it is set to do.
+
+    The owner read a ticked "Enabled" box and concluded that the endpoint was
+    serving. That was a reasonable thing to conclude and it was wrong: enabled
+    is a stored setting, listening is a fact about this moment, and until now
+    the page showed only the first and let him infer the second. The whole of
+    his evening followed from that one inference.
+
+    So the two are reported separately and neither is derived from the other.
+    ``enabled`` stays the operator's expression of intent; this is the state of
+    the world, read from the endpoint itself, and the four values it can take
+    are the four the page has to be able to say out loud:
+
+    ``listening``
+        Serving on every address that was chosen. The only unremarkable one.
+    ``partial``
+        Serving, but not everywhere — the state that is neither on nor off, and
+        the reason ``degraded`` exists rather than a second boolean. Reported
+        as a failure: "it is listening" is true here and useless, because the
+        address that did not bind is the only part the operator can act on.
+    ``down``
+        Switched on and not serving. **This is the state he was in.** Where the
+        endpoint knows why — a serve task that ended with an error, carried on
+        :attr:`~...server.NetworkEndpointInfo.stopped_reason` — the page says
+        why; where it does not, it still says *that*, which is the fact he was
+        denied.
+    ``off``
+        Switched off and not serving. The setting and the world agree.
+
+    ``degraded`` and ``bind_failures`` are read off ``NetworkEndpointInfo``
+    rather than recomputed, so there is exactly one notion of endpoint health
+    in this product and the page cannot drift out of step with the endpoint.
+    """
+    running = bool(getattr(info, "running", False))
+    failures = tuple(getattr(info, "bind_failures", ()) or ())
+    urls = tuple(str(u) for u in (getattr(info, "urls", ()) or ()) if str(u))
+
+    if running and bool(getattr(info, "degraded", False)):
+        return {
+            "state": "partial",
+            "headline": "Partly listening — not on every address you chose.",
+            "detail": (
+                "Some of what you selected is answering and some of it is not, so "
+                "PersonaCore can reach this workstation on some routes and not on "
+                "others. Free the address below, or deselect it, and save again."
+            ),
+            "urls": urls,
+            "failures": failures,
+        }
+    if running:
+        return {
+            "state": "listening",
+            "headline": "Listening now.",
+            "detail": None,
+            "urls": urls,
+            "failures": (),
+        }
+    if enabled:
+        reason = str(getattr(info, "stopped_reason", "") or "")
+        detail = (
+            "It is switched on here, but no socket is bound and nothing can reach "
+            "this workstation. Join will refuse until it is serving."
+        )
+        if reason:
+            detail = f"{detail} It stopped serving because: {reason}."
+        else:
+            detail = (
+                f"{detail} This build cannot tell you why it stopped. Save the "
+                "settings below to start it again."
+            )
+        return {
+            "state": "down",
+            "headline": "Enabled, but NOT listening.",
+            "detail": detail,
+            "urls": (),
+            "failures": failures,
+        }
+    return {
+        "state": "off",
+        "headline": "Switched off — nothing is listening.",
+        "detail": (
+            "Nothing on the network can reach this workstation's capability "
+            "families. Tick Enabled below and save to start the endpoint."
+        ),
+        "urls": (),
+        "failures": (),
+    }
+
+
 def _no_listen_address_message(info: Any) -> str:  # noqa: ANN401 — see _read_info
     """Why there is nothing to pick, when :func:`_listen_choices` came back empty.
 
@@ -902,6 +992,12 @@ def _render(  # noqa: PLR0913 — one parameter per independent page outcome
             # Rendered as a failure, never folded into the "running" light.
             "bind_failures": tuple(getattr(info, "bind_failures", ()) or ()),
             "degraded": bool(getattr(info, "degraded", False)),
+            # The setting and the fact, kept apart. ``nm.enabled`` deliberately
+            # rather than ``values["enabled"]``: ``values`` carries back what
+            # was just typed into the form, and a status line describing *now*
+            # must not be computed from an intent that has not been applied
+            # yet -- least of all on the re-render of a save that failed.
+            "endpoint_status": _endpoint_status(enabled=nm.enabled, info=info),
             # export
             "export_result": export_result,
             "export_problems": export_problems,
@@ -1119,6 +1215,34 @@ def _publish(ctx: BackendContext, server: Any) -> None:  # noqa: ANN401
             log.exception("network-mcp: on_network_mcp_change callback failed")
 
 
+async def _replace(ctx: BackendContext, server: Any) -> None:  # noqa: ANN401
+    """Publish *server*, stopping whatever it displaces first.
+
+    ``ctx.network_mcp`` is the only reference this process keeps to an
+    endpoint. Overwriting it while the outgoing object still owns bound
+    listening sockets does not close them and cannot be undone: nothing can
+    reach that object again, so nothing will ever release them, and the port
+    stays held for the life of the Agent by something the operator cannot see,
+    switch off, or find with a port listing that names only this process.
+
+    That is how the owner's evening ended. His endpoint's serve task had
+    already died, so the router believed it was not running and did not stop
+    it; the save that switched it off counted as a rebind and published a fresh
+    object over it; and the port he had been using minutes earlier was reported
+    in use by the next attempt to bind it.
+
+    Stopping first is unconditional and does not consult ``running``: whether
+    an endpoint holds sockets is not something ``running`` answers -- the whole
+    defect was an endpoint that held sockets while reporting that it did not.
+    ``NetworkMCPServer.stop`` is documented safe when it was never started and
+    safe to call twice, so an unnecessary stop costs nothing.
+    """
+    outgoing = ctx.network_mcp
+    if outgoing is not None and outgoing is not server:
+        await _stop_quietly(outgoing)
+    _publish(ctx, server)
+
+
 def _partial_bind_message(server: Any) -> str | None:  # noqa: ANN401
     """The operator-facing sentence for a partial bind, or ``None`` if there is none.
 
@@ -1195,6 +1319,11 @@ async def _bring_up(
             server = _build_server(ctx, new)
         except Exception as exc:
             log.exception("network-mcp: could not build the endpoint")
+            # There is no replacement to hand `_replace` the outgoing endpoint
+            # to, and the configuration on disk has already moved on to an
+            # address this one is not bound to. Leaving it serving would leave
+            # the page describing settings that nothing is answering on.
+            await _stop_quietly(ctx.network_mcp)
             return "", (
                 f"Saved, but this build could not create the endpoint from the UI ({exc}). "
                 "Restart the Agent to apply the change."
@@ -1202,8 +1331,11 @@ async def _bring_up(
 
     # Already published if it came from `_coverage_probe`; publishing twice
     # would fire the composition root's adoption callback twice for one save.
+    # `_replace` rather than `_publish`: whatever is being displaced here may
+    # still own bound listening sockets, and overwriting the only reference to
+    # it is the one mistake that cannot be undone afterwards.
     if ctx.network_mcp is not server:
-        _publish(ctx, server)
+        await _replace(ctx, server)
 
     start = getattr(server, "start", None)
     if not callable(start):
@@ -1278,11 +1410,18 @@ async def _apply_endpoint(
     running = bool(getattr(current, "running", False))
 
     if not new.enabled:
-        if current is not None and running:
+        # Unconditional, and deliberately not guarded by ``running``. Whether an
+        # endpoint is holding a listening socket is not a question ``running``
+        # answers: the defect the owner hit was an endpoint that held one while
+        # reporting that it did not, so a stop the router skips on that report
+        # is a stop skipped exactly when it was needed. ``stop()`` is safe on an
+        # endpoint that was never started and safe to call twice, so the
+        # unnecessary case costs nothing.
+        if current is not None:
             await _stop_quietly(current)
         if current is None or rebind:
             with contextlib.suppress(Exception):
-                _publish(ctx, _build_server(ctx, new))
+                await _replace(ctx, _build_server(ctx, new))
         return ("The endpoint is switched off and no longer listening.", None)
 
     if current is not None and not rebind and running:
@@ -1292,11 +1431,14 @@ async def _apply_endpoint(
             return "", partial
         return "The endpoint is already running with these settings.", None
 
-    # ``current is not prepared``: the endpoint built moments ago for the
-    # certificate check is the one about to be started, and stopping it first
-    # would report a stop the operator never asked for.
-    if current is not None and current is not prepared:
-        await _stop_quietly(current)
+    # Whatever is live is stopped by :func:`_replace` inside :func:`_bring_up`,
+    # in the same step that publishes its successor, rather than here. That is
+    # one stop rather than two, and -- the part that matters -- it makes the
+    # stop inseparable from the overwrite it protects: a future edit cannot
+    # reintroduce the leak by publishing without stopping, because there is no
+    # longer a publish on this path that is not a `_replace`. The endpoint
+    # built moments ago for the certificate check is exempt by identity, so a
+    # `prepared` endpoint is still not stopped and restarted for no reason.
     return await _bring_up(ctx, new, prepared=prepared)
 
 

@@ -14,6 +14,7 @@ printed.
 from __future__ import annotations
 
 import datetime as dt
+import re
 import zipfile
 
 import pytest
@@ -69,6 +70,9 @@ class FakeEndpoint:
         #: that cannot certify an address it does not have -- no certificate
         #: this machine generates will ever cover 203.0.113.9.
         self.regenerate_sans = regenerate_sans
+        #: What the real endpoint reports when its serve task ended by itself.
+        #: ``None`` is "we do not know", which the page has to render too.
+        self.stopped_reason: str | None = None
         self._running = False
         self.start_calls = 0
         self.stop_calls = 0
@@ -141,6 +145,7 @@ class FakeEndpoint:
             # export path with the one check that matters disabled.
             tool_names=served_tool_names(),
             running=self._running,
+            stopped_reason=None if self._running else self.stopped_reason,
         )
 
     def rotate_token(self):
@@ -925,3 +930,218 @@ def test_no_route_leaks_the_token_into_the_exported_page(tmp_path):
 
     assert token not in client.post("/network-mcp/export-registration").text
     assert token not in client.get("/network-mcp").text
+
+
+# ---------------------------------------------------------------------------
+# P24 defect B -- the page states the running state, it does not imply it
+#
+# "Enabled" is a stored setting; "listening" is a fact about now. The owner was
+# shown the first and reasonably inferred the second, and everything that went
+# wrong that evening followed from the inference being wrong. The endpoint
+# block now says both, and the four states it can be in read differently.
+# ---------------------------------------------------------------------------
+
+
+def _template_source() -> str:
+    """The page template itself.
+
+    Read rather than rendered because no single render contains every form on
+    the page -- Cancel Join exists only while a join is open, and the two
+    export buttons are alternatives. A leftover un-anchored form would sit in
+    a branch no assertion on one rendered page ever visits, which is precisely
+    where this defect lived.
+    """
+    from workstation_agent.ui.backend.app import _TEMPLATES_DIR
+
+    return (_TEMPLATES_DIR / "network_mcp.html").read_text(encoding="utf-8")
+
+
+def _status_state(text: str) -> str:
+    """The state the endpoint block declares, read the way a browser would."""
+    match = re.search(r'data-endpoint-state="([a-z]+)"', text)
+    assert match is not None, "the endpoint block states no running state at all"
+    return match.group(1)
+
+
+def test_the_endpoint_block_says_listening_when_it_is_listening(tmp_path):
+    client = make_client(
+        config_store=FakeConfigStore(), tmp_path=tmp_path, network_mcp_factory=Factory(),
+    )
+    resp = client.post("/network-mcp/settings", data=_form())
+
+    assert _status_state(resp.text) == "listening"
+    assert "Listening now." in resp.text
+    # Which addresses, not merely that there are some: "listening" without an
+    # address is not something the operator can point PersonaCore at.
+    assert "https://192.168.1.50:8765/mcp" in resp.text
+
+
+def test_a_ticked_box_over_a_dead_endpoint_says_enabled_but_not_listening(tmp_path):
+    """The owner's step 2, as the page should have shown it.
+
+    The stored setting still says enabled and stays that way -- it is his
+    intent and the page must not quietly rewrite it. What changes is that the
+    page no longer lets the setting stand in for the fact.
+    """
+    store = FakeConfigStore()
+    factory = Factory()
+    client = make_client(
+        config_store=store, tmp_path=tmp_path, network_mcp_factory=factory,
+    )
+    client.post("/network-mcp/settings", data=_form())
+    factory.last._running = False  # the serve task ended; nobody changed the setting
+
+    resp = client.get("/network-mcp")
+
+    assert store.load().network_mcp.enabled is True
+    assert _status_state(resp.text) == "down"
+    assert "Enabled, but NOT listening." in resp.text
+    assert "Join will refuse until it is serving" in resp.text
+
+
+def test_a_dead_endpoint_that_knows_why_says_why(tmp_path):
+    """``stopped_reason`` is the half of the answer he could not have guessed."""
+    factory = Factory()
+    client = make_client(
+        config_store=FakeConfigStore(), tmp_path=tmp_path, network_mcp_factory=factory,
+    )
+    client.post("/network-mcp/settings", data=_form())
+    factory.last._running = False
+    factory.last.stopped_reason = "the TLS context could not be rebuilt"
+
+    resp = client.get("/network-mcp")
+
+    assert _status_state(resp.text) == "down"
+    assert "the TLS context could not be rebuilt" in resp.text
+    assert "cannot tell you why" not in resp.text
+
+
+def test_a_dead_endpoint_with_no_reason_still_says_it_is_down(tmp_path):
+    """Not knowing why is not a licence to say nothing."""
+    factory = Factory()
+    client = make_client(
+        config_store=FakeConfigStore(), tmp_path=tmp_path, network_mcp_factory=factory,
+    )
+    client.post("/network-mcp/settings", data=_form())
+    factory.last._running = False
+
+    resp = client.get("/network-mcp")
+
+    assert _status_state(resp.text) == "down"
+    assert "cannot tell you why" in resp.text
+
+
+def test_a_partial_bind_reads_as_neither_on_nor_off(tmp_path):
+    """Two of three addresses listening is its own state, not a shade of "on".
+
+    Both halves are on screen in the endpoint block: what is answering, so the
+    operator knows whether the core can reach the machine meanwhile, and what
+    is not, which is the only part they can act on.
+    """
+    failure = _Info(host="192.168.1.50", reason="address already in use")
+    factory = Factory(bind_failures=(failure,))
+    client = make_client(
+        config_store=FakeConfigStore(), tmp_path=tmp_path, network_mcp_factory=factory,
+    )
+    resp = client.post("/network-mcp/settings", data=_form())
+
+    assert _status_state(resp.text) == "partial"
+    assert "Partly listening" in resp.text
+    assert "address already in use" in resp.text
+    # Not the unqualified green sentence, which would be true and useless here.
+    assert "Listening now." not in resp.text
+
+
+def test_switched_off_says_so_rather_than_going_quiet(tmp_path):
+    factory = Factory()
+    client = make_client(
+        config_store=FakeConfigStore(), tmp_path=tmp_path, network_mcp_factory=factory,
+    )
+    client.post("/network-mcp/settings", data=_form())
+    resp = client.post("/network-mcp/settings", data=_form(enabled=None))
+
+    assert _status_state(resp.text) == "off"
+    assert "Switched off" in resp.text
+
+
+def test_the_status_line_describes_now_not_what_was_just_typed(tmp_path):
+    """A save that was refused must not leave the page claiming the new state.
+
+    The form echoes back what the operator typed, so that they do not lose it.
+    The status line is not the form: it describes the machine, and on a refused
+    save the machine did not change.
+    """
+    factory = Factory()
+    client = make_client(
+        config_store=FakeConfigStore(), tmp_path=tmp_path, network_mcp_factory=factory,
+    )
+    resp = client.post("/network-mcp/settings", data=_form(port="not-a-port"))
+
+    # Nothing was ever started, so "enabled" in the form is an intent that has
+    # not been applied. The endpoint is off, and the page says off.
+    assert _status_state(resp.text) == "off"
+
+
+# ---------------------------------------------------------------------------
+# P24 defect C -- the answer appears where the question was asked
+#
+# Every one of these forms re-renders the whole page rather than redirecting,
+# so without a fragment the browser lands at the top and the outcome renders
+# hundreds of lines below the fold. The owner had his diagnosis on screen from
+# his first press of Join and could not see it.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("action", "fragment"),
+    [
+        ("/network-mcp/join", "#nm-join"),
+        ("/network-mcp/join/cancel", "#nm-join"),
+        ("/network-mcp/enrolled/remove", "#nm-enrolled"),
+        ("/network-mcp/export-registration", "#nm-recovery"),
+    ],
+)
+def test_every_posting_form_lands_on_its_own_section(tmp_path, action, fragment):
+    """The form posts to the section its own answer is rendered in."""
+    factory = Factory()
+    client = make_client(
+        config_store=FakeConfigStore(), tmp_path=tmp_path, network_mcp_factory=factory,
+    )
+    client.post("/network-mcp/settings", data=_form())
+    text = _template_source()
+
+    # Present at all -- a parametrisation that silently matched nothing would
+    # pass for a form that had been renamed out from under it.
+    assert f'action="{action}{fragment}"' in text
+    # And never without it: one un-anchored copy is one route back to the bug.
+    assert f'action="{action}"' not in text
+
+
+def test_a_join_refusal_renders_inside_the_section_join_was_pressed_in(tmp_path):
+    """Wherever the refusal comes from, it lands after the anchor Join jumps to.
+
+    This is a positional property, not a textual one. The owner's refusal --
+    "the endpoint is not running, so PersonaCore has nothing to push the token
+    to" -- was on screen from his first press and he could not see it, because
+    the form had no fragment and the message renders below the endpoint block,
+    an eight-row address list, the identity table and the fingerprint. What
+    fixes that is where the browser lands, so that is what is asserted.
+    """
+    factory = Factory()
+    client = make_client(
+        config_store=FakeConfigStore(), tmp_path=tmp_path, network_mcp_factory=factory,
+    )
+    client.post("/network-mcp/settings", data=_form())
+    factory.last._running = False
+
+    resp = client.post(
+        "/network-mcp/join", data={"core_address": "192.168.1.150:8053", "code": "123456"},
+    )
+
+    body = resp.text
+    refusal = body.index("Switch it on above, then join.")
+    assert body.index('id="nm-join"') < refusal
+    # And the endpoint block above now says the same thing in its own words,
+    # so the page agrees with itself instead of showing a ticked box over a
+    # refusal that contradicts it.
+    assert _status_state(body) == "down"

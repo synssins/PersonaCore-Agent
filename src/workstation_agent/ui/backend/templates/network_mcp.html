@@ -16,6 +16,32 @@
 <section id="nm-endpoint">
   <h2>Endpoint</h2>
 
+  {# The setting is in the form below; this is the fact. They are two different
+     things and the page used to show only the first, so a ticked box was read
+     as a running endpoint -- which is how an endpoint that had stopped serving
+     stayed invisible while Join refused, switching off released nothing, and
+     switching on again reported a port in use. Nothing here is inferred from
+     the checkbox: it is read from the endpoint. #}
+  <p id="nm-status" class="{% if endpoint_status.state == 'listening' %}success{% elif endpoint_status.state == 'off' %}{% else %}error{% endif %}"
+     data-endpoint-state="{{ endpoint_status.state }}">
+    <strong>{{ endpoint_status.headline }}</strong>
+    {% if endpoint_status.detail %} {{ endpoint_status.detail }}{% endif %}
+  </p>
+  {% if endpoint_status.urls %}
+    <p>Answering on:</p>
+    <ul>
+      {% for url in endpoint_status.urls %}<li><code>{{ url }}</code></li>{% endfor %}
+    </ul>
+  {% endif %}
+  {% if endpoint_status.failures %}
+    <p class="error">Not bound:</p>
+    <ul>
+      {% for f in endpoint_status.failures %}
+        <li class="error"><code>{{ f.host }}</code> — {{ f.reason }}</li>
+      {% endfor %}
+    </ul>
+  {% endif %}
+
   {% if not can_configure %}
     <p class="error">The endpoint's settings cannot be changed from here because the
       configuration store is unavailable.</p>
@@ -217,7 +243,7 @@
         network is trying codes — cancel and start again.
       {% endif %}
     </p>
-    <form method="post" action="/network-mcp/join/cancel">
+    <form method="post" action="/network-mcp/join/cancel#nm-join">
       <button type="submit">Cancel Join</button>
     </form>
   {% elif listen_empty %}
@@ -229,7 +255,7 @@
     <p><a href="#nm-endpoint">Choose a LAN address in Endpoint settings, at the top
       of this page</a>, save, then come back here and join.</p>
   {% else %}
-    <form method="post" action="/network-mcp/join">
+    <form method="post" action="/network-mcp/join#nm-join">
       <label for="nm-core-address">PersonaCore's address:</label>
       {# Not a secret, and echoed back on a failure so a refusal costs one
          correction rather than three. #}
@@ -321,7 +347,7 @@
           — the name this Agent sent{% endif %}</td>
         <td>{{ core.joined_at.strftime("%Y-%m-%d %H:%M UTC") }}</td>
         <td>
-          <form method="post" action="/network-mcp/enrolled/remove"
+          <form method="post" action="/network-mcp/enrolled/remove#nm-enrolled"
                 onsubmit="return confirm('Removing a core rotates the bearer token for this endpoint, so EVERY core enrolled here is locked out, not just this one. Each remaining core has to join again. Continue?');">
             <input type="hidden" name="slug" value="{{ core.slug }}">
             {# The label carries the blast radius, not just the dialog. A button
@@ -376,12 +402,12 @@
     </ul>
     <p>Fix the endpoint above and export again, or export anyway if you are
       preparing the registration ahead of time.</p>
-    <form method="post" action="/network-mcp/export-registration">
+    <form method="post" action="/network-mcp/export-registration#nm-recovery">
       <input type="hidden" name="confirm" value="true">
       <button type="submit">Export Anyway</button>
     </form>
   {% else %}
-    <form method="post" action="/network-mcp/export-registration">
+    <form method="post" action="/network-mcp/export-registration#nm-recovery">
       <button type="submit">Export Registration</button>
     </form>
   {% endif %}
