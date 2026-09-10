@@ -95,6 +95,12 @@ class FakePluginInfo:
     resource_limits: dict[str, Any] = field(default_factory=dict)
     integrity: str = "high"
     pid: int | None = None
+    #: Mirrors ``PluginInfoImpl``: the plugin's signed ``declared_permissions``.
+    #: The permissions UI reads this to decide what it may offer, so a fake
+    #: without it is a plugin that can be allowed to do nothing -- which is the
+    #: right default for the fakes that predate P25.
+    declared_permissions: list[str] = field(default_factory=list)
+    confirmable_conditions: list[str] = field(default_factory=list)
 
 
 class FakeMCPHost:

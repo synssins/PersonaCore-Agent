@@ -106,7 +106,7 @@ import contextlib
 import logging
 import os
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import urlsplit
@@ -353,6 +353,85 @@ def _parse_one_declaration(  # noqa: C901, PLR0911
     )
 
 
+#: The permission-string prefix that carries a tool-identity grant.
+_TOOL_PREFIX = "tool:"
+
+#: The tool-identity wildcard.  Identity **only** — see
+#: :func:`_check_tool_permission`.
+WILDCARD = "*"
+
+
+def grantable_permissions(declared_permissions: Iterable[object]) -> list[str]:
+    """The entries of *declared_permissions* the identity gate can be satisfied by.
+
+    The one rule, in one place: :func:`_check_tool_permission` calls this to
+    decide what the plugin declared, and the settings UI calls it to decide
+    what it may offer the owner.  Two copies of "which strings are tool
+    grants" is how a page ends up showing a checkbox that always denies —
+    which is precisely the failure P25 exists to remove.
+
+    Returns them sorted, so the page's order does not depend on the order
+    somebody happened to write ``plugin.toml`` in.
+    """
+    return sorted({
+        p for p in declared_permissions
+        if isinstance(p, str) and (p.startswith(_TOOL_PREFIX) or p == WILDCARD)
+    })
+
+
+def parse_declared_permissions(
+    plugin_id: str,
+    declared_permissions: Iterable[object],
+) -> dict[str, ToolDeclaration]:
+    """:func:`parse_declarations`, addressed by the two things it actually reads.
+
+    Split out so a caller holding a plugin's *signed* permission list without a
+    :class:`~workstation_agent.mcp_host.loader.PluginManifest` object — the
+    settings UI, which is handed ``PluginInfo`` rows by the host — can ask the
+    same question and get the same answer.  It is a pure read: nothing here
+    decides anything, it only reports what the manifest declares.
+    """
+    found: dict[str, ToolDeclaration] = {}
+    poisoned: set[str] = set()
+    unattributable = False
+
+    for perm in declared_permissions:
+        if not isinstance(perm, str) or not perm.lower().startswith(_ARGS_PREFIX):
+            continue
+        tool, decl = _parse_one_declaration(perm)
+        if decl is None:
+            if tool is None:
+                unattributable = True
+            else:
+                log.warning(
+                    "plugin=%s has a malformed declaration for tool=%s; refusing the tool",
+                    plugin_id,
+                    tool,
+                )
+                poisoned.add(tool)
+            continue
+        if decl.tool in found or decl.tool in poisoned:
+            log.warning(
+                "plugin=%s declares tool=%s twice; refusing the tool",
+                plugin_id,
+                decl.tool,
+            )
+            poisoned.add(decl.tool)
+            continue
+        found[decl.tool] = decl
+
+    if unattributable:
+        log.warning(
+            "plugin=%s has an args: declaration naming no tool; refusing every "
+            "declaration in the manifest",
+            plugin_id,
+        )
+        return {}
+    for tool in poisoned:
+        found.pop(tool, None)
+    return found
+
+
 def parse_declarations(manifest: PluginManifest) -> dict[str, ToolDeclaration]:
     """Return every usable tool declaration in *manifest*, keyed by tool id.
 
@@ -383,45 +462,7 @@ def parse_declarations(manifest: PluginManifest) -> dict[str, ToolDeclaration]:
     means someone signed a broken file, and a broken security manifest should
     not run.
     """
-    found: dict[str, ToolDeclaration] = {}
-    poisoned: set[str] = set()
-    unattributable = False
-
-    for perm in manifest.declared_permissions:
-        if not isinstance(perm, str) or not perm.lower().startswith(_ARGS_PREFIX):
-            continue
-        tool, decl = _parse_one_declaration(perm)
-        if decl is None:
-            if tool is None:
-                unattributable = True
-            else:
-                log.warning(
-                    "plugin=%s has a malformed declaration for tool=%s; refusing the tool",
-                    manifest.id,
-                    tool,
-                )
-                poisoned.add(tool)
-            continue
-        if decl.tool in found or decl.tool in poisoned:
-            log.warning(
-                "plugin=%s declares tool=%s twice; refusing the tool",
-                manifest.id,
-                decl.tool,
-            )
-            poisoned.add(decl.tool)
-            continue
-        found[decl.tool] = decl
-
-    if unattributable:
-        log.warning(
-            "plugin=%s has an args: declaration naming no tool; refusing every "
-            "declaration in the manifest",
-            manifest.id,
-        )
-        return {}
-    for tool in poisoned:
-        found.pop(tool, None)
-    return found
+    return parse_declared_permissions(manifest.id, manifest.declared_permissions)
 
 
 def tool_declaration(manifest: PluginManifest, tool: object) -> ToolDeclaration | None:
@@ -1521,6 +1562,30 @@ _GUARD_REASONS: dict[str, str] = {
 }
 
 
+def always_denied_guards(
+    confirmable_conditions: Iterable[object],
+) -> list[tuple[str, str]]:
+    """The guards that always deny for a plugin declaring *confirmable_conditions*.
+
+    ``(name, plain-English reason)`` pairs, taken from the same
+    :data:`_HARD_GUARDS` tuple and :data:`_GUARD_REASONS` table
+    :func:`evaluate_detailed` refuses with, so the settings page quotes the
+    gate rather than paraphrasing it.
+
+    A hard guard becomes a *prompt* only when the manifest declares it
+    confirmable; one the manifest does not name can never be approved at the
+    prompt and can never be granted on any page.  That distinction is the
+    reason this is a function and not a constant: the UI has to be able to
+    show an unliftable guard as a statement of fact rather than as a control.
+    """
+    confirmable = {str(c) for c in confirmable_conditions}
+    return [
+        (guard, _GUARD_REASONS.get(guard, ""))
+        for guard in _HARD_GUARDS
+        if guard not in confirmable
+    ]
+
+
 def _check_tool_permission(
     plugin: PluginManifest,
     tool: str,
@@ -1551,18 +1616,16 @@ def _check_tool_permission(
             plugin.id,
         )
         return "deny"
-    tool_perm = f"tool:{tool}"
-    declared_tool_perms = {
-        p for p in plugin.declared_permissions if p.startswith("tool:") or p == "*"
-    }
+    tool_perm = f"{_TOOL_PREFIX}{tool}"
+    declared_tool_perms = set(grantable_permissions(plugin.declared_permissions))
     if not declared_tool_perms:
         log.warning(
             "deny: plugin=%s declared no tool-scoped permissions; default-deny",
             plugin.id,
         )
         return "deny"
-    declared_ok = tool_perm in declared_tool_perms or "*" in declared_tool_perms
-    granted_ok = tool_perm in granted or "*" in granted
+    declared_ok = tool_perm in declared_tool_perms or WILDCARD in declared_tool_perms
+    granted_ok = tool_perm in granted or WILDCARD in granted
     if not declared_ok:
         log.warning(
             "deny: tool=%s not in declared_permissions for plugin=%s",

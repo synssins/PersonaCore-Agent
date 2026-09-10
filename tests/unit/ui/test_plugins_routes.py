@@ -48,26 +48,55 @@ def test_plugin_disable_persists(tmp_path):
     assert store._cfg.plugins.per_plugin["test_plugin"].enabled is False
 
 
+#: A grant the fake plugin's signed manifest declares. Since P25 the route is
+#: bounded by the declaration, so a test granting something undeclared is
+#: testing the refusal, not the grant -- see
+#: ``tests/integration/test_permissions_grant_flow.py``.
+_DECLARED = ["tool:test_plugin.echo", "args:test_plugin.echo:read:text=opaque"]
+_GRANT = "tool:test_plugin.echo"
+
+
 def test_plugin_grant_permission(tmp_path):
     """POST /plugins/{id}/grant/{perm} adds perm to granted_permissions."""
-    client, store, _ = _client_with_plugin(tmp_path)
+    client, store, _ = _client_with_plugin(tmp_path, declared_permissions=_DECLARED)
 
-    resp = client.post("/plugins/test_plugin/grant/filesystem:read", follow_redirects=False)
+    resp = client.post(f"/plugins/test_plugin/grant/{_GRANT}", follow_redirects=False)
     assert resp.status_code == 303
     perms = store._cfg.plugins.per_plugin["test_plugin"].granted_permissions
-    assert "filesystem:read" in perms
+    assert _GRANT in perms
 
 
 def test_plugin_grant_no_duplicate(tmp_path):
     """Granting an already-held permission doesn't duplicate it."""
-    client, store, _ = _client_with_plugin(tmp_path)
+    client, store, _ = _client_with_plugin(tmp_path, declared_permissions=_DECLARED)
     store._cfg.plugins.per_plugin["test_plugin"] = PluginConfig(
-        granted_permissions=["filesystem:read"],
+        granted_permissions=[_GRANT],
     )
 
-    client.post("/plugins/test_plugin/grant/filesystem:read", follow_redirects=False)
+    client.post(f"/plugins/test_plugin/grant/{_GRANT}", follow_redirects=False)
     perms = store._cfg.plugins.per_plugin["test_plugin"].granted_permissions
-    assert perms.count("filesystem:read") == 1
+    assert perms.count(_GRANT) == 1
+
+
+def test_plugin_grant_undeclared_is_refused(tmp_path):
+    """A permission the signed manifest never declared is not storable."""
+    client, store, _ = _client_with_plugin(tmp_path, declared_permissions=_DECLARED)
+
+    resp = client.post("/plugins/test_plugin/grant/filesystem:read", follow_redirects=False)
+    assert resp.status_code == 400
+    assert store._cfg.plugins.per_plugin.get("test_plugin") is None
+
+
+def test_plugin_revoke_permission(tmp_path):
+    """POST /plugins/{id}/revoke/{perm} removes perm from granted_permissions."""
+    client, store, _ = _client_with_plugin(tmp_path, declared_permissions=_DECLARED)
+    store._cfg.plugins.per_plugin["test_plugin"] = PluginConfig(
+        granted_permissions=[_GRANT],
+    )
+
+    resp = client.post(f"/plugins/test_plugin/revoke/{_GRANT}", follow_redirects=False)
+    assert resp.status_code == 303
+    assert store._cfg.plugins.per_plugin["test_plugin"].granted_permissions == []
 
 
 def test_plugin_install_file_requires_acknowledgment(tmp_path):

@@ -5,6 +5,7 @@
 <h1>Plugins</h1>
 
 {% if errors.install is defined %}<p class="error">{{ errors.install }}</p>{% endif %}
+{% if errors.permissions is defined %}<p class="error">{{ errors.permissions }}</p>{% endif %}
 {% if errors._global is defined %}<p class="error">{{ errors._global }}</p>{% endif %}
 
 <section>
@@ -81,6 +82,88 @@
   </table>
   {% else %}
     <p>No plugins loaded.</p>
+  {% endif %}
+</section>
+
+<section>
+  <h2>What each plugin is allowed to do</h2>
+  <p class="info">Nothing is allowed until you allow it here. A plugin can only be allowed
+    to do what its own signed manifest declares, so this list is what it <em>can</em> ask
+    for &mdash; not everything it might want.</p>
+
+  {% if perm_rows %}
+    {% for row in perm_rows %}
+    <section>
+      <h3>{{ row.name }} <small>({{ row.id }})</small></h3>
+
+      {% if row.permissions %}
+      <table>
+        <thead>
+          <tr><th>Tool</th><th>Now</th><th>Change</th></tr>
+        </thead>
+        <tbody>
+        {% for perm in row.permissions %}
+          <tr>
+            <td>
+              {{ perm.label }}
+              {% if perm.note %}<br><small class="info">{{ perm.note }}</small>{% endif %}
+            </td>
+            <td>{% if perm.granted %}<strong>Allowed</strong>{% else %}Not allowed{% endif %}</td>
+            <td>
+              {% if perm.granted %}
+              <form method="post" action="/plugins/{{ row.id }}/revoke/{{ perm.perm|urlencode }}" style="display:inline">
+                <button type="submit">Stop allowing</button>
+              </form>
+              {% else %}
+              <form method="post" action="/plugins/{{ row.id }}/grant/{{ perm.perm|urlencode }}" style="display:inline">
+                <button type="submit">Allow</button>
+              </form>
+              {% endif %}
+            </td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      {% else %}
+        <p class="info">This plugin declares no tools in its signed manifest, so there is
+          nothing it can be allowed to do. Every call to it is refused.</p>
+      {% endif %}
+
+      {% if row.stale %}
+      <p class="error">Left over from an earlier version of this plugin. Each of these is
+        granted, but the plugin no longer declares it, so it has no effect &mdash; calls
+        using it are refused whether it is here or not.</p>
+      <ul>
+      {% for perm in row.stale %}
+        <li>{{ perm }}
+          <form method="post" action="/plugins/{{ row.id }}/revoke/{{ perm|urlencode }}" style="display:inline">
+            <button type="submit">Remove</button>
+          </form>
+        </li>
+      {% endfor %}
+      </ul>
+      {% endif %}
+
+      <p>Anything else this plugin asks for is refused:</p>
+      <ul>
+        <li>A tool that is not in the list above &mdash; whether the plugin never declared
+          it, or you have not allowed it.</li>
+        {% for guard in row.guards %}
+        <li>{{ guard.reason }} This one cannot be approved at the prompt and there is
+          nothing here to switch it off.</li>
+        {% endfor %}
+        {% for cond in row.confirmable %}
+        <li>This plugin's manifest declares <code>{{ cond }}</code> as something you can
+          approve at the time, so a call that trips it asks you rather than being refused
+          outright.</li>
+        {% endfor %}
+        <li>A tool whose arguments the signed manifest does not declare, or a call carrying
+          an argument it does not name.</li>
+      </ul>
+    </section>
+    {% endfor %}
+  {% else %}
+    <p>No plugins are loaded, so there is nothing to allow yet.</p>
   {% endif %}
 </section>
 

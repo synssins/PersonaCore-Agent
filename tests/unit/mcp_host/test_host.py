@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 import workstation_agent.mcp_host.audit as audit_mod
-from workstation_agent.config.schema import AgentConfig
+from workstation_agent.config.schema import AgentConfig, PluginConfig
 from workstation_agent.mcp_host import host as host_mod
 from workstation_agent.mcp_host.host import (
     ConfirmationRequestImpl,
@@ -726,10 +726,25 @@ def _ok_client() -> AsyncMock:
 
 
 def _policy_cfg(*, never=(), always=(), remember=()) -> AgentConfig:
+    """A §7 policy config that also carries the grants the fixtures below hold.
+
+    ``set_config`` re-reads each running plugin's ``granted_permissions`` (P25:
+    a grant made on the Plugins page has to reach the gate on the next call, not
+    the next restart), so a config that names no grants is a config saying the
+    operator has granted nothing -- and pushing one would revoke the fixture
+    plugins mid-test. The grants here are the same two the runtime helpers below
+    are built with, so a policy push changes the policy and nothing else.
+    """
     cfg = AgentConfig()
     cfg.confirmation.never_prompt = list(never)
     cfg.confirmation.always_prompt = list(always)
     cfg.confirmation.remember_for_session = list(remember)
+    cfg.plugins.per_plugin["shell"] = PluginConfig(
+        granted_permissions=["tool:shell.run"],
+    )
+    cfg.plugins.per_plugin["serial"] = PluginConfig(
+        granted_permissions=["tool:serial.write"],
+    )
     return cfg
 
 
