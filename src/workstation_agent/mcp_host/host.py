@@ -521,17 +521,17 @@ class MCPHost:
             vresult = verify(manifest, TRUSTED_PUBKEYS, allow_unsigned=allow_unsigned)
             log.info("plugin=%s verify_status=%s", manifest.id, vresult.status)
 
-            granted: set[str] = set(per.granted_permissions) if per else set()
-
+            # Grants are stamped by _register, at the moment the plugin joins
+            # the pool -- not here.  See _register on the startup-window defect
+            # that closes.
             runtime = _PluginRuntime(
                 manifest=manifest,
                 verify_result=vresult,
-                granted_permissions=granted,
             )
 
             if vresult.status in {"quarantined", "invalid"}:
                 runtime.status = "quarantined"
-                self._runtimes[manifest.id] = runtime
+                self._register(runtime)
                 audit_log(AuditEvent(
                     event="plugin_quarantined",
                     plugin_id=manifest.id,
@@ -544,10 +544,10 @@ class MCPHost:
             except Exception:
                 log.exception("failed to spawn plugin=%s", manifest.id)
                 runtime.status = "stopped"
-                self._runtimes[manifest.id] = runtime
+                self._register(runtime)
                 continue
 
-            self._runtimes[manifest.id] = runtime
+            self._register(runtime)
 
         self._watchdog = HeartbeatWatchdog(
             self._supervisor,
@@ -558,6 +558,42 @@ class MCPHost:
         )
         await self._watchdog.start()
         audit_log(AuditEvent(event="host_started"))
+
+    def _grants_for(self, plugin_id: str) -> set[str]:
+        """What the **current** config grants *plugin_id*, read live.
+
+        The one place that turns config into a runtime grant set, so
+        :meth:`start`, :meth:`_register` and :meth:`set_config` cannot answer
+        the question three slightly different ways.
+        """
+        if self._config is None:
+            return set()
+        per = self._config.plugins.per_plugin.get(plugin_id)
+        return set(per.granted_permissions) if per is not None else set()
+
+    def _register(self, runtime: _PluginRuntime) -> None:
+        """Put *runtime* in the pool, stamping its grants from the live config.
+
+        The grants are re-read **here**, at the moment the plugin becomes
+        reachable, rather than being carried down from the top of
+        :meth:`start`.  ``_spawn`` is awaited in between, and a grant made on
+        the Plugins page during that window lands in a config that
+        :meth:`set_config` then walks -- but the plugin is not in
+        ``self._runtimes`` yet, so the refresh skips it and it enters the pool
+        holding the stale snapshot.  The owner clicks Allow, the page says
+        Allowed, and the tool is denied until the next restart: the same defect
+        this subtask exists to close, reached through the startup door.
+
+        Re-reading at registration is preferred over widening
+        :meth:`set_config` to chase in-flight starts.  Chasing means keeping a
+        record of plugins that are mid-spawn and reconciling it afterwards --
+        more state, and a second ordering to get wrong -- whereas this closes
+        the window by construction: whatever the config says at the instant the
+        plugin becomes callable is what the gate is handed, and there is no
+        instant in between for a grant to fall into.
+        """
+        runtime.granted_permissions = self._grants_for(runtime.manifest.id)
+        self._runtimes[runtime.manifest.id] = runtime
 
     def set_config(self, config: AgentConfig) -> None:
         """Push an updated config into the running host without a restart.
@@ -582,8 +618,7 @@ class MCPHost:
         """
         self._config = config
         for plugin_id, runtime in self._runtimes.items():
-            per = config.plugins.per_plugin.get(plugin_id)
-            runtime.granted_permissions = set(per.granted_permissions) if per else set()
+            runtime.granted_permissions = self._grants_for(plugin_id)
 
     async def _spawn(self, runtime: _PluginRuntime) -> None:
         """Spawn the subprocess, connect the client, collect tools."""

@@ -17,20 +17,27 @@ Copyright (c) 2024 PersonaCore-Agent contributors. See LICENSE for details.
 
 from __future__ import annotations
 
+import asyncio
 import re
 from typing import TYPE_CHECKING
 
+import httpx
 import pytest
+from markupsafe import escape
 
 from tests.unit.ui.conftest import (
+    TEST_ORIGIN,
     FakeConfigStore,
     FakeMCPHost,
     FakePluginInfo,
+    _LoopbackASGI,
     make_client,
 )
 from workstation_agent.config.schema import AgentConfig, PluginConfig
 from workstation_agent.mcp_host.loader import PluginManifest
 from workstation_agent.mcp_host.permissions import evaluate, evaluate_detailed
+from workstation_agent.ui.backend.app import BackendContext, create_app
+from workstation_agent.ui.backend.routers.plugins_routes import NO_ARG_DECLARATION_NOTE
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -406,3 +413,332 @@ async def test_set_config_refreshes_a_running_plugins_grants(tmp_path):
     cfg.plugins.per_plugin[PLUGIN_ID] = PluginConfig(granted_permissions=[])
     host.set_config(cfg)
     assert runtime.granted_permissions == set()
+
+
+# ---------------------------------------------------------------------------
+# A permission carrying a slash (review finding 1)
+#
+# ``{perm}`` stops at the first ``/``. Grant would render a button whose POST
+# 404s; revoke would strand a stale grant the owner cannot click away -- which
+# is the config file as the only way out, the exact outcome unbounded revoke
+# exists to prevent.
+# ---------------------------------------------------------------------------
+
+#: A grant with a ``/`` in it. Contrived as a *declared* tool, ordinary as a
+#: stale one: ``granted_permissions`` is arbitrary stored text, and a past
+#: manifest could have put a ``path:`` scope or anything else in there.
+SLASHED_TOOL = "tool:demo.read/all"
+SLASHED_STALE = "path:C:/Users/Chris/"
+
+
+def test_a_declared_permission_with_a_slash_can_be_granted(tmp_path):
+    """The Allow button the page renders for it actually reaches the route."""
+    store = FakeConfigStore(AgentConfig())
+    host = FakeMCPHost(plugins_list=[
+        FakePluginInfo(id=PLUGIN_ID, declared_permissions=[SLASHED_TOOL]),
+    ])
+    client = make_client(config_store=store, mcp_host=host, tmp_path=tmp_path)
+
+    action = _form_action(client.get("/plugins").text, "grant", SLASHED_TOOL)
+    assert "/" in action.split("/grant/", 1)[1], "the slash survives into the URL"
+
+    resp = client.post(action, follow_redirects=False)
+    assert resp.status_code == 303, "a slashed permission must not 404"
+    assert _granted(store) == {SLASHED_TOOL}
+
+
+def test_a_stale_grant_with_a_slash_can_be_revoked(tmp_path):
+    """The one the owner most needs to remove is the one that used to 404."""
+    store = FakeConfigStore(AgentConfig())
+    cfg = store.load()
+    cfg.plugins.per_plugin[PLUGIN_ID] = PluginConfig(
+        granted_permissions=[SLASHED_STALE],
+    )
+    store.save(cfg)
+    host = FakeMCPHost(plugins_list=[
+        FakePluginInfo(id=PLUGIN_ID, declared_permissions=list(DECLARED)),
+    ])
+    client = make_client(config_store=store, mcp_host=host, tmp_path=tmp_path)
+
+    page = client.get("/plugins").text
+    assert SLASHED_STALE in page
+
+    action = _form_action(page, "revoke", SLASHED_STALE)
+    resp = client.post(action, follow_redirects=False)
+    assert resp.status_code == 303, "a slashed stale grant must be clickable away"
+    assert _granted(store) == set()
+
+
+def test_widening_the_matcher_did_not_widen_what_is_grantable(tmp_path):
+    """``{perm:path}`` changes routing, never the bound. Still refused."""
+    client, store, _host = _fixture(tmp_path)
+
+    resp = client.post(
+        f"/plugins/{PLUGIN_ID}/grant/path:C:/Windows/System32/",
+        follow_redirects=False,
+    )
+    assert resp.status_code == 400
+    assert _granted(store) == set()
+
+
+# ---------------------------------------------------------------------------
+# Overlapping clicks (review finding 2)
+# ---------------------------------------------------------------------------
+
+
+class _DiskLikeStore:
+    """A store with the real one's semantics: ``load`` copies, ``save`` replaces.
+
+    ``FakeConfigStore`` hands every caller the *same* object, so two requests
+    mutating it cannot lose each other's work no matter how they interleave --
+    which is precisely the failure mode under test here. The real store reads
+    and writes a file, so each ``load`` is an independent snapshot and the last
+    ``save`` wins. This models that, and nothing else.
+    """
+
+    def __init__(self, cfg: AgentConfig) -> None:
+        self._raw = cfg.model_dump(mode="json")
+
+    def load(self) -> AgentConfig:
+        return AgentConfig.model_validate(self._raw)
+
+    def save(self, cfg: AgentConfig) -> None:
+        self._raw = cfg.model_dump(mode="json")
+
+
+class _GatedHost(FakeMCPHost):
+    """A host whose *first* ``plugins()`` parks until the test releases it.
+
+    The grant route reads the host listing inside its critical section -- the
+    declaration check is an input to what gets stored, so it has to be. Parking
+    the first caller there holds the lock open, and whether the second caller
+    gets in tells us whether the lock is doing anything.
+    """
+
+    def __init__(self, plugins_list: list[FakePluginInfo]) -> None:
+        super().__init__(plugins_list)
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.calls = 0
+
+    async def plugins(self):
+        self.calls += 1
+        if self.calls == 1:
+            self.entered.set()
+            await self.release.wait()
+        return self._plugins
+
+
+def _async_client(store, host) -> httpx.AsyncClient:
+    """``make_client``'s asynchronous twin: same guards, real concurrency.
+
+    ``TestClient`` drives the app on a loop of its own, so two of its calls
+    cannot overlap. These requests share this test's loop, which is the only
+    way two clicks can actually be in flight at once.
+    """
+    app = _LoopbackASGI(create_app(BackendContext(
+        config_store=store,
+        mcp_host=host,
+    )))
+    return httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url=TEST_ORIGIN,
+        headers={"Origin": TEST_ORIGIN, "Sec-Fetch-Site": "same-origin"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_overlapping_click_waits_instead_of_losing_the_first():
+    """Two grants in flight at once; neither is written over by the other.
+
+    Without the lock the second request reads the config the first has not
+    finished writing, and one of the two grants is silently gone. He has
+    twenty-one tools to turn on and will click several in a row, so this is
+    how the page is actually used.
+    """
+    store = _DiskLikeStore(AgentConfig())
+    host = _GatedHost([
+        FakePluginInfo(id=PLUGIN_ID, declared_permissions=list(DECLARED)),
+    ])
+
+    async with _async_client(store, host) as client:
+        first = asyncio.create_task(
+            client.post(f"/plugins/{PLUGIN_ID}/grant/tool%3A{TOOL}"),
+        )
+        await asyncio.wait_for(host.entered.wait(), timeout=5)
+
+        second = asyncio.create_task(
+            client.post(f"/plugins/{PLUGIN_ID}/grant/tool%3Ademo.write"),
+        )
+        for _ in range(20):
+            await asyncio.sleep(0)
+
+        # The second click is waiting on the lock, not racing through it.
+        assert host.calls == 1, (
+            "the second request entered the read-modify-write while the first "
+            "was still inside it"
+        )
+
+        host.release.set()
+        await asyncio.gather(first, second)
+
+    stored = set(store.load().plugins.per_plugin[PLUGIN_ID].granted_permissions)
+    assert stored == {TOOL_PERM, "tool:demo.write"}
+
+
+@pytest.mark.asyncio
+async def test_a_revoke_is_not_undone_by_an_overlapping_grant():
+    """Revoke a, allow b, quickly: the config must not end up holding a."""
+    cfg = AgentConfig()
+    cfg.plugins.per_plugin[PLUGIN_ID] = PluginConfig(granted_permissions=[TOOL_PERM])
+    store = _DiskLikeStore(cfg)
+    host = _GatedHost([
+        FakePluginInfo(id=PLUGIN_ID, declared_permissions=list(DECLARED)),
+    ])
+
+    async with _async_client(store, host) as client:
+        grant = asyncio.create_task(
+            client.post(f"/plugins/{PLUGIN_ID}/grant/tool%3Ademo.write"),
+        )
+        await asyncio.wait_for(host.entered.wait(), timeout=5)
+
+        revoke = asyncio.create_task(
+            client.post(f"/plugins/{PLUGIN_ID}/revoke/tool%3A{TOOL}"),
+        )
+        for _ in range(20):
+            await asyncio.sleep(0)
+
+        host.release.set()
+        await asyncio.gather(grant, revoke)
+
+    stored = set(store.load().plugins.per_plugin[PLUGIN_ID].granted_permissions)
+    assert TOOL_PERM not in stored, "the revoked permission came back"
+    assert stored == {"tool:demo.write"}
+
+
+# ---------------------------------------------------------------------------
+# Mixed case (review finding 3)
+#
+# The page's "no argument declaration" note and the gate's decision are two
+# answers to one question, and they must never disagree: the note says calls
+# will be refused, so a call the gate allows makes the page a liar in the
+# direction that teaches the owner to distrust it.
+# ---------------------------------------------------------------------------
+
+#: The note as it appears *in the page*: Jinja escapes the apostrophes in
+#: "plugin's" and "tool's", so the raw constant never matches the rendered HTML.
+RENDERED_NO_ARG_NOTE = str(escape(NO_ARG_DECLARATION_NOTE))
+
+MIXED_TOOL = "MyTool"
+MIXED_DECLARED = [
+    f"tool:{MIXED_TOOL}",
+    f"args:{MIXED_TOOL}:read:text=opaque",
+]
+
+
+def _mixed_manifest(tmp_path: Path, declared: list[str]) -> PluginManifest:
+    return PluginManifest(
+        id=PLUGIN_ID,
+        name="Demo Plugin",
+        version="1.0.0",
+        runtime="python",
+        entry=["python", "-m", "demo"],
+        plugin_dir=tmp_path,
+        signature_file=tmp_path / "plugin.sig",
+        declared_permissions=list(declared),
+        confirmable_conditions=[],
+    )
+
+
+def test_mixed_case_declaration_page_and_gate_agree(tmp_path):
+    """A mixed-case tool: no "will be refused" note, and the gate allows it."""
+    store = FakeConfigStore(AgentConfig())
+    host = FakeMCPHost(plugins_list=[
+        FakePluginInfo(id=PLUGIN_ID, declared_permissions=list(MIXED_DECLARED)),
+    ])
+    client = make_client(config_store=store, mcp_host=host, tmp_path=tmp_path)
+    manifest = _mixed_manifest(tmp_path, MIXED_DECLARED)
+
+    page = client.get("/plugins").text
+    assert MIXED_TOOL in page
+    assert RENDERED_NO_ARG_NOTE not in page, (
+        "the page warns of a refusal the gate will not perform"
+    )
+
+    client.post(_form_action(page, "grant", f"tool:{MIXED_TOOL}"), follow_redirects=False)
+    assert evaluate(manifest, MIXED_TOOL, {"text": "hi"}, _granted(store)) == "allow"
+
+
+def test_mixed_case_without_an_args_entry_page_and_gate_agree(tmp_path):
+    """The other direction: the note appears, and the gate really does refuse."""
+    declared = [f"tool:{MIXED_TOOL}"]  # identity declared, arguments not
+    store = FakeConfigStore(AgentConfig())
+    host = FakeMCPHost(plugins_list=[
+        FakePluginInfo(id=PLUGIN_ID, declared_permissions=list(declared)),
+    ])
+    client = make_client(config_store=store, mcp_host=host, tmp_path=tmp_path)
+    manifest = _mixed_manifest(tmp_path, declared)
+
+    page = client.get("/plugins").text
+    assert RENDERED_NO_ARG_NOTE in page
+
+    client.post(_form_action(page, "grant", f"tool:{MIXED_TOOL}"), follow_redirects=False)
+    outcome = evaluate_detailed(manifest, MIXED_TOOL, {"text": "hi"}, _granted(store))
+    assert outcome.decision == "deny"
+    assert outcome.rule == "undeclared_tool"
+
+
+# ---------------------------------------------------------------------------
+# A grant made mid-startup (review finding 4)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_grant_made_while_a_plugin_is_starting_is_not_lost(tmp_path):
+    """``set_config`` lands during ``_spawn``; the plugin must still see it.
+
+    ``set_config`` walks ``self._runtimes``, and a plugin that is mid-spawn is
+    not in it yet, so the refresh skips it. Reading the config at registration
+    closes that window: whatever the config says when the plugin becomes
+    callable is what the gate is handed.
+    """
+    from unittest.mock import patch
+
+    from workstation_agent.mcp_host.host import MCPHost
+    from workstation_agent.mcp_host.loader import VerifyResult
+
+    manifest = _manifest(tmp_path)
+    cfg = AgentConfig()
+    cfg.plugins.allow_unsigned = True
+
+    host = MCPHost()
+
+    async def _spawn_then_grant(_self, runtime):
+        """Stand in for the real spawn, and click Allow while it is running."""
+        granted_cfg = AgentConfig()
+        granted_cfg.plugins.allow_unsigned = True
+        granted_cfg.plugins.per_plugin[PLUGIN_ID] = PluginConfig(
+            granted_permissions=[TOOL_PERM],
+        )
+        host.set_config(granted_cfg)
+        runtime.status = "running"
+
+    with (
+        patch("workstation_agent.mcp_host.host.discover", return_value=[manifest]),
+        patch.object(MCPHost, "_spawn", _spawn_then_grant),
+        patch(
+            "workstation_agent.mcp_host.host.verify",
+            return_value=VerifyResult(status="unsigned"),
+        ),
+    ):
+        await host.start(cfg, confirm_cb=None)
+        try:
+            runtime = host._runtimes[PLUGIN_ID]
+            assert runtime.granted_permissions == {TOOL_PERM}, (
+                "a grant made while the plugin was starting was dropped"
+            )
+            assert evaluate(
+                manifest, TOOL, {"text": "hi"}, runtime.granted_permissions,
+            ) == "allow"
+        finally:
+            await host.stop()

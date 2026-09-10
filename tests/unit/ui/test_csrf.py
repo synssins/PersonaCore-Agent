@@ -15,6 +15,8 @@ that makes this maintainable -- nobody has to remember.
 
 from __future__ import annotations
 
+import re
+
 import pytest
 from starlette.websockets import WebSocketDisconnect
 
@@ -265,6 +267,14 @@ def test_the_loopback_guard_still_answers_first(tmp_path):
 #: them, which is the whole point of asserting on it here.
 _PATH_PARAMS = {"plugin_id": "some-plugin", "perm": "some-perm"}
 
+#: Matches ``{name}`` and ``{name:convertor}`` alike. Starlette lets a path
+#: parameter name a convertor -- ``{perm:path}``, which is how the permission
+#: routes accept a permission string with a ``/`` in it -- and a substitution
+#: that only understood the bare form would silently stop replacing that
+#: parameter, leaving a ``{`` behind and failing the guard below for a reason
+#: that has nothing to do with CSRF.
+_PATH_PARAM_RE = re.compile(r"\{(\w+)(?::[^}]+)?\}")
+
 
 def _walk(routes):
     """Flatten FastAPI's route tree into the leaf routes that carry methods.
@@ -288,9 +298,10 @@ def _state_changing_paths(app) -> list[tuple[str, str]]:
     for route in _walk(app.routes):
         methods = getattr(route, "methods", None) or set()
         for method in sorted(set(methods) - csrf.SAFE_METHODS):
-            concrete = route.path
-            for name, value in _PATH_PARAMS.items():
-                concrete = concrete.replace("{" + name + "}", value)
+            concrete = _PATH_PARAM_RE.sub(
+                lambda m: _PATH_PARAMS.get(m.group(1), m.group(0)),
+                route.path,
+            )
             found.append((method, concrete))
     return found
 

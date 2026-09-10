@@ -5,9 +5,11 @@ Copyright (c) 2024 PersonaCore-Agent contributors. See LICENSE for details.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 from typing import TYPE_CHECKING, Annotated, Any
+from weakref import WeakKeyDictionary
 
 from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -29,6 +31,61 @@ log = logging.getLogger(__name__)
 router = APIRouter(prefix="/plugins", tags=["plugins"])
 
 _TRUTHY = {"true", "1", "yes", "on"}
+
+#: Serialises this router's read-modify-write cycles against each other.
+#:
+#: Every mutation here is load-the-config, change one field, save it back.
+#: ``config.store.save`` writes to a temporary file and ``Path.replace``\ s it
+#: in, so a *save* is atomic -- a reader never sees half a file. That is the
+#: only atomicity the store has: it has no lock, no revision and no
+#: compare-and-swap, so it cannot notice that the config it is being handed was
+#: derived from a version that has since been replaced. Two overlapping
+#: requests therefore both read the same starting state and the second one
+#: writes its copy over the first, and the update the first made is simply
+#: gone. Revoke ``tool:a``, then immediately allow ``tool:b``, and the config
+#: can end up holding *both* -- the gate allowing something the owner has just
+#: explicitly stopped. With twenty-one tools to turn on he will click several
+#: in a row, so this is an ordinary Tuesday, not a race that needs contriving.
+#:
+#: A lock rather than a retry loop, deliberately: the second click waits its
+#: turn and is then applied to what the first one actually wrote. Compare-and-
+#: retry would have to decide what to do with the loser, and the only honest
+#: answers are "do it again" (this, with extra steps) or "drop it" (the bug).
+#:
+#: Held across the whole decision, not just the write. The host listing and the
+#: declaration check are *inputs* to what gets stored, so reading them outside
+#: the lock would leave the same window one step further back.
+#:
+#: Module-level because the store is a process-wide file and the router is a
+#: singleton. It does not reach ``config_routes``, which has the same shape
+#: over the same file; that is a real remaining gap and is noted rather than
+#: silently widened here.
+#:
+#: Keyed by running loop, and created on first use rather than at import.
+#: ``asyncio.Lock`` binds itself to the loop that first acquires it and raises
+#: on every later loop, so one lock built at import time would work for the
+#: Agent's single long-lived loop and then wedge every state-changing click the
+#: moment the app was served from a second one -- which is what the tests do
+#: constantly, and it is not a property worth betting the page on. Per-loop is
+#: also the honest scope: two coroutines can only interleave if they share a
+#: loop, so that is exactly the boundary the serialisation has to cover.
+_CONFIG_WRITE_LOCKS: WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock] = (
+    WeakKeyDictionary()
+)
+
+
+def _config_write_lock() -> asyncio.Lock:
+    """The write lock for the loop this request is running on.
+
+    Synchronous, and therefore not itself a race: it runs to completion between
+    two of the loop's own steps, so two callers cannot both find it absent.
+    """
+    loop = asyncio.get_running_loop()
+    lock = _CONFIG_WRITE_LOCKS.get(loop)
+    if lock is None:
+        lock = asyncio.Lock()
+        _CONFIG_WRITE_LOCKS[loop] = lock
+    return lock
 
 #: Prefix of a tool-identity grant, as the gate spells it.
 _TOOL_PREFIX = "tool:"
@@ -54,6 +111,19 @@ WILDCARD_NOTE = (
     "manifest declares that tool's arguments, and is still checked against the "
     "folders, commands and sites the manifest declares"
 )
+
+#: How much of a caller-supplied permission string is echoed back in a refusal.
+#: ``{perm:path}`` accepts a long, arbitrary tail, and the refusal is a page --
+#: long enough for any real permission to be recognisable, short enough that
+#: the page stays a page. Jinja escapes it on the way out, so this is about
+#: length, not markup.
+_PERM_ECHO_LIMIT = 80
+
+
+def _shown_perm(perm: str) -> str:
+    """*perm*, bounded, for a message a person reads."""
+    return perm if len(perm) <= _PERM_ECHO_LIMIT else perm[:_PERM_ECHO_LIMIT] + "…"
+
 
 GRANT_NOT_DECLARED_ERROR = (
     "The {plugin!r} plugin does not declare {perm!r} in its signed manifest, so "
@@ -345,7 +415,7 @@ def _refused_permission_page(
     )
 
 
-@router.post("/{plugin_id}/grant/{perm}", response_model=None)
+@router.post("/{plugin_id}/grant/{perm:path}", response_model=None)
 async def plugin_grant(
     request: Request,
     plugin_id: str,
@@ -368,45 +438,55 @@ async def plugin_grant(
 
     Idempotent: granting what is already granted changes nothing and is not an
     error. The owner clicking twice is not a mistake he should be told off for.
+
+    ``{perm:path}`` rather than ``{perm}``: a path parameter stops at the first
+    ``/``, so a declared permission carrying one (a ``path:`` scope, say) would
+    render an Allow button whose POST 404s -- a control that cannot work, which
+    is the failure this page exists to remove. Widening the *matcher* cannot
+    widen what is grantable: the declaration check below is what bounds this
+    route, and it is unchanged. Do not "tighten" this back.
     """
-    plugins = await _loaded_plugins(ctx)
-    cfg = None
-    if ctx.config_store is not None:
-        with contextlib.suppress(Exception):
-            cfg = ctx.config_store.load()
+    async with _config_write_lock():
+        plugins = await _loaded_plugins(ctx)
+        cfg = None
+        if ctx.config_store is not None:
+            with contextlib.suppress(Exception):
+                cfg = ctx.config_store.load()
 
-    match = next((p for p in plugins if str(getattr(p, "id", "")) == plugin_id), None)
-    if match is None:
-        log.warning("permission grant refused: unknown plugin id=%s", plugin_id)
-        return _refused_permission_page(
-            request, plugins, cfg,
-            GRANT_UNKNOWN_PLUGIN_ERROR.format(plugin=plugin_id),
-        )
+        match = next((p for p in plugins if str(getattr(p, "id", "")) == plugin_id), None)
+        if match is None:
+            log.warning("permission grant refused: unknown plugin id=%s", plugin_id)
+            return _refused_permission_page(
+                request, plugins, cfg,
+                GRANT_UNKNOWN_PLUGIN_ERROR.format(plugin=plugin_id),
+            )
 
-    declared = grantable_permissions(getattr(match, "declared_permissions", []) or [])
-    if perm not in declared:
-        log.warning(
-            "permission grant refused: id=%s perm=%s is not declared",
-            plugin_id, perm,
-        )
-        return _refused_permission_page(
-            request, plugins, cfg,
-            GRANT_NOT_DECLARED_ERROR.format(plugin=plugin_id, perm=perm),
-        )
+        declared = grantable_permissions(getattr(match, "declared_permissions", []) or [])
+        if perm not in declared:
+            log.warning(
+                "permission grant refused: id=%s perm=%s is not declared",
+                plugin_id, perm,
+            )
+            return _refused_permission_page(
+                request, plugins, cfg,
+                GRANT_NOT_DECLARED_ERROR.format(
+                    plugin=plugin_id, perm=_shown_perm(perm),
+                ),
+            )
 
-    if ctx.config_store is not None and cfg is not None:
-        from workstation_agent.config.schema import PluginConfig  # noqa: PLC0415
-        entry = cfg.plugins.per_plugin.get(plugin_id, PluginConfig())
-        if perm not in entry.granted_permissions:
-            entry.granted_permissions = [*entry.granted_permissions, perm]
-        cfg.plugins.per_plugin[plugin_id] = entry
-        ctx.config_store.save(cfg)
-        _push_to_running_host(ctx, cfg)
+        if ctx.config_store is not None and cfg is not None:
+            from workstation_agent.config.schema import PluginConfig  # noqa: PLC0415
+            entry = cfg.plugins.per_plugin.get(plugin_id, PluginConfig())
+            if perm not in entry.granted_permissions:
+                entry.granted_permissions = [*entry.granted_permissions, perm]
+            cfg.plugins.per_plugin[plugin_id] = entry
+            ctx.config_store.save(cfg)
+            _push_to_running_host(ctx, cfg)
     log.info("permission granted: id=%s perm=%s", plugin_id, perm)
     return RedirectResponse(url="/plugins", status_code=303)
 
 
-@router.post("/{plugin_id}/revoke/{perm}")
+@router.post("/{plugin_id}/revoke/{perm:path}")
 async def plugin_revoke(
     plugin_id: str,
     perm: str,
@@ -427,15 +507,25 @@ async def plugin_revoke(
 
     Idempotent: revoking what is not granted changes nothing and is not an
     error.
+
+    ``{perm:path}`` matters more here than on the grant side. A stale grant is
+    arbitrary stored text -- whatever some past manifest declared, a ``path:``
+    scope with a drive letter in it -- and one containing a ``/`` would simply
+    404, leaving the owner unable to remove it by clicking. That is the config
+    file as the only way out, which is the thing this product does not ask of
+    him, and it would have undone the whole reason revoke is unbounded.
     """
-    if ctx.config_store is not None:
-        cfg = ctx.config_store.load()
-        entry = cfg.plugins.per_plugin.get(plugin_id)
-        if entry is not None and perm in entry.granted_permissions:
-            entry.granted_permissions = [p for p in entry.granted_permissions if p != perm]
-            cfg.plugins.per_plugin[plugin_id] = entry
-            ctx.config_store.save(cfg)
-            _push_to_running_host(ctx, cfg)
+    async with _config_write_lock():
+        if ctx.config_store is not None:
+            cfg = ctx.config_store.load()
+            entry = cfg.plugins.per_plugin.get(plugin_id)
+            if entry is not None and perm in entry.granted_permissions:
+                entry.granted_permissions = [
+                    p for p in entry.granted_permissions if p != perm
+                ]
+                cfg.plugins.per_plugin[plugin_id] = entry
+                ctx.config_store.save(cfg)
+                _push_to_running_host(ctx, cfg)
     log.info("permission revoked: id=%s perm=%s", plugin_id, perm)
     return RedirectResponse(url="/plugins", status_code=303)
 
