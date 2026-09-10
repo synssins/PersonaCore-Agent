@@ -436,6 +436,18 @@ class PluginInfoImpl:
     resource_limits: dict[str, Any]
     integrity: str
     pid: int | None = None
+    #: The plugin's *signed* ``declared_permissions``, verbatim from
+    #: ``plugin.toml``.  Carried here so the settings UI can show the owner what
+    #: this plugin can ever be allowed to do, and can bound what it offers him
+    #: by it.  Without this the UI would have to guess -- and a grant screen
+    #: that offers a permission the manifest never declared is a checkbox that
+    #: always denies.
+    declared_permissions: list[str] = field(default_factory=list)
+    #: The conditions the manifest declares *confirmable*.  A hard guard the
+    #: plugin does not name here always denies and can never be approved at the
+    #: prompt; the UI reads this to tell the two apart rather than presenting
+    #: an unliftable guard as something a click could change.
+    confirmable_conditions: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -509,17 +521,17 @@ class MCPHost:
             vresult = verify(manifest, TRUSTED_PUBKEYS, allow_unsigned=allow_unsigned)
             log.info("plugin=%s verify_status=%s", manifest.id, vresult.status)
 
-            granted: set[str] = set(per.granted_permissions) if per else set()
-
+            # Grants are stamped by _register, at the moment the plugin joins
+            # the pool -- not here.  See _register on the startup-window defect
+            # that closes.
             runtime = _PluginRuntime(
                 manifest=manifest,
                 verify_result=vresult,
-                granted_permissions=granted,
             )
 
             if vresult.status in {"quarantined", "invalid"}:
                 runtime.status = "quarantined"
-                self._runtimes[manifest.id] = runtime
+                self._register(runtime)
                 audit_log(AuditEvent(
                     event="plugin_quarantined",
                     plugin_id=manifest.id,
@@ -532,10 +544,10 @@ class MCPHost:
             except Exception:
                 log.exception("failed to spawn plugin=%s", manifest.id)
                 runtime.status = "stopped"
-                self._runtimes[manifest.id] = runtime
+                self._register(runtime)
                 continue
 
-            self._runtimes[manifest.id] = runtime
+            self._register(runtime)
 
         self._watchdog = HeartbeatWatchdog(
             self._supervisor,
@@ -547,6 +559,42 @@ class MCPHost:
         await self._watchdog.start()
         audit_log(AuditEvent(event="host_started"))
 
+    def _grants_for(self, plugin_id: str) -> set[str]:
+        """What the **current** config grants *plugin_id*, read live.
+
+        The one place that turns config into a runtime grant set, so
+        :meth:`start`, :meth:`_register` and :meth:`set_config` cannot answer
+        the question three slightly different ways.
+        """
+        if self._config is None:
+            return set()
+        per = self._config.plugins.per_plugin.get(plugin_id)
+        return set(per.granted_permissions) if per is not None else set()
+
+    def _register(self, runtime: _PluginRuntime) -> None:
+        """Put *runtime* in the pool, stamping its grants from the live config.
+
+        The grants are re-read **here**, at the moment the plugin becomes
+        reachable, rather than being carried down from the top of
+        :meth:`start`.  ``_spawn`` is awaited in between, and a grant made on
+        the Plugins page during that window lands in a config that
+        :meth:`set_config` then walks -- but the plugin is not in
+        ``self._runtimes`` yet, so the refresh skips it and it enters the pool
+        holding the stale snapshot.  The owner clicks Allow, the page says
+        Allowed, and the tool is denied until the next restart: the same defect
+        this subtask exists to close, reached through the startup door.
+
+        Re-reading at registration is preferred over widening
+        :meth:`set_config` to chase in-flight starts.  Chasing means keeping a
+        record of plugins that are mid-spawn and reconciling it afterwards --
+        more state, and a second ordering to get wrong -- whereas this closes
+        the window by construction: whatever the config says at the instant the
+        plugin becomes callable is what the gate is handed, and there is no
+        instant in between for a grant to fall into.
+        """
+        runtime.granted_permissions = self._grants_for(runtime.manifest.id)
+        self._runtimes[runtime.manifest.id] = runtime
+
     def set_config(self, config: AgentConfig) -> None:
         """Push an updated config into the running host without a restart.
 
@@ -556,8 +604,21 @@ class MCPHost:
         :meth:`start`, this does **not** reset remembered session approvals
         or touch running plugins -- only a real restart does that (§5.5:
         sessions die with the Agent, not with a settings save).
+
+        It **does** re-read each running plugin's granted permissions, because
+        ``start`` snapshots them into the runtime record and the gate reads the
+        snapshot, not the config.  Without this refresh the owner grants a
+        permission on the Plugins page, the page shows it granted, and the very
+        next tool call is still denied until the Agent restarts -- the page
+        telling him something the gate does not agree with, which is the whole
+        defect P25 exists to close.  A grant is applied here exactly as
+        ``start`` would apply it: whatever ``per_plugin[id].granted_permissions``
+        now says, and nothing else.  Revoking is the same operation in the other
+        direction and takes effect just as immediately.
         """
         self._config = config
+        for plugin_id, runtime in self._runtimes.items():
+            runtime.granted_permissions = self._grants_for(plugin_id)
 
     async def _spawn(self, runtime: _PluginRuntime) -> None:
         """Spawn the subprocess, connect the client, collect tools."""
@@ -943,6 +1004,8 @@ class MCPHost:
                 ),
                 integrity=handle.integrity if handle is not None else "unknown",
                 pid=handle.pid if handle is not None else None,
+                declared_permissions=list(runtime.manifest.declared_permissions),
+                confirmable_conditions=list(runtime.manifest.confirmable_conditions),
             ))
         return result
 
