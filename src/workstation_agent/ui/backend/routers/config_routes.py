@@ -20,7 +20,11 @@ from workstation_agent.config.schema import (
     AgentConfig,
 )
 from workstation_agent.ui.backend.app import BackendContext, get_context, templates
-from workstation_agent.ui.backend.form_guard import not_a_form_body
+from workstation_agent.ui.backend.form_guard import (
+    SPEAKS_FOR_FIELD,
+    not_a_form_body,
+    speaks_for,
+)
 
 if TYPE_CHECKING:
     from starlette.datastructures import FormData
@@ -122,9 +126,10 @@ _SETTINGS_FIELDS = frozenset({
     "adb_binary_path",
 })
 
-#: Hidden field in ``config.html`` naming the checkboxes that submission speaks
-#: for. See :func:`_checkbox`.
-_CHECKBOX_DECLARATION = "checkbox_fields"
+#: What ``config.html``'s confirmation form declares in SPEAKS_FOR_FIELD.
+#: Its absence means the body did not come from that form. See
+#: :func:`confirmation_policy_post`.
+_CONFIRMATION_POLICY_SCOPE = "confirmation_policy"
 
 
 def _unreadable_body(request: Request, form: FormData) -> tuple[int, str] | None:
@@ -171,17 +176,27 @@ def _kept[T](form: FormData, name: str, submitted: T, current: T) -> T:
     return submitted if name in form else current
 
 
-def _checkbox(form: FormData, name: str, submitted: str, *, current: bool) -> bool:
+def _checkbox(
+    form: FormData, declared: frozenset[str], name: str, submitted: str, *, current: bool,
+) -> bool:
     """Resolve one checkbox, which HTML omits entirely when it is unticked.
 
-    Absence is genuinely ambiguous for a checkbox, so ``config.html`` submits a
-    hidden ``checkbox_fields`` listing the boxes it speaks for. Named there and
-    absent means the operator unticked it; not named at all means this caller
-    never had an opinion, and the stored value stands.
+    Absence is ambiguous for a checkbox in a way it is not for a text field, so
+    the settings form names the boxes it renders in ``speaks_for`` and
+    *declared* is that list. Named there and absent means the operator unticked
+    it; not named at all means this caller never had an opinion, and the stored
+    value stands.
+
+    Only the checkboxes need the declaration. Every other field is recoverable
+    without it, because :func:`_kept` reads its absence as "unchanged" rather
+    than as a value. That is also why ``speaks_for`` is not itself a settings
+    field: a body carrying *only* ``speaks_for`` names no setting, so the 400
+    guard rejects it. A script that wants to untick one box therefore sends
+    ``wake_enabled=""`` (or any one real field) rather than relying on
+    omission -- an acceptable price for a desktop agent, and a deliberate one.
     """
     if name in form:
         return bool(submitted)
-    declared = str(form.get(_CHECKBOX_DECLARATION) or "").split()
     return False if name in declared else current
 
 
@@ -333,9 +348,13 @@ async def config_post(  # noqa: PLR0913, PLR0917
     update_channel = _kept(form, "update_channel", update_channel, cfg.update.channel)
     adb_binary_path = _kept(form, "adb_binary_path", adb_binary_path, cfg.adb.binary_path)
 
-    streaming = _checkbox(form, "llm_streaming", llm_streaming, current=cfg.llm.streaming)
-    wake_on = _checkbox(form, "wake_enabled", wake_enabled, current=cfg.wake.enabled)
-    update_on = _checkbox(form, "update_enabled", update_enabled, current=cfg.update.enabled)
+    declared = speaks_for(form)
+    streaming = _checkbox(form, declared, "llm_streaming", llm_streaming,
+                          current=cfg.llm.streaming)
+    wake_on = _checkbox(form, declared, "wake_enabled", wake_enabled,
+                        current=cfg.wake.enabled)
+    update_on = _checkbox(form, declared, "update_enabled", update_enabled,
+                          current=cfg.update.enabled)
 
     errors = _field_errors(
         wyoming_port, llm_timeout_seconds, wake_threshold,
@@ -496,6 +515,18 @@ def _push_to_running_host(ctx: BackendContext, cfg: AgentConfig) -> None:
         log.exception("confirmation policy: failed to push config to mcp_host")
 
 
+def _refused_policy_page(
+    request: Request, cfg: AgentConfig | None, message: str, status_code: int,
+) -> HTMLResponse:
+    """The policy page redrawn from the *stored* policy, with *message* and a
+    non-2xx status -- the point of a refusal being that nothing moved."""
+    refused = _policy_page(
+        request, cfg, policy_errors={"_global": message}, policy_saved=False,
+    )
+    refused.status_code = status_code
+    return refused
+
+
 @router.post("/confirmation", response_class=HTMLResponse, response_model=None)
 async def confirmation_policy_post(
     request: Request,
@@ -510,6 +541,23 @@ async def confirmation_policy_post(
     :class:`~workstation_agent.mcp_host.host.MCPHost` (when one is wired) via
     ``set_config`` so a moved tool, or a newly-enabled "remember", takes
     effect on the very next tool call -- not just after a restart.
+
+    Two guards, because this route replaces the whole policy from whatever the
+    body happens to contain, and both failure modes here weaken a *safety*
+    setting silently: an empty parse reads as "no tool is never-prompt, no tool
+    is always-prompt, nothing is remembered", which drops a tool the operator
+    pinned to always-prompt down to ask -- it stops being guarded, with nothing
+    on screen to say so -- and drops never-prompt tools back to prompting.
+
+    The first guard is the encoding (415). The second is the one that closes
+    what the encoding check cannot: an empty form is a *legitimate* submission
+    here, because there is no "ask" radio and "ask for everything" really does
+    submit no policy fields. So "the operator chose ask for everything" and
+    "this body arrived empty" are indistinguishable from the fields alone --
+    the same indistinguishability that erased the configuration from the tray.
+    The form declares itself in ``speaks_for`` and this checks for that
+    declaration (400): present with no policies is honoured exactly as before,
+    absent means the body did not come from this form and nothing is saved.
     """
     if ctx.config_store is None:
         return _policy_page(
@@ -526,25 +574,27 @@ async def confirmation_policy_post(
             policy_saved=False,
         )
 
-    # Same hole as POST /config had, in the same file: this route replaces the
-    # whole §7 policy from the raw form, and a non-form body parses as an empty
-    # one -- which reads as "no tool is never-prompt, no tool is always-prompt,
-    # nothing is remembered". That silently drops a tool the operator had
-    # pinned to always-prompt down to ask, which is a weaker policy than they
-    # chose. An *empty* form is left alone: with only never/always radios and
-    # no "ask" radio, "the operator chose ask for everything" really does
-    # submit nothing.
     wrong_encoding = not_a_form_body(request, saves="saves the whole confirmation policy")
     if wrong_encoding is not None:
         log.warning("confirmation policy POST refused (415): %s", wrong_encoding)
-        refused = _policy_page(
-            request, cfg, policy_errors={"_global": wrong_encoding}, policy_saved=False,
+        return _refused_policy_page(
+            request, cfg, wrong_encoding, status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
         )
-        refused.status_code = status.HTTP_415_UNSUPPORTED_MEDIA_TYPE
-        return refused
+
+    form = await request.form()
+    if _CONFIRMATION_POLICY_SCOPE not in speaks_for(form):
+        message = (
+            "This form-encoded body did not come from the confirmation policy form: "
+            f"it carries no {SPEAKS_FOR_FIELD}={_CONFIRMATION_POLICY_SCOPE!r} "
+            'declaration. Because an empty submission legitimately means "ask for '
+            'every tool", the declaration is the only thing separating that choice '
+            "from a body that arrived empty, and a confirmation policy is not "
+            "something to erase on a guess. Nothing was saved."
+        )
+        log.warning("confirmation policy POST refused (400): %s", message)
+        return _refused_policy_page(request, cfg, message, status.HTTP_400_BAD_REQUEST)
 
     tools = _confirmation_tool_names(cfg)
-    form = await request.form()
     _apply_confirmation_form(cfg, tools, form)
 
     try:

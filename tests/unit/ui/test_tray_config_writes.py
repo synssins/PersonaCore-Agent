@@ -198,7 +198,7 @@ def test_a_partial_form_leaves_the_fields_it_did_not_mention_alone(
     assert cfg.adb.binary_path == r"C:\tools\platform-tools\adb.exe"
     # The checkboxes too. HTML omits an unticked box, so a caller that never
     # mentioned one must not be read as having unticked it -- that is what the
-    # hidden `checkbox_fields` marker is for, and this body has no marker.
+    # hidden `speaks_for` marker is for, and this body has no marker.
     assert cfg.wake.enabled is True
     assert cfg.update.enabled is True
 
@@ -309,7 +309,7 @@ def test_an_unchecked_checkbox_still_means_false_on_a_real_form_post(
         data={
             # The hidden marker config.html submits, naming the boxes this
             # form speaks for. Without it, absence would mean "no opinion".
-            "checkbox_fields": "llm_streaming wake_enabled update_enabled",
+            "speaks_for": "llm_streaming wake_enabled update_enabled",
             "llm_base_url": "http://10.0.0.5:8053/v1",
             "llm_model": "gpt-4o",
             "llm_timeout_seconds": "45",
@@ -408,17 +408,99 @@ def test_the_confirmation_policy_route_refuses_a_non_form_body(
 def test_the_confirmation_policy_route_still_takes_a_real_form(
     owner_client: TestClient, owner_store: FakeConfigStore,
 ) -> None:
-    """An empty *form* stays legitimate -- there is no "ask" radio, so "ask for
-    everything" really does submit no policy fields."""
     resp = owner_client.post(
         "/config/confirmation",
-        data={"policy_shell_run": "always", "remember_shell_run": "true"},
+        data={
+            "speaks_for": "confirmation_policy",
+            "policy_shell_run": "always",
+            "remember_shell_run": "true",
+        },
     )
 
     assert resp.status_code == 200
     after = owner_store.load()
     assert after.confirmation.always_prompt == ["shell_run"]
     assert after.confirmation.remember_for_session == ["shell_run"]
+
+
+def test_choosing_ask_for_every_tool_is_still_expressible(
+    owner_client: TestClient, owner_store: FakeConfigStore,
+) -> None:
+    """The case the declaration exists to preserve.
+
+    There is no "ask" radio, so an operator who wants to be prompted for
+    everything submits a form with no policy fields at all. That is a real
+    choice and must save. Refusing every empty submission would have made it
+    unexpressible -- which is why the guard asks "did this come from the form",
+    not "did it carry any fields".
+    """
+    cfg = owner_store.load()
+    cfg.confirmation.always_prompt = ["shell_run"]
+    cfg.confirmation.never_prompt = ["files_read"]
+    owner_store.save(cfg)
+
+    resp = owner_client.post(
+        "/config/confirmation", data={"speaks_for": "confirmation_policy"},
+    )
+
+    assert resp.status_code == 200
+    after = owner_store.load()
+    assert after.confirmation.never_prompt == []
+    assert after.confirmation.always_prompt == []
+    assert after.confirmation.remember_for_session == []
+
+
+def test_a_form_encoded_body_without_the_declaration_saves_nothing(
+    owner_client: TestClient, owner_store: FakeConfigStore,
+) -> None:
+    """The hole the encoding check alone could not close.
+
+    A truncated request, or a script that got the field names right and the
+    scope wrong, arrives correctly form-encoded and empty -- indistinguishable
+    from the deliberate choice above on the fields alone. Guessing wrong here
+    silently unpins every always-prompt tool the operator chose to be asked
+    about, so it does not guess.
+    """
+    cfg = owner_store.load()
+    cfg.confirmation.always_prompt = ["shell_run"]
+    cfg.confirmation.never_prompt = ["files_read"]
+    cfg.confirmation.remember_for_session = ["files_read"]
+    owner_store.save(cfg)
+
+    resp = owner_client.post(
+        "/config/confirmation",
+        content=b"",
+        headers={"content-type": "application/x-www-form-urlencoded"},
+    )
+
+    assert resp.status_code == 400
+    after = owner_store.load()
+    assert after.confirmation.always_prompt == ["shell_run"]
+    assert after.confirmation.never_prompt == ["files_read"]
+    assert after.confirmation.remember_for_session == ["files_read"]
+    # And the page redraws from the stored policy, not the empty submission.
+    assert "shell_run" in resp.text
+
+
+def test_a_policy_body_that_declares_a_different_scope_saves_nothing(
+    owner_client: TestClient, owner_store: FakeConfigStore,
+) -> None:
+    """A declaration is a claim about *this* form, not a password.
+
+    The settings form's own ``speaks_for`` list must not open this route -- a
+    misdirected submission is exactly the caller error being guarded against.
+    """
+    cfg = owner_store.load()
+    cfg.confirmation.always_prompt = ["shell_run"]
+    owner_store.save(cfg)
+
+    resp = owner_client.post(
+        "/config/confirmation",
+        data={"speaks_for": "llm_streaming wake_enabled update_enabled"},
+    )
+
+    assert resp.status_code == 400
+    assert owner_store.load().confirmation.always_prompt == ["shell_run"]
 
 
 @pytest.mark.parametrize(

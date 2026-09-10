@@ -25,12 +25,41 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from fastapi import Request
+    from starlette.datastructures import FormData
 
 #: The two encodings an HTML ``<form method="post">`` can arrive as.
 FORM_MEDIA_TYPES = frozenset({
     "application/x-www-form-urlencoded",
     "multipart/form-data",
 })
+
+#: Hidden field every form in this backend submits, naming what that submission
+#: speaks for. See :func:`speaks_for`.
+SPEAKS_FOR_FIELD = "speaks_for"
+
+
+def speaks_for(form: FormData) -> frozenset[str]:
+    """The tokens *form* declared it speaks for; empty when it declared nothing.
+
+    The encoding check above catches a body that is not a form. It cannot catch
+    a body that *is* form-encoded but carries nothing meaningful -- and for some
+    fields, carrying nothing is a legitimate answer. An unticked HTML checkbox
+    is omitted from the submission entirely, and "no tool is set to always
+    prompt" is likewise submitted as no fields at all. So "the operator chose
+    the empty answer" and "this body did not come from that form" arrive
+    identically, which is the exact indistinguishability that erased the
+    configuration in the first place.
+
+    A form therefore declares its own scope in a hidden field, and the handler
+    reads it back here: a token present means the submission speaks for that
+    thing and its silence is an answer; a token absent means this caller never
+    had an opinion, and whatever is stored stands.
+
+    Tokens are whatever the reading handler finds useful -- ``config.html``'s
+    settings form names the checkboxes it renders, its confirmation form names
+    the one policy it owns.
+    """
+    return frozenset(str(form.get(SPEAKS_FOR_FIELD) or "").split())
 
 
 def request_media_type(request: Request) -> str:
