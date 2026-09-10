@@ -28,6 +28,14 @@ from workstation_agent.config.schema import NetworkMcpConfig
 from workstation_agent.network_mcp.server import NetworkMCPServer
 from workstation_agent.network_mcp.tools import served_tool_names
 
+# This file stands up a real uvicorn server on pytest's main-thread loop and
+# stops it again, so it is both a possible source and a possible victim of
+# sse_starlette's process-global shutdown latch. Which tests that latch actually
+# breaks is decided by collection order and by scheduling luck, so the file opts
+# in rather than waiting to be reordered into failing. See the fixture's
+# docstring in tests/integration/conftest.py.
+pytestmark = pytest.mark.usefixtures("sse_shutdown_latch_cleared")
+
 # The mcp SDK builds its streamable-HTTP client on httpx2 and takes an
 # httpx2.AsyncClient; fall back to httpx where an older resolution pins that
 # instead. Typed as Any because which one is present is a runtime fact.

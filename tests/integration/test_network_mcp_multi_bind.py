@@ -27,6 +27,14 @@ from workstation_agent.config.schema import NetworkMcpConfig
 from workstation_agent.network_mcp import certs
 from workstation_agent.network_mcp.server import NetworkMCPServer
 
+# This file stands up a real uvicorn server on pytest's main-thread loop and
+# stops it again, so it is both a possible source and a possible victim of
+# sse_starlette's process-global shutdown latch. Which tests that latch actually
+# breaks is decided by collection order and by scheduling luck, so the file opts
+# in rather than waiting to be reordered into failing. See the fixture's
+# docstring in tests/integration/conftest.py.
+pytestmark = pytest.mark.usefixtures("sse_shutdown_latch_cleared")
+
 #: Addresses this machine can actually bind, out of the ones worth trying. A
 #: box without IPv6, or one where 127.0.0.2 is not routed to loopback, must skip
 #: rather than fail: the property under test is about several addresses, not

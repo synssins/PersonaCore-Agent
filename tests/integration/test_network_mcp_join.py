@@ -42,6 +42,13 @@ from workstation_agent.network_mcp.credentials import ensure_token
 from workstation_agent.network_mcp.hardening import ENROL_SUCCESS_STATUS
 from workstation_agent.network_mcp.server import NetworkMCPServer
 
+# Every test here stands up a real uvicorn server on pytest's main-thread loop
+# and stops it again, which makes each one both a possible source and a possible
+# victim of sse_starlette's process-global shutdown latch. Three of the failures
+# that opted this file in were exactly that. See the fixture's docstring in
+# tests/integration/conftest.py.
+pytestmark = pytest.mark.usefixtures("sse_shutdown_latch_cleared")
+
 CODE = "PAIR-4417"
 MINTED = "core-issued-" + "c" * 40
 MCP_HEADERS = {
