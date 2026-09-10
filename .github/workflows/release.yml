@@ -65,8 +65,146 @@ jobs:
           & "$inno\iscc.exe" /? | Select-String "^Inno Setup" | Select-Object -First 1
 
       - name: Run pytest (informational; does not gate publish)
+        id: pytest
         continue-on-error: true
-        run: pytest -q
+        shell: pwsh
+        run: |
+          # Non-gating by design (continue-on-error above): a red suite must
+          # never block a release. But it must not be silent either - this
+          # step makes a bad run loud in three places: a ::error:: workflow
+          # annotation, the job summary, and (thread via step outputs) the
+          # published release notes. -rfE does not change what runs; it only
+          # asks pytest to also print an explicit "FAILED <nodeid>" /
+          # "ERROR <nodeid>" line per failure/error so we have something
+          # machine-parseable.
+          #
+          # There are three distinct outcomes, not one boolean:
+          #   ok       - pytest exited 0. All collected tests passed.
+          #   reported - pytest exited non-zero and told us why (a "N failed"
+          #              and/or "N error" count in its own summary line).
+          #              Failures and errors are different problems (a test
+          #              that failed vs. a test that couldn't even be
+          #              collected) and are reported separately.
+          #   unknown  - pytest exited non-zero but printed nothing this
+          #              parser recognizes as a summary (crash, INTERNALERROR,
+          #              killed process, a collection step that behaves
+          #              differently run to run, etc.). This is the important
+          #              one: it means the suite did not finish, so we must
+          #              NOT guess a count and must say exactly that.
+          $ErrorActionPreference = 'Continue'
+          $PSNativeCommandUseErrorActionPreference = $false
+
+          & pytest -q -rfE | Tee-Object -Variable pytestLines
+          $exitCode = $LASTEXITCODE
+
+          $lastLine = ($pytestLines | Where-Object { $_.Trim() -ne '' } | Select-Object -Last 1)
+
+          $hasFailed = $false
+          $hasError = $false
+          $failedCount = 0
+          $errorCount = 0
+          if ($lastLine -and ($lastLine -match '(\d+)\s+failed')) {
+            $hasFailed = $true
+            $failedCount = [int]$Matches[1]
+          }
+          if ($lastLine -and ($lastLine -match '(\d+)\s+errors?\b')) {
+            $hasError = $true
+            $errorCount = [int]$Matches[1]
+          }
+
+          function Get-NodeIds {
+            param([string]$Prefix, [string[]]$Lines)
+            $ids = @()
+            $pattern = '^{0}\s+(.+)$' -f $Prefix
+            foreach ($line in $Lines) {
+              if ($line -match $pattern) {
+                $rest = $Matches[1]
+                $sepIdx = $rest.IndexOf(' - ')
+                if ($sepIdx -ge 0) { $nodeId = $rest.Substring(0, $sepIdx) } else { $nodeId = $rest }
+                $ids += $nodeId.Trim()
+              }
+            }
+            return $ids
+          }
+          $failedTests = Get-NodeIds -Prefix 'FAILED' -Lines $pytestLines
+          $erroredTests = Get-NodeIds -Prefix 'ERROR' -Lines $pytestLines
+
+          if ($exitCode -eq 0) {
+            $status = 'ok'
+          } elseif ($hasFailed -or $hasError) {
+            $status = 'reported'
+          } else {
+            $status = 'unknown'
+          }
+
+          "status=$status" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "exit_code=$exitCode" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "failed_count=$failedCount" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "error_count=$errorCount" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          $delim1 = "EOF_$([guid]::NewGuid().ToString('N'))"
+          "failed_tests<<$delim1" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          ($failedTests -join "`n") | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          $delim1 | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          $delim2 = "EOF_$([guid]::NewGuid().ToString('N'))"
+          "errored_tests<<$delim2" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          ($erroredTests -join "`n") | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          $delim2 | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+          if ($status -ne 'ok') {
+            $maxList = 25
+
+            if ($status -eq 'unknown') {
+              $headline = "pytest exited with code $exitCode and produced no recognized pass/fail summary. The test suite did not complete, so its result is unknown - this is not the same as a passing suite."
+            } else {
+              $bits = @()
+              if ($hasFailed) { $bits += "$failedCount test$(if ($failedCount -ne 1) {'s'}) failed" }
+              if ($hasError) { $bits += "$errorCount test$(if ($errorCount -ne 1) {'s'}) could not be collected (error)" }
+              $headline = "pytest reported: " + ($bits -join '; ') + "."
+            }
+
+            # 1. Loud in the run summary: a red workflow annotation.
+            Write-Host "::error::$headline The build is published anyway (this step is informational / continue-on-error)."
+
+            # 2. Loud in the job summary: what happened, and - when known -
+            #    the failing/errored node ids, capped so it stays skimmable.
+            $summary = New-Object System.Collections.Generic.List[string]
+            if ($status -eq 'unknown') {
+              $summary.Add("## :warning: pytest: suite did not complete")
+            } else {
+              $summary.Add("## :x: pytest: suite did not pass cleanly")
+            }
+            $summary.Add("")
+            $summary.Add($headline)
+            if ($status -eq 'reported') {
+              $summary.Add("")
+              $summary.Add("This is informational and does not block the release.")
+              if ($hasFailed) {
+                $summary.Add("")
+                $summary.Add("**Failed:**")
+                $shown = $failedTests | Select-Object -First $maxList
+                foreach ($t in $shown) {
+                  $safe = $t -replace '`', "'"
+                  $summary.Add("- ``$safe``")
+                }
+                if ($failedTests.Count -gt $maxList) {
+                  $summary.Add("- ...and $($failedTests.Count - $maxList) more")
+                }
+              }
+              if ($hasError) {
+                $summary.Add("")
+                $summary.Add("**Errored (could not be collected):**")
+                $shown = $erroredTests | Select-Object -First $maxList
+                foreach ($t in $shown) {
+                  $safe = $t -replace '`', "'"
+                  $summary.Add("- ``$safe``")
+                }
+                if ($erroredTests.Count -gt $maxList) {
+                  $summary.Add("- ...and $($erroredTests.Count - $maxList) more")
+                }
+              }
+            }
+            ($summary -join "`n") | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          }
 
       - name: Boot check (gates publish)
         run: python scripts/boot_check.py --fake-backends
@@ -152,6 +290,25 @@ jobs:
           $title = "PersonaCore-Agent $tag"
           $isPrerelease = $tag -match "-(alpha|beta|rc|dev)"
           $notesLines = @()
+          $suiteStatus = "${{ steps.pytest.outputs.status }}"
+          if ($suiteStatus -ne "ok") {
+            $runUrl = "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            if ($suiteStatus -eq "unknown") {
+              $exitCode = "${{ steps.pytest.outputs.exit_code }}"
+              $warningLine = "> **The test suite did not complete on this build (pytest exited with code $exitCode and produced no summary) - the result is unknown, but the build was published anyway.** See the [workflow run]($runUrl) for the raw log."
+            } else {
+              $failedCount = [int]"${{ steps.pytest.outputs.failed_count }}"
+              $errorCount = [int]"${{ steps.pytest.outputs.error_count }}"
+              $bits = @()
+              if ($failedCount -gt 0) { $bits += "$failedCount test$(if ($failedCount -ne 1) {'s'}) failed" }
+              if ($errorCount -gt 0) { $bits += "$errorCount test$(if ($errorCount -ne 1) {'s'}) could not be collected" }
+              $summaryBits = $bits -join ", "
+              $warningLine = "> **Test suite did not pass cleanly on this build: $summaryBits, but the build was published anyway.** See the [workflow run]($runUrl) for which tests failed."
+            }
+            $notesLines += "> [!WARNING]"
+            $notesLines += $warningLine
+            $notesLines += ""
+          }
           $notesLines += "Automated release for $tag."
           $notesLines += ""
           $notesLines += "Install: download PersonaCore-Agent-Setup-$v.exe below and run it. Per-user by default; pass /ALLUSERS on the command line for machine-wide install."
