@@ -154,6 +154,7 @@ def make_client(
     network_mcp: Any = ...,
     network_mcp_factory: Any = ...,
     on_network_mcp_change: Any = ...,
+    update_poller: Any = ...,
     *,
     return_ctx: Literal[False] = ...,
 ) -> TestClient: ...
@@ -169,6 +170,7 @@ def make_client(
     network_mcp: Any = ...,
     network_mcp_factory: Any = ...,
     on_network_mcp_change: Any = ...,
+    update_poller: Any = ...,
     *,
     return_ctx: Literal[True],
 ) -> tuple[TestClient, BackendContext]: ...
@@ -183,6 +185,7 @@ def make_client(  # noqa: PLR0913, PLR0917 -- one param per injected BackendCont
     network_mcp: Any = None,
     network_mcp_factory: Any = None,
     on_network_mcp_change: Any = None,
+    update_poller: Any = None,
     *,
     return_ctx: bool = False,
 ) -> TestClient | tuple[TestClient, BackendContext]:
@@ -206,6 +209,7 @@ def make_client(  # noqa: PLR0913, PLR0917 -- one param per injected BackendCont
         network_mcp=network_mcp,
         network_mcp_factory=network_mcp_factory,
         on_network_mcp_change=on_network_mcp_change,
+        update_poller=update_poller,
     )
     app = create_app(ctx)
     # Wrap with loopback spoof so the middleware passes in tests

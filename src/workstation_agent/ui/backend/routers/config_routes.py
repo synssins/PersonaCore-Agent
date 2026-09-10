@@ -25,6 +25,7 @@ from workstation_agent.ui.backend.form_guard import (
     not_a_form_body,
     speaks_for,
 )
+from workstation_agent.updater_client.channels import CHANNELS, normalise_channel
 
 if TYPE_CHECKING:
     from starlette.datastructures import FormData
@@ -84,6 +85,7 @@ def _settings_page(
             "warnings": warnings or {},
             "saved": saved,
             "confirmation_tools": _confirmation_tool_names(cfg),
+            "channels": CHANNELS,
             "policy_errors": {},
             "policy_saved": False,
         },
@@ -360,6 +362,17 @@ async def config_post(  # noqa: PLR0913, PLR0917
         wyoming_port, llm_timeout_seconds, wake_threshold,
         session_mode, session_sticky_seconds,
     )
+    # The channel used to be a free-text box, so "stabel" saved happily and the
+    # update check then had a channel no release could ever match. The form is a
+    # three-value select now, and this is the half of that which a select cannot
+    # enforce: a body that names a fourth value is refused rather than written.
+    #
+    # Only what this caller actually *sent* is validated. A partial submission
+    # that never mentions the channel keeps whatever is stored -- including a
+    # legacy value this build does not recognise, which is the About page's
+    # problem to report, not a reason to refuse an unrelated save.
+    if "update_channel" in form and normalise_channel(update_channel) is None:
+        errors["update_channel"] = f"Channel must be one of {', '.join(CHANNELS)}"
     if errors:
         return _settings_page(request, cfg, errors=errors)
 
@@ -477,6 +490,7 @@ def _policy_page(
             "warnings": {},
             "saved": False,
             "confirmation_tools": _confirmation_tool_names(cfg),
+            "channels": CHANNELS,
             "policy_errors": policy_errors,
             "policy_saved": policy_saved,
         },

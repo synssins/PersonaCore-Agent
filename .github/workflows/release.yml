@@ -206,6 +206,22 @@ jobs:
             ($summary -join "`n") | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
           }
 
+      - name: Stamp the build with its own version
+        shell: pwsh
+        run: |
+          # Without this the shipped Agent reports the checkout's placeholder
+          # (0.1.0.dev0) as its version -- on the About page, and to the update
+          # check, which then has nothing true to compare a release against.
+          # The tag is the only place the real version exists, so it is written
+          # in here. Deliberately after pytest (so the suite runs against the
+          # checked-in value) and before the PyInstaller build (which bundles
+          # this source).
+          $v = "${{ steps.ver.outputs.version }}"
+          $init = "src/workstation_agent/__init__.py"
+          $stamped = (Get-Content $init -Raw) -replace '__version__ = "[^"]*"', "__version__ = `"$v`""
+          Set-Content -Path $init -Value $stamped -Encoding utf8 -NoNewline
+          Select-String -Path $init -Pattern '__version__'
+
       - name: Boot check (gates publish)
         run: python scripts/boot_check.py --fake-backends
 
@@ -227,9 +243,20 @@ jobs:
           $updSha   = (Get-FileHash -Algorithm SHA256 $updaterExe).Hash.ToLower()
           $agentSize = (Get-Item $agentZip).Length
           $updSize   = (Get-Item $updaterExe).Length
+          # The channel this build belongs to, from the tag suffix -- the same
+          # signal $isPrerelease uses further down, so the manifest and the
+          # release can no longer contradict each other. This used to be the
+          # literal "stable" on every build, including the alphas: the manifest
+          # claimed stable, the release said prerelease, and the "stable" feed
+          # the client polled was empty. Mirrored by
+          # src/workstation_agent/updater_client/channels.py; change both.
+          $channel = "stable"
+          if     ($v -match "-(alpha|dev)") { $channel = "dev" }
+          elseif ($v -match "-(beta|rc)")   { $channel = "beta" }
+          Write-Host "manifest channel=$channel for version $v"
           $manifest = @{
             version              = $v
-            channel              = "stable"
+            channel              = $channel
             released_at          = (Get-Date -AsUTC).ToString("o")
             mandatory            = $false
             notes_url            = "https://github.com/${{ github.repository }}/releases/tag/v$v"
@@ -288,6 +315,9 @@ jobs:
           $v = "${{ steps.ver.outputs.version }}"
           $tag = "v$v"
           $title = "PersonaCore-Agent $tag"
+          # Kept identical to the manifest's $channel test above and to
+          # channels._TAG_SUFFIX_RE on the client: a build published as a
+          # prerelease must not be one the manifest calls stable.
           $isPrerelease = $tag -match "-(alpha|beta|rc|dev)"
           $notesLines = @()
           $suiteStatus = "${{ steps.pytest.outputs.status }}"

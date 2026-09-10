@@ -96,8 +96,19 @@
       <input type="checkbox" name="update_enabled" value="true" {% if cfg and cfg.update.enabled %}checked{% endif %}>
     </label>
     <label>Channel:
-      <input type="text" name="update_channel" value="{{ cfg.update.channel if cfg else 'stable' }}">
+      {# A select, not a free-text box: a typo here used to be saved happily and
+         then no release could ever match it. The channel's real home, next to
+         the version it is choosing between, is the About page. #}
+      <select name="update_channel">
+        {% set current_channel = cfg.update.channel if cfg else 'stable' %}
+        {% for name in channels %}
+          <option value="{{ name }}" {% if name == current_channel %}selected{% endif %}>{{ name }}</option>
+        {% endfor %}
+      </select>
+      {% if errors.update_channel is defined %}<span class="error">{{ errors.update_channel }}</span>{% endif %}
     </label>
+    <p>Choosing a channel, and seeing what the last check made of it, is on the
+      <a href="/about">About page</a>.</p>
   </fieldset>
 
   <button type="submit">Save</button>

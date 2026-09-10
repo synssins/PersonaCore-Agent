@@ -73,7 +73,22 @@ _HTTP_OK = 200
 
 
 def _pkg_version() -> str:
-    """Return the installed package version, falling back to a sentinel."""
+    """Return the version this build actually is.
+
+    ``workstation_agent.__version__`` first, because that is the string the
+    release workflow stamps with the git tag (``0.1.0-alpha.18``) and so the
+    one directly comparable with the version in a release manifest. It is also
+    the only one a PyInstaller-frozen Agent reliably has: ``importlib.metadata``
+    needs dist-info, which the frozen build may not carry.
+
+    Distribution metadata is the fallback, and it is PEP 440-normalised
+    (``0.1.0a18``) rather than the tag spelling --
+    :func:`workstation_agent.updater_client.channels.version_key` understands
+    both, so a comparison still works either way.
+    """
+    from workstation_agent import __version__
+    if __version__:
+        return __version__
     try:
         from importlib.metadata import version as _v
         return _v("workstation-agent")
@@ -852,7 +867,7 @@ class Application:
         from workstation_agent.security.first_party_pubkey import FIRST_PARTY_PUBKEY
         from workstation_agent.updater_client.poller import UpdatePoller
 
-        async def _on_update(manifest: Any, _raw: bytes, _sig: bytes) -> None:
+        async def _on_update(manifest: Any, raw: bytes, sig: bytes) -> None:
             log.info("update-available: version=%s", manifest.version)
             toast = self._subs.toast
             if toast is not None:
@@ -880,21 +895,55 @@ class Application:
 
                 asyncio.create_task(_announce(), name="update-voice-announce")  # noqa: RUF006
 
+            # Notify, do not install -- unless the owner has explicitly asked
+            # for the other behaviour. An agent that upgraded itself in the
+            # middle of a diagnosis would hide the defect being diagnosed, so
+            # `auto_install` is off by default and the ordinary path is the
+            # Install button on the About page, which stages these same bytes.
+            if not getattr(getattr(self._subs.config, "update", None), "auto_install", False):
+                return
+            from workstation_agent.updater_client.handoff import (
+                spawn_updater,
+                stage_pending,
+            )
+
+            try:
+                stage_pending(manifest, manifest_bytes=raw, signature_bytes=sig)
+                pid = spawn_updater()
+            except Exception:
+                log.exception("auto-install: handing off to the updater failed")
+            else:
+                log.info("auto-install: updater spawned pid=%s for %s", pid, manifest.version)
+
         if self._fake:
             self._subs.started["update_poller"] = Health(ok=True, detail="skipped (fake)")
             return
 
         poller = UpdatePoller(
             github_repo=cfg.update.github_repo,
-            current_version="0.1.0",
+            # The version this build actually is, not a literal. The comparison
+            # against a release is only meaningful if this side is true, and
+            # `update.channel` is only meaningful if it reaches the poller --
+            # it never used to, so every check ran on the built-in default.
+            current_version=_pkg_version(),
             pubkey=FIRST_PARTY_PUBKEY,
             http=self._subs.http_client,
             on_update_available=_on_update,
             poll_interval_seconds=cfg.update.poll_interval_hours * 3600.0,
+            channel=cfg.update.channel,
         )
+        # `update.enabled` used to be a setting that did nothing: the scheduled
+        # loop started regardless of it. It is honoured here -- but the poller
+        # is still handed to the UI, so "Check for updates now" remains a thing
+        # the owner can do on demand without turning scheduled checks back on.
+        self._subs.update_poller = poller
+        if not cfg.update.enabled:
+            self._subs.started["update_poller"] = Health(
+                ok=True, detail="scheduled checks disabled (update.enabled=false)",
+            )
+            return
         try:
             poller.start()
-            self._subs.update_poller = poller
             self._subs.started["update_poller"] = Health(ok=True, detail="started")
         except Exception as exc:
             log.warning("UpdatePoller failed: %s", exc)

@@ -613,20 +613,27 @@ async def test_fetch_downloads_and_parses(
     m_bytes = canonical_json(_make_manifest_dict())
     sig = SigningKey.generate().sign(m_bytes).signature  # unrelated key OK here
     del pub, sig  # not used in fetch itself
-    # GitHub-like release payload: /repos/OWNER/REPO/releases/latest
-    httpserver.expect_request("/repos/o/r/releases/latest").respond_with_json(
-        {
-            "assets": [
-                {
-                    "name": "manifest.json",
-                    "browser_download_url": httpserver.url_for("/manifest.json"),
-                },
-                {
-                    "name": "manifest.json.sig",
-                    "browser_download_url": httpserver.url_for("/manifest.json.sig"),
-                },
-            ],
-        },
+    # GitHub-like release *list*: /repos/OWNER/REPO/releases. Not
+    # /releases/latest -- that endpoint excludes prereleases, which is every
+    # release this project publishes, so it answered 404 forever.
+    httpserver.expect_request("/repos/o/r/releases").respond_with_json(
+        [
+            {
+                "tag_name": "v1.2.3",
+                "prerelease": False,
+                "draft": False,
+                "assets": [
+                    {
+                        "name": "manifest.json",
+                        "browser_download_url": httpserver.url_for("/manifest.json"),
+                    },
+                    {
+                        "name": "manifest.json.sig",
+                        "browser_download_url": httpserver.url_for("/manifest.json.sig"),
+                    },
+                ],
+            },
+        ],
     )
     httpserver.expect_request("/manifest.json").respond_with_data(m_bytes)
     httpserver.expect_request("/manifest.json.sig").respond_with_data(b"stub-sig")
@@ -650,8 +657,15 @@ async def test_fetch_downloads_and_parses(
 
 
 async def test_fetch_missing_assets(httpserver) -> None:
-    httpserver.expect_request("/repos/o/r/releases/latest").respond_with_json(
-        {"assets": [{"name": "something-else", "browser_download_url": "https://x"}]},
+    httpserver.expect_request("/repos/o/r/releases").respond_with_json(
+        [
+            {
+                "tag_name": "v1.2.3",
+                "prerelease": False,
+                "draft": False,
+                "assets": [{"name": "something-else", "browser_download_url": "https://x"}],
+            },
+        ],
     )
     async with httpx.AsyncClient() as client:
         async def rewrite_get(url, **kw):  # type: ignore[no-untyped-def]
@@ -660,7 +674,7 @@ async def test_fetch_missing_assets(httpserver) -> None:
             return await httpx.AsyncClient.get(client, url, **kw)
 
         client.get = rewrite_get  # type: ignore[method-assign]
-        with pytest.raises(ValueError, match="missing manifest"):
+        with pytest.raises(ValueError, match=r"no manifest\.json"):
             await fetch("o/r", client)
 
 
@@ -670,9 +684,13 @@ class _StubPollerFetch:
     def __init__(self, results: list[Any]) -> None:
         self.results = results
         self.calls: list[str] = []
+        self.channels: list[str] = []
 
-    async def __call__(self, repo: str, http: httpx.AsyncClient):  # noqa: ARG002
+    async def __call__(
+        self, repo: str, http: httpx.AsyncClient, *, channel: str = "stable",  # noqa: ARG002
+    ):
         self.calls.append(repo)
+        self.channels.append(channel)
         item = self.results.pop(0)
         if isinstance(item, Exception):
             raise item
