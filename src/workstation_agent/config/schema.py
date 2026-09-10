@@ -104,12 +104,28 @@ class SessionConfig(BaseModel):
 
 
 class UpdateConfig(BaseModel):
-    """Auto-update configuration."""
+    """Update-check configuration.
+
+    ``channel`` stays a plain ``str`` rather than a ``Literal``: this file is
+    read at startup, and a config carrying a channel this build does not know
+    must not stop the Agent from booting. It is validated where it is *used*
+    instead — the About page only offers the three valid values, ``POST
+    /config`` refuses anything else, and a value that somehow got in by hand
+    is reported to the owner as a failed check rather than silently treated as
+    ``stable``. See :mod:`workstation_agent.updater_client.channels`.
+    """
 
     enabled: bool = True
     poll_interval_hours: int = Field(default=24, gt=0)
     channel: str = "stable"
     github_repo: str = "synssins/PersonaCore-Agent"
+
+    #: Install a found update without asking. Off, and off is the design:
+    #: the updater's job is to say a build exists. An agent that moved itself
+    #: from alpha.14 to alpha.17 in the middle of a diagnosis would make the
+    #: defect being diagnosed much harder to pin down, which is exactly how
+    #: several of this project's real defects were found. The owner opts in.
+    auto_install: bool = False
 
 
 class NotificationsConfig(BaseModel):

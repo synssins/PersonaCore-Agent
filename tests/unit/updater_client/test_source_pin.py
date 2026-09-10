@@ -125,6 +125,20 @@ def test_api_url_is_pinned() -> None:
         f"https://api.github.com/repos/{REPO}/releases/latest"
     )
     assert pin.check_api_url(pin.api_latest_release_url)
+    # The feed fetch() actually reads is the release *list*, and it is pinned
+    # by the same check -- the query string does not weaken it, because
+    # check_api_url reads the path.
+    assert pin.api_releases_url == (
+        f"https://api.github.com/repos/{REPO}/releases?per_page=100"
+    )
+    assert pin.check_api_url(pin.api_releases_url)
+    for bad_list in [
+        f"http://api.github.com/repos/{REPO}/releases?per_page=100",
+        f"https://api.evil.example/repos/{REPO}/releases?per_page=100",
+        "https://api.github.com/repos/attacker/evil/releases?per_page=100",
+    ]:
+        with pytest.raises(SourcePinError):
+            pin.check_api_url(bad_list)
     for bad in [
         f"http://api.github.com/repos/{REPO}/releases/latest",
         f"https://api.evil.example/repos/{REPO}/releases/latest",
@@ -277,17 +291,27 @@ class _Client:
         return self.routes[url]
 
 
-def _release_payload(manifest_url: str, sig_url: str) -> dict[str, Any]:
-    return {
-        "assets": [
-            {"name": "manifest.json", "browser_download_url": manifest_url},
-            {"name": "manifest.json.sig", "browser_download_url": sig_url},
-        ],
-    }
+#: The feed URL fetch() reads. Not /releases/latest: that endpoint excludes
+#: prereleases, which is why the updater saw a 404 for its whole life.
+API_LIST = f"https://api.github.com/repos/{REPO}/releases?per_page=100"
+
+
+def _release_payload(manifest_url: str, sig_url: str) -> list[dict[str, Any]]:
+    return [
+        {
+            "tag_name": "v0.2.0",
+            "prerelease": False,
+            "draft": False,
+            "assets": [
+                {"name": "manifest.json", "browser_download_url": manifest_url},
+                {"name": "manifest.json.sig", "browser_download_url": sig_url},
+            ],
+        },
+    ]
 
 
 def _fetch_routes(*, manifest_bytes: bytes, sig_redirect_to: str) -> dict[str, _Resp]:
-    api = f"https://api.github.com/repos/{REPO}/releases/latest"
+    api = API_LIST
     m_url = f"{RELEASE}/manifest.json"
     s_url = f"{RELEASE}/manifest.json.sig"
     return {
@@ -328,7 +352,7 @@ async def test_fetch_refuses_redirect_to_hostile_host() -> None:
 
 async def test_fetch_refuses_off_origin_asset_url_from_the_api() -> None:
     """The API response is payload too — its download URLs get gated."""
-    api = f"https://api.github.com/repos/{REPO}/releases/latest"
+    api = API_LIST
     hostile = "https://evil.example/manifest.json"
     client = _Client({
         api: _Resp(200, payload=_release_payload(hostile, f"{RELEASE}/manifest.json.sig")),
@@ -352,7 +376,7 @@ async def test_fetch_refuses_a_manifest_naming_another_repo() -> None:
 
 
 async def test_fetch_caps_the_redirect_chain() -> None:
-    api = f"https://api.github.com/repos/{REPO}/releases/latest"
+    api = API_LIST
     loop = "https://objects.githubusercontent.com/loop"
     client = _Client({api: _Resp(302, location=loop), loop: _Resp(302, location=loop)})
     with pytest.raises(SourcePinError, match="redirects"):

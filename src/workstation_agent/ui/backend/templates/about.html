@@ -10,9 +10,92 @@
 
 <section>
   <h2>Update</h2>
+
+  {# The outcome of the LAST check, not a description of the settings. A failed
+     check and "nothing newer" are different things and are never rendered the
+     same way here: every failure states that nothing was compared. #}
+  <h3>Last check</h3>
+  {% if last_check %}
+    <p class="{{ 'error' if last_check.failed else 'success' }}">
+      <strong>{{ last_check.headline }}</strong>
+    </p>
+    <p>{{ last_check.message }}</p>
+    <p>
+      Checked {{ last_check.checked_at_text }},
+      channel <strong>{{ last_check.channel }}</strong>,
+      running <strong>{{ last_check.current_version }}</strong>.
+    </p>
+    {% if last_check.notes_url %}
+      <p><a href="{{ last_check.notes_url }}" rel="noreferrer">Release notes for {{ last_check.available_version }}</a></p>
+    {% endif %}
+  {% elif checks_run_here %}
+    <p>No update check has run yet in this session. Press the button below to run one now.</p>
+  {% else %}
+    <p class="error">
+      <strong>No update checker is running</strong>
+    </p>
+    <p>
+      This Agent has no update poller wired up, so no check has been made and none
+      will be until it restarts. Nothing here reflects the state of GitHub.
+    </p>
+  {% endif %}
+
+  {% if not updates_enabled %}
+    <p class="error">
+      Update checks are switched off in your configuration, so nothing is checked
+      on a schedule. The button below still runs one check when you press it.
+    </p>
+  {% endif %}
+
   <form method="post" action="/about/check-updates">
     <button type="submit">Check for Updates Now</button>
   </form>
+
+  {% if pending_version %}
+    <h3>Ready to install</h3>
+    <p>
+      {{ pending_version }} has been fetched and its signature verified.
+      Nothing has been installed — the Agent does not update itself unless you ask it to.
+    </p>
+    <form method="post" action="/about/install">
+      <button type="submit">Install {{ pending_version }}</button>
+    </form>
+  {% endif %}
+
+  <h3>Update channel</h3>
+  {% if not channel_known %}
+    <p class="error">
+      Your configuration has <code>{{ channel }}</code> as the update channel,
+      which is not one this Agent knows. No release can match it. Choose one
+      below.
+    </p>
+  {% endif %}
+  <form method="post" action="/about/channel">
+    {# Names what this submission speaks for, so an unticked auto-install box is
+       distinguishable from a body that never mentioned it. See form_guard.py. #}
+    <input type="hidden" name="speaks_for" value="{{ speaks_for_scope }}">
+    <label>Channel:
+      <select name="update_channel">
+        {% for name, description in channels %}
+          <option value="{{ name }}" {% if name == channel %}selected{% endif %}>{{ name }} — {{ description }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>
+      <input type="checkbox" name="auto_install" value="true" {% if auto_install %}checked{% endif %}>
+      Install updates automatically instead of offering them here
+    </label>
+    <button type="submit">Save update settings</button>
+  </form>
+  {% if checks_run_here %}
+    <p>Changing the channel takes effect immediately — no restart needed.</p>
+  {% else %}
+    <p>
+      No update checker is running in this Agent, so a change saved here
+      will not take effect until the Agent restarts.
+    </p>
+  {% endif %}
+  {% if repo %}<p>Updates come only from <code>{{ repo }}</code> on GitHub.</p>{% endif %}
 </section>
 
 <section>

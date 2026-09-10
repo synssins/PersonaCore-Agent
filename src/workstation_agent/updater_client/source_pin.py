@@ -255,8 +255,31 @@ class SourcePin:
 
     @property
     def api_latest_release_url(self) -> str:
-        """The one manifest feed this pin will fetch."""
+        """This repo's ``/releases/latest`` endpoint.
+
+        **Not what the poller reads**, and it never should have been.
+        ``/releases/latest`` excludes prereleases by definition, and every
+        release this project has published is one, so the endpoint answers
+        ``404`` — see :attr:`api_releases_url`. Kept because it is a correct
+        URL for the pin to *describe* (and the Go side mirrors it), so that a
+        caller who genuinely wants the newest non-prerelease still gets a
+        pinned URL rather than building one by hand.
+        """
         return f"https://{GITHUB_API_HOST}/repos/{self.repo}/releases/latest"
+
+    @property
+    def api_releases_url(self) -> str:
+        """The manifest feed the poller reads: this repo's release *list*.
+
+        Listing is what lets the channel mean anything — the client picks the
+        newest release matching the owner's channel (see
+        :mod:`workstation_agent.updater_client.channels`) instead of asking
+        GitHub for the one release type this project does not publish.
+
+        ``per_page`` bounds the response; the pin is unaffected by it, since
+        :meth:`check_api_url` reads the path and ignores the query.
+        """
+        return f"https://{GITHUB_API_HOST}/repos/{self.repo}/releases?per_page=100"
 
     def _repo_matches(self, owner: str, name: str) -> bool:
         # GitHub treats owner/repo case-insensitively; do not fail an update
