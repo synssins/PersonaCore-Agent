@@ -210,7 +210,11 @@ class SystemTray:
         log.debug("Tray: Reload plugins clicked")
         try:
             base = self._url_provider()
-            httpx.post(f"{base}/plugins/reload", timeout=5)
+            httpx.post(
+                f"{base}/plugins/reload",
+                timeout=5,
+                headers=self._same_origin_headers(base),
+            )
         except Exception:
             log.exception("Tray: reload plugins request failed")
 
@@ -218,7 +222,11 @@ class SystemTray:
         log.debug("Tray: Check for updates now clicked")
         try:
             base = self._url_provider()
-            httpx.post(f"{base}/about/check-updates", timeout=10)
+            httpx.post(
+                f"{base}/about/check-updates",
+                timeout=10,
+                headers=self._same_origin_headers(base),
+            )
         except Exception:
             log.exception("Tray: check-updates request failed")
 
@@ -250,10 +258,28 @@ class SystemTray:
     # Helpers
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _same_origin_headers(base: str) -> dict[str, str]:
+        """Headers that name *base* as where this request came from.
+
+        The settings UI refuses any state-changing request that cannot show it
+        came from the UI's own origin (``ui/backend/csrf.py``). The tray is not
+        a browser, so nothing sets ``Origin`` for it; it says so itself. *base*
+        is the address the tray is already about to call -- read from the
+        ``ui-port`` file at call time -- so this follows the Agent onto its new
+        ephemeral port at every restart and there is nothing to configure.
+        """
+        return {"Origin": base.rstrip("/")}
+
     def _post_config(self, payload: dict[str, Any]) -> None:
         try:
             base = self._url_provider()
-            httpx.post(f"{base}/config", json=payload, timeout=5)
+            httpx.post(
+                f"{base}/config",
+                json=payload,
+                timeout=5,
+                headers=self._same_origin_headers(base),
+            )
         except Exception:
             log.exception("Tray: config POST failed")
 

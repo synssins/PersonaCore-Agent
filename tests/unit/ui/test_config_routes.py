@@ -130,14 +130,12 @@ def test_config_post_invalid_session_mode(tmp_path):
 
 def test_config_get_no_store_returns_200(tmp_path):
     """GET /config with no config store still renders (graceful)."""
-    from starlette.testclient import TestClient
-
-    from tests.unit.ui.conftest import _LoopbackASGI
+    from tests.unit.ui.conftest import _LoopbackASGI, ui_test_client
     from workstation_agent.ui.backend.app import BackendContext, create_app
     ctx = BackendContext(config_store=None, log_dir=tmp_path / "logs")
     app = create_app(ctx)
     wrapped = _LoopbackASGI(app)
-    c = TestClient(wrapped)
+    c = ui_test_client(wrapped)
     resp = c.get("/config")
     assert resp.status_code == 200
 
@@ -235,14 +233,12 @@ def test_confirmation_policy_post_pushes_to_running_host(tmp_path):
 
 def test_confirmation_policy_post_no_store_returns_200(tmp_path):
     """POST /config/confirmation with no config store still renders gracefully."""
-    from starlette.testclient import TestClient
-
-    from tests.unit.ui.conftest import _LoopbackASGI
+    from tests.unit.ui.conftest import _LoopbackASGI, ui_test_client
     from workstation_agent.ui.backend.app import BackendContext, create_app
 
     ctx = BackendContext(config_store=None, log_dir=tmp_path / "logs")
     app = create_app(ctx)
-    c = TestClient(_LoopbackASGI(app))
+    c = ui_test_client(_LoopbackASGI(app))
     resp = c.post("/config/confirmation", data={})
     assert resp.status_code == 200
     assert "Config store not available" in resp.text

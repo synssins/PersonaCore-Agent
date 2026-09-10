@@ -35,6 +35,35 @@ class _LoopbackASGI:
 
 
 # ---------------------------------------------------------------------------
+# Same-origin test client
+# ---------------------------------------------------------------------------
+
+#: The origin every UI test client speaks from. It has to be a loopback name --
+#: ``ui/backend/csrf.py`` refuses a state-changing request arriving under any
+#: other ``Host``, because for such a request there is no honest way to say what
+#: the app's own origin is.
+TEST_ORIGIN = "http://127.0.0.1:12345"
+
+
+def ui_test_client(app: ASGIApp, **kwargs: Any) -> TestClient:
+    """A :class:`TestClient` that looks like the Agent's own Settings window.
+
+    ``base_url`` fixes the ``Host``; the headers are the two a browser would
+    have set. They are sent on every request rather than injected into the ASGI
+    scope on purpose: the CSRF check stays in the path of all 170-odd existing
+    POST tests, so those tests keep proving that a legitimate same-origin POST
+    still reaches its route, instead of quietly bypassing the check they now
+    share the app with.
+    """
+    return TestClient(
+        app,
+        base_url=TEST_ORIGIN,
+        headers={"Origin": TEST_ORIGIN, "Sec-Fetch-Site": "same-origin"},
+        **kwargs,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Fake config store
 # ---------------------------------------------------------------------------
 
@@ -175,7 +204,7 @@ def make_client(  # noqa: PLR0913, PLR0917 -- one param per injected BackendCont
     app = create_app(ctx)
     # Wrap with loopback spoof so the middleware passes in tests
     wrapped = _LoopbackASGI(app)
-    client = TestClient(wrapped, raise_server_exceptions=True)
+    client = ui_test_client(wrapped, raise_server_exceptions=True)
     return (client, ctx) if return_ctx else client
 
 

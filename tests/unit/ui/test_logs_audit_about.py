@@ -10,13 +10,13 @@ import json
 from typing import TYPE_CHECKING
 
 import pytest
-from starlette.testclient import TestClient
 
 from tests.unit.ui.conftest import (
     FakeAuditReader,
     FakeConfigStore,
     _LoopbackASGI,
     make_client,
+    ui_test_client,
 )
 from workstation_agent.mcp_host.audit import AuditEvent
 from workstation_agent.ui.backend.app import BackendContext, create_app
@@ -275,7 +275,7 @@ def test_audit_page_no_reader(tmp_path):
     )
     app = create_app(ctx)
     wrapped = _LoopbackASGI(app)
-    client = TestClient(wrapped)
+    client = ui_test_client(wrapped)
     resp = client.get("/audit")
     assert resp.status_code == 200
 
@@ -302,7 +302,7 @@ def test_about_check_updates_no_poller(tmp_path):
     )
     app = create_app(ctx)
     wrapped = _LoopbackASGI(app)
-    client = TestClient(wrapped)
+    client = ui_test_client(wrapped)
     resp = client.post("/about/check-updates", follow_redirects=False)
     assert resp.status_code == 303
 
@@ -322,7 +322,7 @@ def test_about_check_updates_calls_poller(tmp_path):
     )
     app = create_app(ctx)
     wrapped = _LoopbackASGI(app)
-    client = TestClient(wrapped)
+    client = ui_test_client(wrapped)
     resp = client.post("/about/check-updates", follow_redirects=False)
     assert resp.status_code == 303
     assert called == [True]
@@ -361,7 +361,7 @@ def test_dashboard_shows_plugins(tmp_path):
     )
     app = create_app(ctx)
     wrapped = _LoopbackASGI(app)
-    client = TestClient(wrapped)
+    client = ui_test_client(wrapped)
     resp = client.get("/dashboard")
     assert resp.status_code == 200
     assert "myplugin" in resp.text or "My Plugin" in resp.text

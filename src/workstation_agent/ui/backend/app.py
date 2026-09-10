@@ -26,6 +26,8 @@ from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
+from workstation_agent.ui.backend.csrf import same_origin_guard
+
 log = logging.getLogger(__name__)
 
 _HERE = Path(__file__).parent
@@ -156,6 +158,22 @@ def create_app(ctx: BackendContext | None = None) -> FastAPI:
         set_context(ctx)
 
     app = FastAPI(title="PersonaCore-Agent UI", docs_url=None, redoc_url=None)
+
+    # ------------------------------------------------------------------
+    # Same-origin (CSRF) middleware
+    #
+    # Registered *before* the loopback guard on purpose. Starlette runs the
+    # most recently added middleware outermost, so this ordering leaves the
+    # loopback guard on the outside exactly where it already was: a request
+    # from off-machine still gets "Forbidden: loopback only" and never reaches
+    # this check.
+    #
+    # This is middleware and not a per-form token so that a route added later
+    # is covered without anyone having to remember it. See
+    # ``ui/backend/csrf.py`` for the mechanism and for the reasoning on
+    # requests that carry no ``Origin`` at all.
+    # ------------------------------------------------------------------
+    app.middleware("http")(same_origin_guard)
 
     # ------------------------------------------------------------------
     # Loopback-only middleware
