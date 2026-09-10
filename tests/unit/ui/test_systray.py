@@ -82,10 +82,16 @@ def test_mute_toggle_changes_state(tray, mock_httpx):  # noqa: ARG001
     assert tray._muted is False
 
 
-def test_mute_toggle_posts_config(tray, mock_httpx):
+def test_mute_toggle_makes_no_http_call(tray, mock_httpx):
+    """Mute is local speaker state, not a setting.
+
+    It used to POST ``{"muted": ...}`` at ``/config``, which parsed as an empty
+    form and reset every setting to its default (P23). There is no ``muted``
+    key in ``AgentConfig`` and no route that owns one, so the correct number of
+    requests for this click is zero.
+    """
     tray._on_mute_toggle(MagicMock(), MagicMock())
-    mock_httpx.assert_called_once()
-    assert "/config" in mock_httpx.call_args[0][0]
+    mock_httpx.assert_not_called()
 
 
 def test_session_mode_action_updates_state(tray, mock_httpx):  # noqa: ARG001
@@ -94,11 +100,13 @@ def test_session_mode_action_updates_state(tray, mock_httpx):  # noqa: ARG001
     assert tray._session_mode == "sticky"
 
 
-def test_session_mode_action_posts_config(tray, mock_httpx):
+def test_session_mode_action_posts_to_the_single_setting_route(tray, mock_httpx):
+    """Not ``/config`` -- that route replaces the whole configuration (P23)."""
     action = tray._make_session_mode_action("persistent")
     action(MagicMock(), MagicMock())
     mock_httpx.assert_called_once()
-    assert "/config" in mock_httpx.call_args[0][0]
+    assert mock_httpx.call_args[0][0].endswith("/config/session-mode")
+    assert mock_httpx.call_args.kwargs["json"] == {"mode": "persistent"}
 
 
 def test_reload_plugins_posts(tray, mock_httpx):
@@ -214,6 +222,6 @@ def test_update_plugin_badge_refreshes_menu(mock_webview):
         mock_icon.update_menu.assert_called_once()
 
 
-def test_post_config_tolerates_http_error(tray, mock_httpx):
+def test_post_json_tolerates_http_error(tray, mock_httpx):
     mock_httpx.side_effect = Exception("timeout")
-    tray._post_config({"key": "value"})  # must not raise
+    tray._post_json("/config/session-mode", {"mode": "sticky"})  # must not raise

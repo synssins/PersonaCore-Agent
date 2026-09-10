@@ -19,15 +19,39 @@ from workstation_agent.ui.backend.app import (
     mark_first_run_completed,
     templates,
 )
+from workstation_agent.ui.backend.form_guard import not_a_form_body
 
 log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/first-run", tags=["first-run"])
 
+_HTTP_UNSUPPORTED_MEDIA_TYPE = 415
 _WYOMING_PORT_MAX = 65535
 _HTTP_ERROR_STATUS_MIN = 400
 _HTTP_UNAUTHORIZED = 401
 _HTTP_FORBIDDEN = 403
+
+
+def _refuse_non_form(
+    request: Request, *, step: int, saves: str,
+) -> HTMLResponse | None:
+    """Re-render *step* with a 415 when the body is not a form (P23).
+
+    Each wizard step reads defaulted ``Form(...)`` parameters and writes them
+    straight into the saved config, so a non-form body -- which Starlette
+    parses as an empty form -- would overwrite the operator's LLM base URL,
+    model, Wyoming host or audio devices with this file's placeholder
+    defaults. Exactly the shape that erased the config from the tray.
+    """
+    message = not_a_form_body(request, saves=saves)
+    if message is None:
+        return None
+    log.warning("first-run step %d refused (415): %s", step, message)
+    page = templates.TemplateResponse(
+        request, "first_run.html", {"step": step, "errors": {"_global": message}},
+    )
+    page.status_code = _HTTP_UNSUPPORTED_MEDIA_TYPE
+    return page
 
 
 def _split_url(url: str, default_port: int = 8053) -> tuple[str, int]:
@@ -175,6 +199,9 @@ async def first_run_llm(
     form: Annotated[_LLMStepForm, Depends()],
 ) -> HTMLResponse | RedirectResponse:
     """Process LLM step of the wizard."""
+    refused = _refuse_non_form(request, step=1, saves="saves the LLM connection")
+    if refused is not None:
+        return refused
     llm_host, llm_port, model, api_key_ref = (
         form.llm_host, form.llm_port, form.model, form.api_key_ref,
     )
@@ -220,6 +247,9 @@ async def first_run_wyoming(
     wyoming_port: Annotated[int, Form()] = 10300,
 ) -> HTMLResponse | RedirectResponse:
     """Process Wyoming step of the wizard."""
+    refused = _refuse_non_form(request, step=2, saves="saves the Wyoming STT/TTS address")
+    if refused is not None:
+        return refused
     errors: dict[str, str] = {}
     if not (1 <= wyoming_port <= _WYOMING_PORT_MAX):
         errors["wyoming_port"] = "Port must be 1-65535"
@@ -259,6 +289,9 @@ async def first_run_audio(
     output_device: Annotated[str, Form()] = "",
 ) -> HTMLResponse | RedirectResponse:
     """Save the selected audio devices (empty string = OS default)."""
+    refused = _refuse_non_form(request, step=3, saves="saves the audio device selection")
+    if refused is not None:
+        return refused
     if ctx.config_store is not None:
         cfg = ctx.config_store.load()
         cfg.audio.input_device = input_device.strip() or None

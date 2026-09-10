@@ -8,6 +8,12 @@
 {% if errors._global is defined %}<p class="error">{{ errors._global }}</p>{% endif %}
 
 <form method="post" action="/config">
+  {# HTML omits an unticked checkbox entirely, so "absent" is ambiguous: it can
+     mean "the operator unticked it" or "this caller never mentioned it". This
+     names the boxes THIS form speaks for, so POST /config can tell the two
+     apart and leave a box nobody mentioned alone instead of switching it off.
+     Keep it in step with the checkboxes below. #}
+  <input type="hidden" name="checkbox_fields" value="llm_streaming wake_enabled update_enabled">
   <fieldset>
     <legend>LLM</legend>
     <label>Base URL:
