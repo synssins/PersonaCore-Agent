@@ -2,8 +2,8 @@
 
 Contract §11 item 8: stopping and starting the Agent must bring the endpoint back
 without anyone touching PersonaCore. That means the token *and* the certificate
-survive a restart unchanged, because the core pins the fingerprint and the
-operator pasted the token into its secret store.
+survive a restart unchanged, because the core pins the fingerprint and holds
+its own copy of the token, minted and pushed to us once at enrolment.
 """
 
 from __future__ import annotations

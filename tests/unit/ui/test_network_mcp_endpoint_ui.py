@@ -274,8 +274,8 @@ def test_disabling_from_the_ui_stops_the_running_endpoint(tmp_path):
     assert started.running is False
     assert started.stop_calls == 1
     assert "no longer listening" in resp.text.lower()
-    # The stopped endpoint is kept so the page can still show the fingerprint
-    # and token the operator has to paste into PersonaCore.
+    # The stopped endpoint is kept so the page can still show its identity
+    # and fingerprint.
     assert ctx.network_mcp is started
 
 
@@ -893,25 +893,29 @@ def test_the_page_no_longer_tells_the_owner_to_run_a_command(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# The show-once contract must survive all of the above
+# No screen ever reveals the token; the fingerprint's show-once contract
+# must still survive all of the above.
 # ---------------------------------------------------------------------------
 
 
-def test_saving_settings_does_not_re_reveal_an_already_shown_token(tmp_path):
+def test_saving_settings_never_reveals_the_token(tmp_path):
+    """The Bearer token panel is gone. Saving settings must not reveal the
+    token on any render -- not even the first, which used to be the one
+    render this "shown once" contract allowed."""
     factory = Factory()
     client = make_client(
         config_store=FakeConfigStore(), tmp_path=tmp_path, network_mcp_factory=factory,
     )
     first = client.post("/network-mcp/settings", data=_form())
     token = factory.last.token
-    assert token in first.text  # shown once, on the render that created it
+    assert token not in first.text
 
     again = client.post("/network-mcp/settings", data=_form())
     assert token not in again.text
     assert token not in client.get("/network-mcp").text
 
 
-def test_no_route_leaks_the_token_into_the_exported_page_after_it_was_shown(tmp_path):
+def test_no_route_leaks_the_token_into_the_exported_page(tmp_path):
     factory = Factory()
     client = make_client(
         config_store=FakeConfigStore(), tmp_path=tmp_path, network_mcp_factory=factory,

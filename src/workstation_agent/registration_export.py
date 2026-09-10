@@ -236,9 +236,11 @@ def build_manifest_text(
 
     **Never accepts a token.** There is no parameter for one — the
     registration carries only the *name* of the secret
-    (``auth_secret = "workstation_token"``) the operator pastes the value
-    into on the PersonaCore side (contract §3), so there is no argument here
-    a caller could accidentally wire the live token into.
+    (``auth_secret = "workstation_token"``) PersonaCore fills on its own side
+    (contract §3). PersonaCore mints the token itself during enrolment and
+    keeps its own copy under that name; nobody pastes a value into it by
+    hand any more. There is accordingly no argument here a caller could
+    accidentally wire the live token into.
     """
     if not fingerprint.startswith("sha256:") or len(fingerprint) != len("sha256:") + 64:
         msg = f"fingerprint must be 'sha256:' + 64 hex characters, got {_safe_repr(fingerprint)}"

@@ -1,11 +1,19 @@
 """Network MCP: the whole endpoint, configured and operated from the browser.
 
-Contract §3: the URL, the certificate fingerprint and the bearer token are
-shown **once**, each with a copy button, so the operator can paste them into
-PersonaCore's Plugins page and secret store. :func:`NetworkMCPServer.info`
-(``network_mcp/server.py``) is the read-only source for all of it; this
-router never mutates anything under ``network_mcp/`` -- it calls that
-package's public interface and nothing else.
+Contract §3's original flow showed the URL, the certificate fingerprint and
+the bearer token **once**, each with a copy button, so the operator could
+paste them into PersonaCore's Plugins page and secret store. Enrolment (see
+``network_mcp/enrolment.py`` and ``network_mcp/join.py``) replaced the token
+half of that: the owner types a pairing code and PersonaCore mints the token
+and pushes it back over this endpoint's own HTTPS connection, so nobody ever
+walks the copy-the-token-by-hand path any more and this router does not
+render one. The URL and the certificate fingerprint -- neither a secret --
+are still shown once each, the fingerprint's copy button feeding the
+Recovery export flow below for the one case Join cannot reach (see
+:func:`NetworkMCPServer.info`, ``network_mcp/server.py``, the read-only
+source for all of it). This router never mutates anything under
+``network_mcp/`` -- it calls that package's public interface and nothing
+else.
 
 Beyond that surface this router owns three things the operator previously had
 to leave the UI for, and the product requirement is that they never have to
@@ -223,16 +231,6 @@ _OTHER = "__other__"
 _ORDINALS: Final = ("1st", "2nd", "3rd", "4th", "5th", "6th", "7th", "8th", "9th", "10th")
 
 
-def _token_identity(token: str) -> str:
-    """A stand-in for the token that is safe to keep in the reveal-state file.
-
-    Never the token itself: :func:`consume_reveal` persists whatever it is
-    given to disk, and the whole point of this surface is that the token
-    only ever lives in memory and in what the operator pasted elsewhere.
-    """
-    return hashlib.sha256(token.encode("utf-8")).hexdigest()
-
-
 def export_dir() -> Path:
     """Where ``workstation-registration.zip`` is written.
 
@@ -437,26 +435,28 @@ def _read_info(server: Any) -> tuple[Any, str | None]:  # noqa: ANN401
         return None, "Could not read the network MCP endpoint's current state."
 
 
-def _consume_reveals(info: Any) -> tuple[bool, bool, str | None]:  # noqa: ANN401
-    """Show-once bookkeeping for the token and fingerprint.
+def _consume_reveals(info: Any) -> tuple[bool, str | None]:  # noqa: ANN401
+    """Show-once bookkeeping for the certificate fingerprint.
 
-    Fail-closed on a persistence failure: when we cannot durably record that a
-    value was shown, it is *not* shown. Revealing anyway would turn one write
-    failure into a standing leak of the token on every page load.
+    The bearer token has no reveal of its own any more -- enrolment pushes it
+    to PersonaCore directly, and no screen on this page ever displays it, so
+    there is nothing here to consume for ``"token"``. Only the fingerprint,
+    which is not a secret and still backs the Recovery export flow, goes
+    through the show-once gate.
+
+    Fail-closed on a persistence failure: when we cannot durably record that
+    the fingerprint was shown, it is *not* shown. Revealing anyway would turn
+    one write failure into a standing leak on every page load.
     """
     if info is None:
-        return False, False, None
+        return False, None
     try:
-        return (
-            consume_reveal("token", _token_identity(info.token)),
-            consume_reveal("fingerprint", info.fingerprint),
-            None,
-        )
+        return consume_reveal("fingerprint", info.fingerprint), None
     except RevealPersistenceError:
         log.exception("network-mcp: reveal state persistence failed")
-        return False, False, (
-            "Could not record that the token/fingerprint were shown, so they "
-            "are being kept hidden for safety. Check that this workstation's "
+        return False, (
+            "Could not record that the fingerprint was shown, so it is "
+            "being kept hidden for safety. Check that this workstation's "
             "%APPDATA%\\WorkstationAgent directory is writable, then reload "
             "this page."
         )
@@ -819,7 +819,7 @@ def _render(  # noqa: PLR0913 — one parameter per independent page outcome
     """
     cfg, cfg_error = _load_config(ctx)
     info, info_error = _read_info(ctx.network_mcp)
-    reveal_token, reveal_fingerprint, reveal_error = _consume_reveals(info)
+    reveal_fingerprint, reveal_error = _consume_reveals(info)
 
     nm = cfg.network_mcp if cfg is not None else NetworkMcpConfig()
     values = {
@@ -877,7 +877,6 @@ def _render(  # noqa: PLR0913 — one parameter per independent page outcome
             "running": running,
             "error": info_error or cfg_error,
             "reveal_error": reveal_error,
-            "reveal_token": reveal_token,
             "reveal_fingerprint": reveal_fingerprint,
             # endpoint settings form
             "can_configure": cfg is not None,
@@ -1427,20 +1426,16 @@ async def settings_post(  # noqa: PLR0913, PLR0917 — one per form field/outcom
 
 
 # ---------------------------------------------------------------------------
-# Credentials
+# Certificate
+#
+# No ``/rotate-token`` route here any more. It existed solely to feed the
+# Bearer token panel's "rotate to see a new one" button -- the copy-the-
+# token-by-hand surface enrolment replaced -- and a route that hands back a
+# fresh token with nowhere on the page left to show it would be a footgun,
+# not a feature: the operator would have no way to get the new value to
+# PersonaCore short of re-enrolling anyway. ``NetworkMCPServer.rotate_token``
+# itself is untouched; it is simply no longer wired to a UI control.
 # ---------------------------------------------------------------------------
-
-
-@router.post("/rotate-token")
-async def rotate_token(
-    ctx: Annotated[BackendContext, Depends(get_context)],
-) -> RedirectResponse:
-    """Generate a fresh bearer token; it is shown once on the next page load."""
-    if ctx.network_mcp is not None:
-        with contextlib.suppress(Exception):
-            ctx.network_mcp.rotate_token()
-        log.info("network-mcp: token rotated")
-    return RedirectResponse(url="/network-mcp", status_code=303)
 
 
 @router.post("/regenerate-certificate")

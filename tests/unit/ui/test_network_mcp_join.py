@@ -1304,16 +1304,17 @@ def test_the_remove_button_says_what_it_does(tmp_path):
 
 
 def test_no_bearer_token_is_offered_anywhere_in_the_enrolment_surface(tmp_path):
-    """Join exists so nobody ever handles the token. Nothing added here may
-    hand one back out."""
+    """Join exists so nobody ever handles the token. Nothing on the whole
+    page may hand one back out -- the Bearer token panel that used to sit
+    above Join is gone, so there is no longer a part of the page this needs
+    to carve out and ignore."""
     enrol(tmp_path)
     client = make_client(tmp_path=tmp_path, network_mcp=FakeEndpoint(tmp_path))
 
     text = client.get("/network-mcp").text
-    _, _, after_join = text.partition('<section id="nm-join">')
 
-    assert "t" * 64 not in after_join
-    assert 'name="token"' not in after_join
+    assert "t" * 64 not in text
+    assert 'name="token"' not in text
 
 
 # ---------------------------------------------------------------------------

@@ -91,7 +91,10 @@ class BackendContext:
     network_mcp: Any = field(default=None)
     """workstation_agent.network_mcp.server.NetworkMCPServer (or fake), or
     None when no endpoint object exists yet. Backs the /network-mcp
-    credential surface (contract §3: URL, fingerprint, token, shown once).
+    identity surface (contract §3: URL and fingerprint, shown once). The
+    bearer token is no longer displayed here -- enrolment pushes it to
+    PersonaCore directly -- so this object's ``token`` is read only to feed
+    the endpoint's own auth, never rendered.
 
     **Mutable at runtime.** ``POST /network-mcp/settings`` replaces this with a
     server built from the newly-saved config, so enabling the endpoint from
