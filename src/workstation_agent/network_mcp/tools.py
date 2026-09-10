@@ -64,6 +64,40 @@ from typing import Any, Final
 TOOL_NAME_PATTERN: Final = re.compile(r"\A[a-z][a-z0-9-]{1,63}\Z")
 
 
+def wire_name(internal_name: str) -> str:
+    """Contract §2's translation of a dotted internal id into the wire spelling.
+
+    ``"shell.run"`` → ``"shell_run"``.  One line, and it is here rather than
+    inlined at each caller because this direction is the *only* unambiguous one
+    and the codebase should have exactly one spelling of it: a dotted name has
+    exactly one dot separating family from verb, so replacing it can never lose
+    information.  :func:`internal_name_for_wire` is the other direction, and it
+    is a table lookup rather than a string operation for precisely that reason.
+
+    This is the name the operator meets everywhere outside the Agent's own
+    internals — PersonaCore's tool list, its logs, the §7 confirmation policy
+    (``shell_run``, ``jobs_*``) — so any surface that shows him a tool name has
+    to be able to produce it.  :func:`validate_tool_names` checks the served
+    table against this function, so the table and the translation cannot drift.
+
+    A name with no dot is returned unchanged: it is either already a wire name
+    or not a tool id at all, and inventing a separator would be worse than
+    passing it through.
+    """
+    return internal_name.replace(".", "_")
+
+
+def tool_family(internal_name: str) -> str:
+    """The family half of a dotted internal id (``"shell.run"`` → ``"shell"``).
+
+    A name with no dot is its own family.  That is the honest reading — an
+    ungrouped tool is a group of one — and it keeps every caller free of a
+    "what if there is no family" branch that would otherwise be duplicated
+    wherever tools are grouped for the operator.
+    """
+    return internal_name.split(".", 1)[0] if "." in internal_name else internal_name
+
+
 def _freeze(value: Any) -> Any:
     """Return a deeply immutable view of *value*.
 
@@ -527,6 +561,26 @@ SERVED_TOOLS_BY_NAME: Final[Mapping[str, ServedTool]] = MappingProxyType(
     {t.name: t for t in SERVED_TOOLS},
 )
 
+def internal_name_for_wire(name: str) -> str | None:
+    """The dotted internal id a wire name translates back to, or ``None``.
+
+    A **table lookup**, deliberately not ``name.replace("_", ".")``: the wire
+    spelling is lossy in this direction. ``"adb_install"`` could be
+    ``adb.install`` or a family ``adb_install`` with no verb, and a verb
+    containing an underscore makes the split outright ambiguous — which is the
+    same reason :class:`ServedTool` writes both names out rather than deriving
+    one. Guessing here would mistranslate a name silently, so an unknown wire
+    name answers ``None`` and the caller keeps whatever it was given.
+
+    Used by surfaces that accept a tool name *from the operator* — he types the
+    wire spelling, because that is the one he is shown everywhere else, while
+    what is stored (an audit row's ``tool_id``, a grant's ``tool:`` entry) is
+    dotted.
+    """
+    tool = SERVED_TOOLS_BY_NAME.get(name.strip())
+    return tool.internal_name if tool is not None else None
+
+
 #: The families this endpoint is willing to serve at all.
 SERVED_FAMILIES: Final[tuple[str, ...]] = tuple(
     dict.fromkeys(t.family for t in SERVED_TOOLS),
@@ -596,7 +650,7 @@ def validate_tool_names() -> list[str]:
                 f"internal name {tool.internal_name!r} does not start with family "
                 f"{tool.family!r}",
             )
-        expected = tool.internal_name.replace(".", "_")
+        expected = wire_name(tool.internal_name)
         if tool.name != expected:
             problems.append(
                 f"served name {tool.name!r} is not the §2 translation of internal name "

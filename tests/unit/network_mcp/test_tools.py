@@ -312,3 +312,57 @@ def test_a_trailing_newline_in_a_name_is_caught_by_the_validator():
         description="x", input_schema={},
     )
     assert any("does not match" in p for p in _problems_with(sneaky))
+
+
+# ---------------------------------------------------------------------------
+# The two spellings, and which direction may be computed
+# ---------------------------------------------------------------------------
+
+
+def test_wire_name_is_the_translation_the_table_uses():
+    """One spelling of contract §2's translation, checked against the table.
+
+    ``validate_tool_names`` compares every entry's hand-written wire name to
+    this function, so if the two ever disagree the endpoint refuses to bind.
+    This asserts the same property directly, so a failure names the cause.
+    """
+    for tool in T.SERVED_TOOLS:
+        assert T.wire_name(tool.internal_name) == tool.name
+
+
+def test_wire_name_leaves_a_name_with_no_dot_alone():
+    assert T.wire_name("shell_run") == "shell_run"
+    assert T.wire_name("") == ""
+
+
+def test_tool_family_splits_on_the_first_dot_only():
+    assert T.tool_family("shell.run") == "shell"
+    assert T.tool_family("jobs.output") == "jobs"
+    # A name with no dot is a family of one, not a family of nothing.
+    assert T.tool_family("hello_world") == "hello_world"
+
+
+def test_tool_family_agrees_with_the_table():
+    for tool in T.SERVED_TOOLS:
+        assert T.tool_family(tool.internal_name) == tool.family
+
+
+def test_internal_name_for_wire_round_trips_every_served_tool():
+    for tool in T.SERVED_TOOLS:
+        assert T.internal_name_for_wire(tool.name) == tool.internal_name
+
+
+def test_internal_name_for_wire_refuses_to_guess():
+    """``_`` to ``.`` is not invertible, so an unknown name is not rewritten.
+
+    A guess here would filter, or route, for a tool that does not exist --
+    silently, which is the failure mode the explicit table exists to prevent.
+    """
+    assert T.internal_name_for_wire("hello_world_echo") is None
+    assert T.internal_name_for_wire("not_a_tool") is None
+    assert T.internal_name_for_wire("") is None
+
+
+def test_internal_name_for_wire_tolerates_surrounding_space():
+    """It reads what an operator typed into a box, not a machine-made string."""
+    assert T.internal_name_for_wire("  shell_run  ") == "shell.run"

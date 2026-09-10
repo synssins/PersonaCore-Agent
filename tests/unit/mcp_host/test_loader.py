@@ -499,3 +499,73 @@ def test_the_signer_refuses_when_it_cannot_import_the_entry_module(tmp_path):
         copy.plugin_dir, SigningKey.generate(), replace_sentinel=True, allow_dir_scan=True,
     )
     assert ok.startswith("OK"), ok
+
+
+# ---------------------------------------------------------------------------
+# "What does this plugin declare" -- one function, running or not
+# ---------------------------------------------------------------------------
+
+
+def _declaring_manifest(tmp_path) -> loader.PluginManifest:
+    return loader.PluginManifest(
+        id="declarer",
+        name="Declaring Plugin",
+        version="2.0.0",
+        runtime="python",
+        entry=["-m", "declarer"],
+        plugin_dir=tmp_path,
+        signature_file=tmp_path / "signature.sig",
+        declared_permissions=["tool:demo.echo", "args:demo.echo:read:text=opaque"],
+        confirmable_conditions=["command_outside_allowlist"],
+    )
+
+
+def test_plugin_declaration_reports_the_signed_claims_verbatim(tmp_path):
+    """The settings UI reads this for a plugin the host never started.
+
+    A plugin that is switched off is skipped by ``MCPHost.start`` and so is
+    absent from ``MCPHost.plugins()`` entirely. The page still has to be able to
+    say what it declares -- and it has to be the *same* answer the host would
+    give, which is why there is one function for the question rather than a
+    second reader of the same signed file.
+    """
+    decl = loader.plugin_declaration(_declaring_manifest(tmp_path))
+
+    assert decl.id == "declarer"
+    assert decl.name == "Declaring Plugin"
+    assert decl.version == "2.0.0"
+    assert decl.declared_permissions == (
+        "tool:demo.echo", "args:demo.echo:read:text=opaque",
+    )
+    assert decl.confirmable_conditions == ("command_outside_allowlist",)
+
+
+def test_a_declaration_cannot_be_edited_by_whoever_is_shown_it(tmp_path):
+    """It is a report about a signed document, not a working copy."""
+    decl = loader.plugin_declaration(_declaring_manifest(tmp_path))
+
+    with pytest.raises((AttributeError, TypeError)):
+        decl.declared_permissions = ("tool:demo.anything",)  # type: ignore[misc]
+    assert isinstance(decl.declared_permissions, tuple)
+
+
+@pytest.mark.asyncio
+async def test_the_host_answers_the_declaration_question_the_same_way(tmp_path):
+    """``MCPHost.plugins`` and the UI must not read the manifest differently."""
+    from workstation_agent.mcp_host.host import MCPHost, _PluginRuntime
+
+    manifest = _declaring_manifest(tmp_path)
+    host = MCPHost()
+    host._runtimes[manifest.id] = _PluginRuntime(
+        manifest=manifest,
+        verify_result=loader.VerifyResult(status="valid"),
+    )
+
+    row = (await host.plugins())[0]
+    decl = loader.plugin_declaration(manifest)
+
+    assert row.id == decl.id
+    assert row.name == decl.name
+    assert row.version == decl.version
+    assert tuple(row.declared_permissions) == decl.declared_permissions
+    assert tuple(row.confirmable_conditions) == decl.confirmable_conditions

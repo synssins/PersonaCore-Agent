@@ -40,6 +40,7 @@ from workstation_agent.mcp_host.loader import (
     PluginManifest,
     VerifyResult,
     discover,
+    plugin_declaration,
     verify,
 )
 from workstation_agent.mcp_host.mcp_client import MCPStdioClient
@@ -982,14 +983,23 @@ class MCPHost:
         return answer is True, correlation_id
 
     async def plugins(self) -> list[PluginInfoImpl]:
-        """Return status for every known plugin."""
+        """Return status for every known plugin.
+
+        The *declaration* half of each row comes from
+        :func:`~workstation_agent.mcp_host.loader.plugin_declaration`, which is
+        also what the settings UI calls for a plugin this host is **not**
+        running. One function, so "what does this plugin declare" cannot have
+        one answer on the page for a running plugin and a differently-parsed
+        answer for a disabled one.
+        """
         result: list[PluginInfoImpl] = []
         for runtime in self._runtimes.values():
             handle = runtime.handle
+            declared = plugin_declaration(runtime.manifest)
             result.append(PluginInfoImpl(
-                id=runtime.manifest.id,
-                name=runtime.manifest.name,
-                version=runtime.manifest.version,
+                id=declared.id,
+                name=declared.name,
+                version=declared.version,
                 status=runtime.status,
                 signature_status=runtime.verify_result.status,
                 granted_permissions=list(runtime.granted_permissions),
@@ -1004,8 +1014,8 @@ class MCPHost:
                 ),
                 integrity=handle.integrity if handle is not None else "unknown",
                 pid=handle.pid if handle is not None else None,
-                declared_permissions=list(runtime.manifest.declared_permissions),
-                confirmable_conditions=list(runtime.manifest.confirmable_conditions),
+                declared_permissions=list(declared.declared_permissions),
+                confirmable_conditions=list(declared.confirmable_conditions),
             ))
         return result
 
