@@ -13,6 +13,19 @@ authors = [{ name = "Chris (synssins)", email = "synssins@gmail.com" }]
 
 dependencies = [
     "openwakeword>=0.6,<1.0",
+    # Pinned below 1.30 because PyInstaller cannot analyse it. `onnxruntime`
+    # arrives transitively through `openwakeword`, which sets no upper bound, so
+    # 1.30.0 was picked up the moment it was published -- between the alpha.16
+    # release build, which succeeded on 1.29.0, and alpha.17's, which failed on
+    # nothing but this. PyInstaller's isolated dependency-analysis subprocess
+    # crashes importing it: `SubprocessDiedError: Isolated subprocess crashed
+    # while importing package 'onnxruntime'`, and the installer never builds.
+    #
+    # An unpinned transitive dependency means a release can break with no change
+    # to this repository at all, which is what happened -- the failing commit
+    # added no import and touched nothing near the wake-word stack. Same reason
+    # `mcp` carries an upper bound below.
+    "onnxruntime>=1.29,<1.30",
     "wyoming>=1.0,<2.0",
     "httpx>=0.23,<1.0",
     "structlog>=21.0,<22.0",
