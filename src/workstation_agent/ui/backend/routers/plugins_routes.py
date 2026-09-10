@@ -250,6 +250,41 @@ async def plugin_install_registry(
     return RedirectResponse(url="/plugins", status_code=303)
 
 
+@router.post("/reload")
+async def plugin_reload_all(
+    ctx: Annotated[BackendContext, Depends(get_context)],
+) -> RedirectResponse:
+    """Reload every loaded plugin.
+
+    The tray's "Reload plugins" item has been posting here since it shipped and
+    getting a 404: the only reload route was ``/plugins/{plugin_id}/reload``,
+    which cannot express "all of them", and the tray has no plugin list to
+    iterate. The menu item is a real feature -- it carries the pending-plugin
+    badge, and it is how the operator applies a plugin change without opening
+    the UI -- so the missing route is the thing that was wrong, not the caller.
+
+    Each plugin is reloaded independently: one plugin that refuses to come back
+    must not stop the rest, and the operator's other tools should still be
+    there afterwards.
+    """
+    reloaded = 0
+    if ctx.mcp_host is not None:
+        try:
+            plugins = await ctx.mcp_host.plugins()
+        except Exception:
+            log.exception("plugin reload-all: could not list plugins")
+            plugins = []
+        for plugin in plugins:
+            try:
+                await ctx.mcp_host.reload(plugin.id)
+            except Exception:
+                log.exception("plugin reload-all: reload failed for id=%s", plugin.id)
+            else:
+                reloaded += 1
+    log.info("plugin reload-all: reloaded %d plugin(s)", reloaded)
+    return RedirectResponse(url="/plugins", status_code=303)
+
+
 @router.post("/{plugin_id}/reload")
 async def plugin_reload(
     plugin_id: str,

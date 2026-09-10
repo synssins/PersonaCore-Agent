@@ -189,7 +189,10 @@ def test_confirmation_policy_post_moves_tool_between_lists(tmp_path):
 
     # shell_run starts on the always-prompt default; move it to never-prompt
     # and leave every other default tool where it started.
-    data = {}
+    # The hidden field config.html's confirmation form submits (P23): it is
+    # what separates "the operator chose ask for every tool" -- a submission
+    # with no policy fields at all -- from a body that merely arrived empty.
+    data = {"speaks_for": "confirmation_policy"}
     for tool in store._cfg.confirmation.never_prompt:
         data[f"policy_{tool}"] = "never"
     for tool in store._cfg.confirmation.always_prompt:
@@ -211,6 +214,7 @@ def test_confirmation_policy_post_sets_remember_flag(tmp_path):
     data = {f"policy_{t}": "always" for t in store._cfg.confirmation.always_prompt}
     data.update({f"policy_{t}": "never" for t in store._cfg.confirmation.never_prompt})
     data["remember_serial_write"] = "true"
+    data["speaks_for"] = "confirmation_policy"
 
     client.post("/config/confirmation", data=data, follow_redirects=False)
     assert store._cfg.confirmation.remember_for_session == ["serial_write"]
@@ -224,6 +228,7 @@ def test_confirmation_policy_post_pushes_to_running_host(tmp_path):
 
     data = {f"policy_{t}": "always" for t in store._cfg.confirmation.always_prompt}
     data.update({f"policy_{t}": "never" for t in store._cfg.confirmation.never_prompt})
+    data["speaks_for"] = "confirmation_policy"
 
     client.post("/config/confirmation", data=data, follow_redirects=False)
 

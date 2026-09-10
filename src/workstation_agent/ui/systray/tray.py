@@ -194,15 +194,24 @@ class SystemTray:
             self._webview.open("/dashboard")
 
     def _on_mute_toggle(self, _icon, _item) -> None:  # noqa: ANN001
+        # No HTTP call. "Muted" is speaker state -- SpeakerSink.mute() in
+        # audio.sink -- not a setting: there is no `muted` key in AgentConfig
+        # and no backend route that owns one. This used to POST
+        # {"muted": ...} at /config, where the JSON body parsed as an empty
+        # form and every setting was replaced by its default. The click could
+        # never have muted anything; all it could do was erase the config.
+        # Wiring the tray to the running speaker is v0.2 work (no sink on
+        # BackendContext yet); until then the checkmark is honest about being
+        # local state.
         self._muted = not self._muted
-        log.debug("Tray: mute toggled -> %s", self._muted)
-        self._post_config({"muted": self._muted})
+        log.debug("Tray: mute toggled -> %s (local state only)", self._muted)
 
     def _make_session_mode_action(self, mode: str) -> Callable[..., None]:
         def _action(_icon, _item) -> None:  # noqa: ANN001
             self._session_mode = mode
             log.debug("Tray: session mode -> %s", mode)
-            self._post_config({"session_mode": mode})
+            # The single-setting route, not the save-everything form route.
+            self._post_json("/config/session-mode", {"mode": mode})
 
         return _action
 
@@ -271,17 +280,30 @@ class SystemTray:
         """
         return {"Origin": base.rstrip("/")}
 
-    def _post_config(self, payload: dict[str, Any]) -> None:
+    def _post_json(self, path: str, payload: dict[str, Any]) -> None:
+        """POST a JSON body to *path* on the local UI backend.
+
+        Was ``_post_config``, which hardcoded ``/config`` -- the route that
+        replaces the entire configuration from an HTML form. A JSON body there
+        parses as an empty form, so every caller of the old helper silently
+        reset the operator's settings to defaults. The path is a parameter now
+        because the callers want different, narrower routes.
+
+        The ``Origin`` header is orthogonal and still required: it says the
+        request came from the UI's own origin, which is what gets it past the
+        same-origin guard. Naming the right *route* is what stops it destroying
+        the configuration once it is through.
+        """
         try:
             base = self._url_provider()
             httpx.post(
-                f"{base}/config",
+                f"{base}{path}",
                 json=payload,
                 timeout=5,
                 headers=self._same_origin_headers(base),
             )
         except Exception:
-            log.exception("Tray: config POST failed")
+            log.exception("Tray: POST %s failed", path)
 
     @staticmethod
     def _default_url_provider() -> str:
