@@ -1,19 +1,26 @@
 """Tracks which network-MCP credential values have already been shown once.
 
-Contract §3: the operator sees the token and the certificate fingerprint
-**once**, with a copy button each, then pastes them into PersonaCore. A page
-that re-renders the raw token on every visit to ``/network-mcp`` defeats the
-entire point of "shown once" — it turns a one-time reveal into a standing
-leak to anyone who can load the page (which, granted, is loopback-only
-per :func:`workstation_agent.ui.backend.app.create_app`'s middleware, but the
-contract's "once" is a property of the *value*, not of who else can see it).
+Contract §3's original flow had the operator see the token and the
+certificate fingerprint **once**, with a copy button each, then paste them
+into PersonaCore. Enrolment replaced the token half of that -- PersonaCore
+mints the token and pushes it back over the endpoint's own HTTPS connection,
+so the ``/network-mcp`` page never renders the token at all any more, and
+this module is never asked to gate it. The certificate fingerprint is not a
+secret, but it is still gated the same "shown once" way, both because it can
+change (regenerating the certificate mints a new one) and to keep it off the
+screen once the operator has what they need rather than leaving it standing
+on every visit. A page that re-rendered a gated value on every visit would
+defeat the point of "shown once" — it turns a one-time reveal into a
+standing display to anyone who can load the page (which, granted, is
+loopback-only per :func:`workstation_agent.ui.backend.app.create_app`'s
+middleware, but the contract's "once" is a property of the *value*, not of
+who else can see it).
 
-The state kept here is keyed to the value itself (a hash of the token, the
-fingerprint string verbatim — never the raw token) rather than to "has this
-page been visited before", so a **new** value — an operator rotating the
-token or regenerating the certificate — is correctly revealed again exactly
-once, while the *same* value across an Agent restart stays masked. The
-network MCP endpoint's own certificate/token persistence
+The state kept here is keyed to the value itself (the fingerprint string
+verbatim) rather than to "has this page been visited before", so a **new**
+value — an operator regenerating the certificate — is correctly revealed
+again exactly once, while the *same* value across an Agent restart stays
+masked. The network MCP endpoint's own certificate/token persistence
 (``network_mcp/credentials.py``, ``network_mcp/certs.py``) already survives
 restarts for the same reason (contract §11 item 8); this file's job is only
 to remember whether the UI has already shown what those files hold.

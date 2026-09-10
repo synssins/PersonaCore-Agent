@@ -1,9 +1,14 @@
-"""Subtask B5 -- the credential surface: GET /network-mcp, rotate, regenerate.
+"""Subtask B5 -- the identity surface: GET /network-mcp, regenerate.
 
-Contract §3: the URL, certificate fingerprint and bearer token are shown
-**once**, with a copy button each. These tests pin the "once" part -- the
-raw token and fingerprint must not reappear on a second page load unless
-the operator explicitly rotates or regenerates.
+Contract §3's original flow showed the URL, certificate fingerprint and
+bearer token **once**, with a copy button each. Enrolment replaced the
+token half: PersonaCore mints it and pushes it back over this endpoint's
+own HTTPS connection, so the page never renders it and there is no route
+left that reveals or rotates it from here. These tests pin that -- the raw
+token must never appear anywhere on this page, under any outcome -- and
+pin the "once" part for what is still shown: the fingerprint must not
+reappear on a second page load unless the operator explicitly regenerates
+the certificate.
 """
 
 from __future__ import annotations
@@ -24,13 +29,17 @@ from workstation_agent.ui.backend.credential_reveal import (
 
 
 class FakeNetworkMCPServer:
-    """Stands in for NetworkMCPServer.info()/rotate_token()/regenerate_certificate()."""
+    """Stands in for NetworkMCPServer.info()/regenerate_certificate().
+
+    Still carries a ``token`` -- ``info()`` always has one, since the
+    endpoint still authenticates with it -- but nothing in this test module
+    exercises rotating it: there is no page and no route left that does.
+    """
 
     def __init__(self, *, token="t" * 64, fingerprint=None, running=True) -> None:
         self.token = token
         self.fingerprint = fingerprint or ("sha256:" + "ab" * 32)
         self.running = running
-        self.rotate_calls = 0
         self.regenerate_calls = 0
 
     def info(self):
@@ -45,11 +54,6 @@ class FakeNetworkMCPServer:
             tool_names=("workstation_status", "devices_list"),
             running=self.running,
         )
-
-    def rotate_token(self):
-        self.rotate_calls += 1
-        self.token = "r" * 64
-        return self.token
 
     def regenerate_certificate(self):
         self.regenerate_calls += 1
@@ -75,42 +79,41 @@ def test_disabled_endpoint_shows_not_running(tmp_path):
     assert "not running" in resp.text.lower()
 
 
-def test_first_visit_reveals_the_token_and_fingerprint(tmp_path):
+def test_first_visit_reveals_the_fingerprint_but_never_the_token(tmp_path):
     server = FakeNetworkMCPServer(token="firsttoken" * 6 + "ab", fingerprint="sha256:" + "11" * 32)
     client = make_client(tmp_path=tmp_path, network_mcp=server)
 
     resp = client.get("/network-mcp")
     assert resp.status_code == 200
-    assert server.token in resp.text
     assert server.fingerprint in resp.text
+    assert server.token not in resp.text
 
 
-def test_second_visit_does_not_reveal_the_same_token_again(tmp_path):
+def test_second_visit_does_not_reveal_the_same_fingerprint_again(tmp_path):
     server = FakeNetworkMCPServer(token="samevalue" * 7, fingerprint="sha256:" + "22" * 32)
     client = make_client(tmp_path=tmp_path, network_mcp=server)
 
     first = client.get("/network-mcp")
-    assert server.token in first.text
+    assert server.fingerprint in first.text
+    assert server.token not in first.text
 
     second = client.get("/network-mcp")
-    assert server.token not in second.text
     assert server.fingerprint not in second.text
+    assert server.token not in second.text
     assert "already shown" in second.text.lower()
 
 
-def test_rotating_the_token_reveals_the_new_one_once(tmp_path):
+def test_there_is_no_route_left_to_rotate_or_reveal_the_token(tmp_path):
+    """The Bearer token panel and its Rotate Token button are gone; nothing
+    in this router still exposes ``/network-mcp/rotate-token``. Enrolment is
+    how the token reaches PersonaCore now, and there is no UI path back to
+    the old copy-the-token-by-hand flow."""
     server = FakeNetworkMCPServer(token="original" * 8)
     client = make_client(tmp_path=tmp_path, network_mcp=server)
 
-    client.get("/network-mcp")  # consume the original reveal
-
-    resp = client.post("/network-mcp/rotate-token", follow_redirects=True)
-    assert server.rotate_calls == 1
-    assert resp.status_code == 200
-    assert server.token in resp.text  # the new token, shown once
-
-    again = client.get("/network-mcp")
-    assert server.token not in again.text  # not shown a second time
+    resp = client.post("/network-mcp/rotate-token", follow_redirects=False)
+    assert resp.status_code == 404
+    assert server.token == "original" * 8  # untouched -- nothing rotated it
 
 
 def test_regenerating_the_certificate_reveals_the_new_fingerprint_once(tmp_path):
@@ -127,13 +130,16 @@ def test_regenerating_the_certificate_reveals_the_new_fingerprint_once(tmp_path)
     assert server.fingerprint not in again.text
 
 
-def test_the_page_never_puts_the_token_in_a_form_action_or_redirect(tmp_path):
-    """A copy-button flow must not leak the token into a URL/redirect target."""
+def test_no_bearer_token_is_offered_anywhere_on_the_settings_page(tmp_path):
+    """The whole page, on every outcome this test can cheaply drive: no
+    raw token, no rotate-token form action, nowhere."""
     server = FakeNetworkMCPServer(token="leakcheck" * 7)
     client = make_client(tmp_path=tmp_path, network_mcp=server)
-    resp = client.post("/network-mcp/rotate-token", follow_redirects=False)
-    assert resp.status_code == 303
-    assert server.token not in resp.headers["location"]
+
+    resp = client.get("/network-mcp")
+    assert server.token not in resp.text
+    assert "/network-mcp/rotate-token" not in resp.text
+    assert "Bearer token" not in resp.text
 
 
 def test_a_reveal_persistence_failure_fails_closed_not_a_500(tmp_path, monkeypatch):
