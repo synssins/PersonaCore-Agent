@@ -5,7 +5,7 @@ End-to-end round trip against ``echo_plugin`` for the SPEC-03A surface:
 the ``notifications()`` async iterator. Also covers timeout, cancellation,
 protocol/remote errors, and closed-client behaviour without the plugin.
 """
-# ruff: noqa: ARG002, EM101, TRY003, TC003, E402
+# ruff: noqa: ARG002, EM101, TRY003, TC003
 
 from __future__ import annotations
 
@@ -13,16 +13,10 @@ import asyncio
 import concurrent.futures
 import io
 import json
-import os
 import queue
 from pathlib import Path
 
 import pytest
-
-pytestmark = pytest.mark.skipif(
-    os.getenv("CI") == "true",
-    reason="echo_plugin subprocess race on CI py3.12 (task #10)",
-)
 
 from workstation_agent.mcp_host.mcp_client import (
     MCPProtocolError,

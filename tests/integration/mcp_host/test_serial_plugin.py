@@ -18,16 +18,10 @@ without a real device.
 from __future__ import annotations
 
 import json
-import os
 import sys
 from pathlib import Path
 
 import pytest
-
-pytestmark = pytest.mark.skipif(
-    os.getenv("CI") == "true",
-    reason="plugin subprocess race on GH Actions py3.12 (task #10)",
-)
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _WORKTREE_SRC = _REPO_ROOT / "src"

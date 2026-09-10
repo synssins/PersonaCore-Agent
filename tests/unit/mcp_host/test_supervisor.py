@@ -5,22 +5,16 @@ Covers:
 * Job Object + PID exist after spawn and are cleared after terminate.
 * Low-integrity fallback path when SetTokenInformation raises.
 """
-# ruff: noqa: ARG001, EM101, TRY003, TC003, E402
+# ruff: noqa: ARG001, EM101, TRY003, TC002, TC003
 
 from __future__ import annotations
 
 import asyncio
 import json
-import os
 import time
 from pathlib import Path
 
 import pytest
-
-pytestmark = pytest.mark.skipif(
-    os.getenv("CI") == "true",
-    reason="echo_plugin subprocess race on CI py3.12 (task #10)",
-)
 
 from workstation_agent.mcp_host import supervisor as sup_mod
 from workstation_agent.mcp_host.supervisor import (

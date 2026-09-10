@@ -12,18 +12,12 @@ from __future__ import annotations
 
 import io
 import json
-import os
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any
 
 import pytest
-
-pytestmark = pytest.mark.skipif(
-    os.getenv("CI") == "true",
-    reason="plugin subprocess race on GH Actions py3.12 (task #10)",
-)
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _PYTHON = sys.executable
