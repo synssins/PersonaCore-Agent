@@ -29,10 +29,12 @@ from unittest.mock import MagicMock
 import pytest
 
 from tests.unit.ui.conftest import (
+    TEST_ORIGIN,
     FakeConfigStore,
     FakeMCPHost,
     FakePluginInfo,
     make_client,
+    ui_test_client,
 )
 from workstation_agent.config.schema import AgentConfig
 from workstation_agent.ui.systray.tray import SystemTray
@@ -116,9 +118,13 @@ def _tray_wired_to(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> Syste
         return client.post(url, follow_redirects=False, **kwargs)
 
     monkeypatch.setattr("workstation_agent.ui.systray.tray.httpx.post", _post)
+    # The tray's own Origin header (P21) is derived from the address it is
+    # calling, so the URL it is pointed at has to be the one the same-origin
+    # guard is configured for. Nothing here bypasses that check: these requests
+    # go through it exactly as a real tray click does.
     return SystemTray(
         webview_window=MagicMock(),
-        url_provider=lambda: "http://testserver",
+        url_provider=lambda: TEST_ORIGIN,
         pending_plugin_count=lambda: 0,
     )
 
@@ -360,13 +366,11 @@ def test_the_tray_reload_click_reloads_every_plugin(
 
 def test_reload_all_with_no_host_is_not_an_error(tmp_path: Path) -> None:
     """No MCP host wired (a backend running standalone) is not a 500."""
-    from starlette.testclient import TestClient
-
     from tests.unit.ui.conftest import _LoopbackASGI
     from workstation_agent.ui.backend.app import BackendContext, create_app
 
     ctx = BackendContext(config_store=FakeConfigStore(), log_dir=tmp_path / "logs")
-    client = TestClient(_LoopbackASGI(create_app(ctx)))
+    client = ui_test_client(_LoopbackASGI(create_app(ctx)))
 
     resp = client.post("/plugins/reload", follow_redirects=False)
 

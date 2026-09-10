@@ -452,7 +452,12 @@ def test_the_tray_names_the_origin_it_is_calling(monkeypatch):
             logs_dir="/logs",
         )
 
-    tray._on_mute_toggle(None, None)
+    # Every menu item that makes a request. The mute toggle used to be one of
+    # them; P23 removed its call entirely (there is no `muted` setting and no
+    # route that owns one, so the request could only ever have destroyed the
+    # configuration), so it is not listed here -- and the assertion below that
+    # *every* post carries the header would catch it if it came back untreated.
+    tray._make_session_mode_action("persistent")(None, None)
     tray._on_reload_plugins(None, None)
     tray._on_check_updates(None, None)
 
