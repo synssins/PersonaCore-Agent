@@ -8,13 +8,19 @@
 
 <form method="get" action="/audit">
   <label>Plugin ID: <input type="text" name="plugin_id" value="{{ filters.plugin_id or '' }}"></label>
-  <label>Tool ID: <input type="text" name="tool_id" value="{{ filters.tool_id or '' }}"></label>
+  <label>Tool: <input type="text" name="tool_id" value="{{ filters.tool_id or '' }}"
+    placeholder="shell_run"></label>
   <label>Event: <input type="text" name="event" value="{{ filters.event or '' }}"></label>
   <label>Since: <input type="text" name="since" value="{{ filters.since or '' }}" placeholder="ISO-8601"></label>
   <label>Until: <input type="text" name="until" value="{{ filters.until or '' }}" placeholder="ISO-8601"></label>
   <label>Limit: <input type="number" name="limit" value="{{ filters.limit }}" min="1" max="1000"></label>
   <button type="submit">Filter</button>
 </form>
+
+{% if tool_note %}<p class="info">{{ tool_note }}</p>{% endif %}
+<p class="info">Tools are named the way you see them everywhere else &mdash; shell_run &mdash;
+  with the Agent's internal spelling (shell.run) beside them. They are the same tool, and
+  either spelling works in the filter above.</p>
 
 <table>
   <thead>
@@ -28,11 +34,18 @@
   <tr>
     <td>{{ row.ts }}</td>
     <td>{{ row.event }}</td>
-    <td>{{ row.plugin_id or '' }}</td>
-    <td>{{ row.tool_id or '' }}</td>
-    <td>{{ row.decision or '' }}</td>
-    <td>{{ row.result or '' }}</td>
-    <td>{{ row.detail or '' }}</td>
+    <td>{{ row.plugin_id }}</td>
+    <td>
+      {%- if row.tool_wire -%}
+      {{ row.tool_wire }}
+      {%- if row.tool_internal != row.tool_wire %}
+      <br><small class="info">{{ row.tool_internal }}</small>
+      {%- endif -%}
+      {%- endif -%}
+    </td>
+    <td>{{ row.decision }}</td>
+    <td>{{ row.result }}</td>
+    <td>{{ row.detail }}</td>
   </tr>
   {% else %}
   <tr><td colspan="7">No audit records found.</td></tr>

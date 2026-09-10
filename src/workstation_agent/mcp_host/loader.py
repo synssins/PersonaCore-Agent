@@ -299,6 +299,56 @@ def discover() -> list[PluginManifest]:
     return result
 
 
+@dataclass(frozen=True)
+class PluginDeclaration:
+    """What one plugin's signed ``plugin.toml`` says about itself.
+
+    The answer to "what does this plugin declare", and **the only** answer:
+    :func:`plugin_declaration` builds it, and every caller that needs to show or
+    bound a plugin's claims reads it rather than reaching into a manifest (or a
+    runtime record) itself.
+
+    It exists because the question has two askers that used to have different
+    access to it. :meth:`~workstation_agent.mcp_host.host.MCPHost.plugins` can
+    answer it for a plugin the host is *running*, because it is holding the
+    manifest already. The settings UI has to answer it for a plugin the host is
+    **not** running — one the owner switched off, one that failed to spawn —
+    and a page that silently omits such a plugin tells him a tool he can watch
+    being refused elsewhere does not exist. The alternative to this type was the
+    UI reading manifests its own way, which is a second source of truth about a
+    *signed* document: two readers, two parsings, and eventually two answers.
+
+    Immutable (``frozen``, tuples rather than lists) because it is a report
+    about a signed file. Nothing downstream has any business editing what a
+    plugin declared, and handing out a mutable copy of it invites exactly that.
+    """
+
+    id: str
+    name: str
+    version: str
+    declared_permissions: tuple[str, ...]
+    confirmable_conditions: tuple[str, ...]
+
+
+def plugin_declaration(manifest: PluginManifest) -> PluginDeclaration:
+    """What *manifest* declares — running or not, this is the same answer.
+
+    A pure read of the signed document. It decides nothing: what may be
+    *granted* out of these claims is
+    :func:`~workstation_agent.mcp_host.permissions.grantable_permissions`, and
+    what is *allowed* is the gate. Keeping this function free of judgement is
+    what lets the UI call it for a plugin that is switched off without that
+    call implying the plugin can do anything at all.
+    """
+    return PluginDeclaration(
+        id=manifest.id,
+        name=manifest.name,
+        version=manifest.version,
+        declared_permissions=tuple(manifest.declared_permissions),
+        confirmable_conditions=tuple(manifest.confirmable_conditions),
+    )
+
+
 def _manifest_dict(manifest: PluginManifest) -> dict[str, Any]:
     """Serialise the manifest fields that are covered by the signature."""
     return {

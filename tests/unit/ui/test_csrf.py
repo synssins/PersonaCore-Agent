@@ -265,7 +265,11 @@ def test_the_loopback_guard_still_answers_first(tmp_path):
 #: Stand-ins for the path parameters on the parameterised routes. The values do
 #: not have to name anything real: the CSRF check runs before routing resolves
 #: them, which is the whole point of asserting on it here.
-_PATH_PARAMS = {"plugin_id": "some-plugin", "perm": "some-perm"}
+_PATH_PARAMS = {
+    "plugin_id": "some-plugin",
+    "perm": "some-perm",
+    "family": "some-family",
+}
 
 #: Matches ``{name}`` and ``{name:convertor}`` alike. Starlette lets a path
 #: parameter name a convertor -- ``{perm:path}``, which is how the permission
@@ -314,6 +318,10 @@ def test_the_route_sweep_actually_finds_the_routes(tmp_path):
     assert len(paths) >= 20
     assert ("POST", "/network-mcp/enrolled/remove") in paths
     assert ("POST", "/config") in paths
+    # The family-level permission routes: one click that writes several grants
+    # is exactly the kind of route a cross-origin page would most like to reach.
+    assert ("POST", "/plugins/some-plugin/grant-family/some-family") in paths
+    assert ("POST", "/plugins/some-plugin/revoke-family/some-family") in paths
     assert not any("{" in path for _, path in paths)
 
 

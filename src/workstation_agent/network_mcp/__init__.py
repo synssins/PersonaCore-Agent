@@ -43,8 +43,11 @@ from workstation_agent.network_mcp.tools import (
     SERVED_TOOLS,
     SERVED_TOOLS_BY_NAME,
     ServedTool,
+    internal_name_for_wire,
     served_tool_names,
+    tool_family,
     validate_tool_names,
+    wire_name,
 )
 
 __all__ = [
@@ -62,7 +65,10 @@ __all__ = [
     "endpoint_url",
     "ensure_certificate",
     "ensure_token",
+    "internal_name_for_wire",
     "served_tool_names",
+    "tool_family",
     "validate_json_body",
     "validate_tool_names",
+    "wire_name",
 ]

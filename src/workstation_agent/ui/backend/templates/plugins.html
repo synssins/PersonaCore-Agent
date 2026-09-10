@@ -90,27 +90,78 @@
   <p class="info">Nothing is allowed until you allow it here. A plugin can only be allowed
     to do what its own signed manifest declares, so this list is what it <em>can</em> ask
     for &mdash; not everything it might want.</p>
+  <p class="info">{{ notes.names }}</p>
+  <p class="info">{{ notes.family_scope }}</p>
 
   {% if perm_rows %}
     {% for row in perm_rows %}
-    <section>
+    <section id="plugin-{{ row.anchor }}">
       <h3>{{ row.name }} <small>({{ row.id }})</small></h3>
+
+      {% if not row.running %}
+      <p class="error">{{ row.absent_note }}</p>
+      <form method="post" action="/plugins/{{ row.id }}/enable" style="display:inline">
+        <button type="submit">Enable this plugin</button>
+      </form>
+      {% endif %}
 
       {% if row.permissions %}
       <table>
         <thead>
-          <tr><th>Tool</th><th>Now</th><th>Change</th></tr>
+          <tr><th>What it can do</th><th>Now</th><th>Change</th></tr>
         </thead>
         <tbody>
-        {% for perm in row.permissions %}
+        {% for fam in row.families %}
           <tr>
             <td>
-              {{ perm.label }}
+              <strong>{{ fam.title }}</strong> &mdash; <code>{{ fam.wire_label }}</code><br>
+              <small>{{ fam.tools | map(attribute='wire') | join(', ') }}</small>
+              {% if fam.undeclared_args %}
+              <br><small class="info">{{ fam.undeclared_args | join(', ') }}:
+                the plugin's signed manifest does not declare this tool's arguments,
+                so calls to it are refused even when it is allowed here.</small>
+              {% endif %}
+            </td>
+            <td>
+              {% if fam.state == 'all' %}
+                <strong>Allowed</strong>{% if fam.total > 1 %} &mdash; all {{ fam.total }}{% endif %}
+              {% elif fam.state == 'none' %}
+                Not allowed{% if fam.total > 1 %} &mdash; none of {{ fam.total }}{% endif %}
+              {% else %}
+                <strong>Partly allowed</strong> &mdash; {{ fam.granted_count }} of {{ fam.total }}.
+                Allowed: {{ fam.allowed_names | join(', ') }}.
+                Not allowed: {{ fam.missing_names | join(', ') }}.
+              {% endif %}
+            </td>
+            <td>
+              {% if row.running %}
+                {% if fam.state != 'all' %}
+                <form method="post" action="/plugins/{{ row.id }}/grant-family/{{ fam.key|urlencode }}" style="display:inline">
+                  <button type="submit">Allow{% if fam.total > 1 %} all {{ fam.total }}{% endif %}</button>
+                </form>
+                {% endif %}
+                {% if fam.state != 'none' %}
+                <form method="post" action="/plugins/{{ row.id }}/revoke-family/{{ fam.key|urlencode }}" style="display:inline">
+                  <button type="submit">Stop allowing{% if fam.total > 1 %} all{% endif %}</button>
+                </form>
+                {% endif %}
+              {% else %}
+                <span class="info">Enable this plugin first.</span>
+              {% endif %}
+            </td>
+          </tr>
+        {% endfor %}
+        {% for perm in row.ungrouped %}
+          <tr>
+            <td>
+              <strong>{{ perm.label }}</strong>
               {% if perm.note %}<br><small class="info">{{ perm.note }}</small>{% endif %}
             </td>
             <td>{% if perm.granted %}<strong>Allowed</strong>{% else %}Not allowed{% endif %}</td>
             <td>
-              {% if perm.granted %}
+              {% if not row.running %}
+                <span class="info">Enable this plugin first.</span>
+              {% elif perm.granted %}
               <form method="post" action="/plugins/{{ row.id }}/revoke/{{ perm.perm|urlencode }}" style="display:inline">
                 <button type="submit">Stop allowing</button>
               </form>
@@ -124,6 +175,45 @@
         {% endfor %}
         </tbody>
       </table>
+
+      <details{% if advanced %} open{% endif %}>
+        <summary>Advanced &mdash; one tool at a time</summary>
+        <table>
+          <thead>
+            <tr><th>Tool</th><th>Now</th><th>Change</th></tr>
+          </thead>
+          <tbody>
+          {% for perm in row.permissions %}
+            <tr>
+              <td>
+                <strong>{{ perm.label }}</strong>
+                {% if perm.internal %}
+                <br><small class="info">internal name <code>{{ perm.internal }}</code> &mdash;
+                  this is the spelling the audit log and refusal messages use.</small>
+                {% endif %}
+                {% if perm.note %}<br><small class="info">{{ perm.note }}</small>{% endif %}
+              </td>
+              <td>{% if perm.granted %}<strong>Allowed</strong>{% else %}Not allowed{% endif %}</td>
+              <td>
+                {% if not row.running %}
+                  <span class="info">Enable this plugin first.</span>
+                {% elif perm.granted %}
+                <form method="post" action="/plugins/{{ row.id }}/revoke/{{ perm.perm|urlencode }}" style="display:inline">
+                  <input type="hidden" name="advanced" value="1">
+                  <button type="submit">Stop allowing</button>
+                </form>
+                {% else %}
+                <form method="post" action="/plugins/{{ row.id }}/grant/{{ perm.perm|urlencode }}" style="display:inline">
+                  <input type="hidden" name="advanced" value="1">
+                  <button type="submit">Allow</button>
+                </form>
+                {% endif %}
+              </td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </details>
       {% else %}
         <p class="info">This plugin declares no tools in its signed manifest, so there is
           nothing it can be allowed to do. Every call to it is refused.</p>
@@ -134,9 +224,9 @@
         granted, but the plugin no longer declares it, so it has no effect &mdash; calls
         using it are refused whether it is here or not.</p>
       <ul>
-      {% for perm in row.stale %}
-        <li>{{ perm }}
-          <form method="post" action="/plugins/{{ row.id }}/revoke/{{ perm|urlencode }}" style="display:inline">
+      {% for s in row.stale %}
+        <li><strong>{{ s.label }}</strong> <small class="info">(<code>{{ s.perm }}</code>)</small>
+          <form method="post" action="/plugins/{{ row.id }}/revoke/{{ s.perm|urlencode }}" style="display:inline">
             <button type="submit">Remove</button>
           </form>
         </li>
