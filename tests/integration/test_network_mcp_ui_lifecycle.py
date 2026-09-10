@@ -25,6 +25,14 @@ from tests.unit.ui.conftest import FakeConfigStore, make_client
 from workstation_agent.registration_export import MANIFEST_ARCNAME, REGISTRATION_ZIP_NAME
 from workstation_agent.ui.backend.routers import network_mcp_routes
 
+# This file drives `_apply_endpoint`, which stops one real uvicorn server and
+# starts another in-process, so it is both a possible source and a possible
+# victim of sse_starlette's process-global shutdown latch. Which tests that
+# latch actually breaks is decided by collection order and by scheduling luck,
+# so the file opts in rather than waiting to be reordered into failing. See the
+# fixture's docstring in tests/integration/conftest.py.
+pytestmark = pytest.mark.usefixtures("sse_shutdown_latch_cleared")
+
 
 @pytest.fixture(autouse=True)
 def _isolated_appdata(tmp_path, monkeypatch):

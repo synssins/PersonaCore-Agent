@@ -41,6 +41,15 @@ from workstation_agent.network_mcp.server import (
     NetworkMCPServer as RealNetworkMCPServer,
 )
 
+# `test_a_real_endpoint_binds_and_stops_cleanly` stands up a real uvicorn server
+# on pytest's main-thread loop and stops it again, so this file is both a
+# possible source and a possible victim of sse_starlette's process-global
+# shutdown latch. Which tests that latch actually breaks is decided by collection
+# order and by scheduling luck, so the file opts in rather than waiting to be
+# reordered into failing. See the fixture's docstring in
+# tests/integration/conftest.py.
+pytestmark = pytest.mark.usefixtures("sse_shutdown_latch_cleared")
+
 
 def _fake_info(*, running: bool) -> network_mcp_server_mod.NetworkEndpointInfo:
     return network_mcp_server_mod.NetworkEndpointInfo(

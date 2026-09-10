@@ -246,6 +246,39 @@ class NetworkMCPServer:
 
         import uvicorn
 
+        # Defence in depth. This is NOT fixing a bug that is reachable today —
+        # please do not delete it as dead code, and do not read it as evidence of
+        # one. What it removes is a way for a *future* change somewhere else to
+        # break this endpoint invisibly.
+        #
+        # ``sse_starlette.sse.AppStatus.should_exit`` is a process-global class
+        # attribute that nothing ever resets. Once it is True, every
+        # ``EventSourceResponse`` in the process ends immediately after its
+        # headers — and the MCP SDK serves all three of its streamable-HTTP paths
+        # through one, so every tool call afterwards dies mid-chunked-body
+        # ("peer closed connection without sending complete message body").
+        # Enrolment would keep working, because ``/enrol/token`` is a plain
+        # response rather than SSE. The operator would see a pairing that
+        # succeeded and an endpoint that is silently useless.
+        #
+        # Why it cannot happen right now: sse_starlette latches that flag from a
+        # watcher that locates a uvicorn ``Server`` only by introspecting
+        # ``signal.getsignal(SIGTERM)``; uvicorn's ``capture_signals()`` installs
+        # nothing when it is not on the main thread; and the Agent runs its
+        # asyncio loop on the ``pc-agent-asyncio`` thread (``app.py``). The
+        # watcher's lookup therefore returns ``None`` and it can never observe a
+        # stopping server. Under pytest, where the loop *is* on the main thread,
+        # it observes one — which is how this was found.
+        #
+        # What would make it reachable: any change that serves a uvicorn server
+        # in this process from the main thread. The restart it would then poison
+        # already exists — ``ui/backend/routers/network_mcp_routes._apply_endpoint``
+        # does ``_stop_quietly(current)`` then ``_bring_up(...)`` every time the
+        # operator edits the bind addresses or the port. Clearing the flag here,
+        # before the app is built, means such a restart cannot inherit a stale
+        # one regardless of where the loop ends up living.
+        _clear_sse_shutdown_latch()
+
         self._token = ensure_token(self._state_dir)
         cert, outcome = self._open_listeners()
 
@@ -845,6 +878,40 @@ _REQUIRED_APP_KWARGS: Final = (
 
 #: Keyword arguments this module passes to ``Server(...)``.
 _REQUIRED_SERVER_KWARGS: Final = ("version", "instructions", "on_list_tools", "on_call_tool")
+
+
+def _clear_sse_shutdown_latch() -> None:
+    """Clear ``sse_starlette``'s process-global shutdown latch.
+
+    Called from :meth:`NetworkMCPServer.start` before the app is built. The long
+    comment at the call site says what the latch is, why nothing can currently
+    set it in this process, and what would change that; this function only has
+    to survive the day ``sse_starlette`` moves it.
+
+    A missing attribute is reported rather than swallowed. If the guard has
+    stopped applying, the next person to read a streaming response that ends
+    after its headers should be able to find out why from the log rather than
+    from first principles.
+    """
+    try:
+        from sse_starlette.sse import AppStatus
+    except ImportError:
+        log.warning(
+            "sse_starlette.sse.AppStatus is gone, so the network MCP endpoint "
+            "cannot clear the SSE shutdown latch on start. If streaming responses "
+            "begin ending immediately after their headers, start here.",
+        )
+        return
+
+    if not hasattr(AppStatus, "should_exit"):
+        log.warning(
+            "sse_starlette.sse.AppStatus has no 'should_exit', so the network MCP "
+            "endpoint cannot clear the SSE shutdown latch on start. If streaming "
+            "responses begin ending immediately after their headers, start here.",
+        )
+        return
+
+    AppStatus.should_exit = False
 
 
 def _require_mcp_api() -> None:
