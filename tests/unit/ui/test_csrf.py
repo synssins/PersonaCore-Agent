@@ -16,6 +16,7 @@ that makes this maintainable -- nobody has to remember.
 from __future__ import annotations
 
 import pytest
+from starlette.websockets import WebSocketDisconnect
 
 from tests.unit.ui.conftest import (
     TEST_ORIGIN,
@@ -374,6 +375,53 @@ def test_a_route_added_later_is_covered_without_being_told(tmp_path):
     legitimate = client.post("/a-route-nobody-thought-about")
     assert legitimate.status_code == 200
     assert legitimate.json() == {"ran": True}
+
+
+def test_a_websocket_route_added_later_is_covered_too(tmp_path):
+    """The exception the middleware choice would otherwise have hidden.
+
+    Starlette's HTTP middleware is only ever handed an ``http`` scope, so a
+    WebSocket route registered later would have slipped past this check *and*
+    past the loopback guard, and cross-site WebSocket hijacking is not subject
+    to the same-origin policy -- the browser opens it. This surface has no
+    WebSocket routes, so the upgrade is refused outright, which is the honest
+    answer today and a loud one for whoever adds a real one tomorrow.
+    """
+    ctx = BackendContext(config_store=FakeConfigStore(), log_dir=tmp_path / "logs")
+    app = create_app(ctx)
+    reached = []
+
+    @app.websocket("/a-socket-nobody-thought-about")
+    async def _new_socket(websocket) -> None:
+        reached.append(True)
+        await websocket.accept()
+
+    client = ui_test_client(_LoopbackASGI(app))
+
+    with (
+        pytest.raises(WebSocketDisconnect) as caught,
+        client.websocket_connect("/a-socket-nobody-thought-about"),
+    ):
+        pass
+
+    assert caught.value.code == 1008
+    assert reached == []  # the route never ran
+
+
+def test_lifespan_scopes_pass_through(tmp_path):
+    """Only http and websocket are judged; startup must not be swallowed."""
+    ctx = BackendContext(config_store=FakeConfigStore(), log_dir=tmp_path / "logs")
+    app = create_app(ctx)
+    started = []
+
+    @app.on_event("startup")
+    async def _startup() -> None:
+        started.append(True)
+
+    with ui_test_client(_LoopbackASGI(app)) as client:
+        assert client.get("/dashboard", follow_redirects=False).status_code == 200
+
+    assert started == [True]
 
 
 # ---------------------------------------------------------------------------

@@ -99,6 +99,35 @@ threaded through each form, so a route added later is covered the day it is
 added. There is nothing for the author of the next form to remember, which is
 the only kind of check that stays true.
 
+WebSockets
+----------
+
+:class:`SameOriginGuard` is raw ASGI rather than
+:func:`fastapi.FastAPI.middleware`-style HTTP middleware for one reason:
+Starlette's HTTP middleware is only ever handed ``scope["type"] == "http"``, so
+a WebSocket handshake would pass it without being seen at all. That is not an
+acceptable gap in a check whose whole justification is that the *next* route is
+covered without its author knowing this file exists. A WebSocket route added
+later would have been silently unprotected, and cross-site WebSocket hijacking
+is not subject to the same-origin policy: the browser opens the connection and
+hands the page a live, authenticated channel.
+
+**So the handshake is refused outright**, with close code 1008, the same answer
+and for the same reason as
+:class:`~workstation_agent.network_mcp.hardening.NetworkMCPHardening` gives on
+the endpoint. This surface has no WebSocket routes, so refusing every upgrade is
+exactly correct today, and it turns a gap nobody would predict into a refusal
+the next person meets on their first run. Origin-checking a handshake we have no
+use for would be answering a question that should not be asked yet: whoever adds
+a genuine WebSocket route here has to decide deliberately how it is
+authenticated, rather than inheriting whatever this file happened to do.
+
+Note also that the loopback guard in ``app.py`` is HTTP middleware and so has
+the same blind spot; refusing the upgrade here covers both.
+
+Anything that is neither ``http`` nor ``websocket`` -- ``lifespan``, in practice
+-- is passed through untouched.
+
 The network-MCP endpoint (``workstation_agent/network_mcp/``) is a different
 application with its own bearer-token authentication and its own threat model.
 It is not served by this app and nothing here touches it.
@@ -108,12 +137,13 @@ from __future__ import annotations
 
 import html
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
-from fastapi import Request, Response
+from fastapi import Response
+from starlette.datastructures import Headers
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Coroutine
+    from starlette.types import ASGIApp, Receive, Scope, Send
 
 log = logging.getLogger(__name__)
 
@@ -132,6 +162,13 @@ _LOOPBACK_HOSTNAMES: frozenset[str] = frozenset({"127.0.0.1", "localhost", "::1"
 #: loopback address, which is a different origin and, on a machine running a
 #: hostile local server, a different program.
 _SAME_ORIGIN: str = "same-origin"
+
+#: RFC 6455 close code 1008, "policy violation" -- the answer
+#: ``network_mcp/hardening.py`` already gives to an upgrade on a surface that
+#: has no WebSocket routes. There is no page to render into: a handshake that is
+#: never accepted has no body, so the wording that carries the HTTP refusals has
+#: nowhere to go and the close code is the whole message.
+_WEBSOCKET_POLICY_VIOLATION: int = 1008
 
 #: How much of an untrusted ``Host`` is echoed back into the refusal page. Long
 #: enough for any real name to be recognisable, short enough that the page stays
@@ -297,34 +334,59 @@ def refusal_response(message: str) -> Response:
     )
 
 
-async def same_origin_guard(
-    request: Request,
-    call_next: Callable[[Request], Coroutine[Any, Any, Response]],
-) -> Response:
-    """ASGI middleware: refuse any state-changing request that is not our own.
+class SameOriginGuard:
+    """ASGI middleware: refuse anything state-changing that is not our own.
 
     Registered in :func:`workstation_agent.ui.backend.app.create_app` over the
     whole application, so it covers every router already mounted and every route
-    added after it.
+    added after it -- ``http`` and ``websocket`` alike. See the module docstring
+    on why it is raw ASGI and not
+    :func:`fastapi.FastAPI.middleware`-decorated HTTP middleware.
+
+    A request that passes is handed to the wrapped app untouched: this
+    middleware neither wraps the response nor buffers the body, so an allowed
+    request behaves exactly as if the check were not here.
     """
-    message = refusal_for(
-        request.method,
-        request.url.scheme,
-        request.headers.get("host"),
-        request.headers.get("origin"),
-        request.headers.get("sec-fetch-site"),
-    )
-    if message is not None:
-        # The path is logged; the headers are not echoed into the log, only
-        # classified, so a hostile Origin cannot write arbitrary text into the
-        # operator's log file.
-        log.warning(
-            "Refused a cross-origin %s to %s (origin present=%s, "
-            "sec-fetch-site present=%s)",
-            request.method,
-            request.url.path,
-            request.headers.get("origin") is not None,
-            request.headers.get("sec-fetch-site") is not None,
+
+    def __init__(self, app: ASGIApp) -> None:
+        self._app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "websocket":
+            log.warning(
+                "Refused a WebSocket upgrade to %s: this surface has no "
+                "WebSocket routes",
+                scope.get("path"),
+            )
+            await send({"type": "websocket.close", "code": _WEBSOCKET_POLICY_VIOLATION})
+            return
+
+        if scope["type"] != "http":
+            # lifespan, and anything a future server invents.
+            await self._app(scope, receive, send)
+            return
+
+        headers = Headers(scope=scope)
+        message = refusal_for(
+            scope["method"],
+            scope.get("scheme", "http"),
+            headers.get("host"),
+            headers.get("origin"),
+            headers.get("sec-fetch-site"),
         )
-        return refusal_response(message)
-    return await call_next(request)
+        if message is not None:
+            # The path is logged; the headers are not echoed into the log, only
+            # classified, so a hostile Origin cannot write arbitrary text into
+            # the operator's log file.
+            log.warning(
+                "Refused a cross-origin %s to %s (origin present=%s, "
+                "sec-fetch-site present=%s)",
+                scope["method"],
+                scope.get("path"),
+                headers.get("origin") is not None,
+                headers.get("sec-fetch-site") is not None,
+            )
+            await refusal_response(message)(scope, receive, send)
+            return
+
+        await self._app(scope, receive, send)
