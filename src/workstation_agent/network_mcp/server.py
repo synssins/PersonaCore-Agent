@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import json
 import logging
 import ssl
@@ -145,6 +146,20 @@ class NetworkEndpointInfo:
 
     Non-empty alongside :attr:`running` is a partial bind. See :attr:`degraded`.
     """
+    stopped_reason: str | None = None
+    """Why the endpoint is **not** serving, when that is known.
+
+    Always ``None`` while :attr:`running`. It carries the error the serve task
+    ended with — a lifespan that failed after startup, an error out of uvicorn —
+    which is the one thing the operator could not find out for themselves: the
+    stored setting still says "enabled", and nothing else on the machine
+    distinguishes "switched off" from "switched on and dead".
+
+    Deliberately *not* folded into :attr:`degraded` or :attr:`bind_failures`.
+    Those two are the partial-bind case — serving, but not everywhere — and
+    they mean nothing when the answer is that the endpoint is not serving at
+    all.
+    """
     degraded: bool = False
     """Serving, but not on every address the operator chose.
 
@@ -195,6 +210,11 @@ class NetworkMCPServer:
         self._sockets: tuple[socket.socket, ...] = ()
         self._bound: tuple[BoundAddress, ...] = ()
         self._bind_failures: tuple[BindFailure, ...] = ()
+        #: Why serving ended, when serving ended by itself. Set by
+        #: :meth:`_serve_ended` and surfaced as
+        #: :attr:`NetworkEndpointInfo.stopped_reason`, so a page that has to say
+        #: "enabled, but not serving" can say why rather than only that.
+        self._serve_error: str | None = None
         #: The enrolment window and the receiver for the token PersonaCore
         #: pushes into it. Built here rather than in :meth:`_build_app` so a Join
         #: is not silently dropped by a stop/start, and held only in memory so
@@ -279,6 +299,10 @@ class NetworkMCPServer:
         # one regardless of where the loop ends up living.
         _clear_sse_shutdown_latch()
 
+        # Whatever went wrong last time is last time's news; this attempt gets
+        # to report its own outcome.
+        self._serve_error = None
+
         self._token = ensure_token(self._state_dir)
         cert, outcome = self._open_listeners()
 
@@ -296,6 +320,13 @@ class NetworkMCPServer:
             self._uvicorn = server
             self._task = asyncio.create_task(
                 _guarded_serve(server, list(outcome.sockets)), name="network-mcp-serve",
+            )
+            # The socket's lifetime is now tied to the task's, and to nothing
+            # else. Registered in the same breath as the task is created --
+            # there is no await in between, so the task cannot finish before
+            # something is watching it. See :meth:`_serve_ended`.
+            self._task.add_done_callback(
+                functools.partial(self._serve_ended, outcome.sockets),
             )
         except BaseException:
             self._release_sockets()
@@ -410,27 +441,93 @@ class NetworkMCPServer:
         next start would then fail on an address the operator can see nothing
         wrong with.
         """
-        # First, before anything can await: an endpoint that is on its way down
-        # must not be handed a Join. Passing ``self`` means a stop() racing a
-        # start() cannot unregister the endpoint that has just replaced it.
-        from workstation_agent.network_mcp.join import unregister_endpoint
+        # ``finally``, and not merely "last": every statement above it can
+        # raise -- an unregister that meets a broken registry, a ``should_exit``
+        # on an object that is not the uvicorn server we think it is, an
+        # ``await`` that is cancelled from outside -- and the caller that
+        # matters most here is ``ui...network_mcp_routes._stop_quietly``, which
+        # swallows whatever comes out. A release reachable only along the happy
+        # path would therefore leak a listening socket in complete silence,
+        # which is the one failure the operator has no way at all to see.
+        try:
+            # First, before anything can await: an endpoint that is on its way
+            # down must not be handed a Join. Passing ``self`` means a stop()
+            # racing a start() cannot unregister the endpoint that has just
+            # replaced it.
+            from workstation_agent.network_mcp.join import unregister_endpoint
 
-        unregister_endpoint(self)
+            unregister_endpoint(self)
 
-        server, task = self._uvicorn, self._task
-        self._uvicorn = self._task = None
-        if server is not None:
-            server.should_exit = True
-        if task is not None and not task.done():
-            with contextlib.suppress(asyncio.TimeoutError, asyncio.CancelledError, Exception):
-                await asyncio.wait_for(asyncio.shield(task), timeout=5.0)
-            if not task.done():  # pragma: no cover — uvicorn normally exits
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await task
-        self._release_sockets()
-        self._bound = ()
+            server, task = self._uvicorn, self._task
+            self._uvicorn = self._task = None
+            if server is not None:
+                server.should_exit = True
+            if task is not None and not task.done():
+                with contextlib.suppress(
+                    asyncio.TimeoutError, asyncio.CancelledError, Exception,
+                ):
+                    await asyncio.wait_for(asyncio.shield(task), timeout=5.0)
+                if not task.done():  # pragma: no cover — uvicorn normally exits
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await task
+        finally:
+            self._release_sockets()
+            self._bound = ()
         log.info("network MCP endpoint stopped")
+
+    def _serve_ended(
+        self, sockets: tuple[socket.socket, ...], task: asyncio.Task[None],
+    ) -> None:
+        """Release *sockets* the moment the task serving them ends, however it ends.
+
+        ``running`` is ``self._task is not None and not self._task.done()``, so
+        the instant this callback runs the endpoint already reports that it is
+        not serving. Without it, that is the *only* thing that changes: the
+        sockets stay bound, held by a process with nothing behind them, and
+        every route the operator has out of that state is blocked --
+
+        * the page says "Enabled", because enabled is a stored setting and the
+          setting did not change;
+        * Join refuses with "the endpoint is not running", because that is a
+          fact about now and it is true;
+        * switching the endpoint off releases nothing, because the router only
+          stops an endpoint it believes to be running;
+        * switching it back on fails with the port in use, naming a port that
+          was free minutes earlier and that nothing outside this process is
+          holding.
+
+        The owner met all four of those in one evening. Binding the socket's
+        lifetime to the task's is what makes them unreachable: this closes
+        exactly the sockets *this* task was handed, so it is correct no matter
+        how many times the endpoint has since been restarted and no matter
+        which incarnation ``self._sockets`` currently refers to.
+
+        It also reports *why* serving ended, which is the other half of what
+        the operator was denied: ``stopped_reason`` is what the page shows when
+        it has to say "enabled, but not serving".
+        """
+        if self._sockets is sockets:
+            self._sockets = ()
+            self._bound = ()
+        try:
+            close_listeners(sockets)
+        except BaseException:
+            log.exception("network MCP endpoint could not release a listening socket")
+
+        if task.cancelled():
+            self._serve_error = None
+            return
+        exc = task.exception()
+        if exc is None:
+            self._serve_error = None
+            return
+        # Retrieved here as well as recorded, so asyncio does not later report
+        # it as "exception was never retrieved" with no context attached.
+        self._serve_error = str(exc) or type(exc).__name__
+        log.error(
+            "network MCP endpoint stopped serving unexpectedly: %s", exc, exc_info=exc,
+        )
 
     def _release_sockets(self) -> None:
         """Close every listening socket this endpoint opened. Idempotent."""
@@ -501,6 +598,7 @@ class NetworkMCPServer:
             bind_hosts=hosts,
             bind_failures=self._bind_failures if running else (),
             degraded=bool(running and self._bind_failures),
+            stopped_reason=None if running else self._serve_error,
         )
 
     def rotate_token(self) -> str:

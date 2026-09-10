@@ -601,8 +601,14 @@ def test_an_address_the_picker_did_offer_is_not_refused(tmp_path, monkeypatch):
 
 
 def join_form(text: str) -> str:
-    """Just the Join form, so the bind-address controls above cannot match."""
-    _, _, after = text.partition('action="/network-mcp/join"')
+    """Just the Join form, so the bind-address controls above cannot match.
+
+    The fragment is part of the action, not decoration: it is what puts the
+    answer to a Join on screen instead of hundreds of lines below the fold.
+    Matched here so that dropping it breaks this helper loudly rather than
+    quietly reintroducing the defect.
+    """
+    _, _, after = text.partition('action="/network-mcp/join#nm-join"')
     form, _, _ = after.partition("</form>")
     return form
 

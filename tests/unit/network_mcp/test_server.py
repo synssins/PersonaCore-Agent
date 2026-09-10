@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import socket
 
 import pytest
 from pydantic import ValidationError
@@ -409,3 +410,140 @@ async def test_stop_does_not_hang_when_a_client_holds_a_connection(tmp_path):
         with contextlib.suppress(ConnectionError, OSError, asyncio.TimeoutError):
             await asyncio.wait_for(writer.wait_closed(), timeout=2)
     assert srv.running is False
+
+
+# ---------------------------------------------------------------------------
+# P24 defect A -- a listening socket must never outlive the thing serving on it
+#
+# The owner hit this on a shipped build: the page said "Enabled", Join refused
+# with "the endpoint is not running", switching it off released nothing, and
+# switching it back on reported a port in use that had been free minutes
+# earlier. Every one of those is the same fact -- a socket this process opened
+# and nobody was serving on -- seen from a different angle.
+#
+# These assert on whether the port can actually be bound by a *second* socket,
+# never on what the endpoint says about itself: the whole defect was an object
+# whose state disagreed with reality.
+# ---------------------------------------------------------------------------
+
+
+def port_is_free(host: str, port: int) -> bool:
+    """True if a fresh socket can bind *host*:*port* right now.
+
+    ``SO_REUSEADDR`` is deliberately not set, for the same reason
+    ``listeners._bind_one`` does not set it on Windows: with it, this would
+    answer "free" for a port another socket in this very process is still
+    listening on, which is precisely the state under test.
+    """
+    probe = socket.socket()
+    try:
+        probe.bind((host, port))
+    except OSError:
+        return False
+    finally:
+        probe.close()
+    return True
+
+
+async def end_the_serve_task(srv) -> None:
+    """End the serve task from outside, the way it would end by itself.
+
+    A lifespan that fails after startup, an error escaping uvicorn, a
+    cancellation from the loop shutting down: the endpoint cannot tell them
+    apart and must not need to. All that is true afterwards is that the task is
+    over and nothing is serving -- and that is the whole precondition of the
+    defect. The trailing yield lets the task's done callbacks run, which is
+    what a real serve task ending mid-loop would also get.
+    """
+    task = srv._task
+    assert task is not None, "nothing was serving to begin with"
+    task.cancel()
+    with contextlib.suppress(BaseException):
+        await task
+    await asyncio.sleep(0)
+
+
+async def test_a_serve_task_that_dies_releases_every_socket_it_was_serving(tmp_path):
+    """Nothing is serving, so nothing may still be listening.
+
+    ``running`` going False while the port stays bound is the state the owner
+    was in when the page said "Enabled" and Join said "not running".
+    """
+    srv, _ = server(lambda *_: text_result("{}"), tmp_path)
+    info = await srv.start()
+    try:
+        assert not port_is_free("127.0.0.1", info.port)
+
+        # However the serve task ends -- a lifespan that later fails, an
+        # unhandled error inside uvicorn, a cancellation -- it ends.
+        await end_the_serve_task(srv)
+
+        assert srv.running is False
+        assert port_is_free("127.0.0.1", info.port)
+    finally:
+        await srv.stop()
+
+
+async def test_the_port_is_reusable_after_the_serve_task_dies(tmp_path):
+    """The owner's step 5, made unnecessary: a second endpoint binds the port.
+
+    He had to change the port to get going again. Nothing was holding the old
+    one except this process, and after the task died nothing was serving on it.
+    """
+    srv, _ = server(lambda *_: text_result("{}"), tmp_path)
+    info = await srv.start()
+    await end_the_serve_task(srv)
+
+    cfg = NetworkMcpConfig(bind_host="127.0.0.1", port=info.port)
+    second = NetworkMCPServer(cfg, mcp_host=None, state_dir=tmp_path)
+    try:
+        again = await second.start()
+        assert again.port == info.port
+        assert second.running is True
+    finally:
+        await second.stop()
+        await srv.stop()
+
+
+async def test_stop_releases_the_sockets_even_when_the_teardown_raises(tmp_path, monkeypatch):
+    """A stop that fails partway must still not strand a listener.
+
+    ``_stop_quietly`` in the UI router swallows the exception, so a release
+    that happened only on the happy path would leak in silence -- which is the
+    one failure mode the operator has no way at all to see.
+    """
+    from workstation_agent.network_mcp import join as join_mod
+
+    srv, _ = server(lambda *_: text_result("{}"), tmp_path)
+    info = await srv.start()
+
+    def explode(_endpoint=None):
+        msg = "the join registry is unavailable"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(join_mod, "unregister_endpoint", explode)
+    with pytest.raises(RuntimeError, match="join registry"):
+        await srv.stop()
+
+    assert port_is_free("127.0.0.1", info.port)
+
+
+async def test_a_partial_bind_releases_every_socket_when_serving_ends(tmp_path):
+    """Several sockets are open at once; a leak on one of them is invisible.
+
+    Two loopback spellings of the same machine, one port. Both bind, both are
+    in ``_sockets``, and the death of the one serve task behind them has to
+    release both -- a release that reached only the first would leave a port
+    half-held, which is harder to see than the single-address case the owner
+    already could not diagnose.
+    """
+    srv, _ = server(lambda *_: text_result("{}"), tmp_path, bind_hosts=("127.0.0.1",))
+    info = await srv.start()
+    try:
+        assert len(srv._sockets) == len(info.urls)
+        await end_the_serve_task(srv)
+
+        assert srv._sockets == ()
+        assert port_is_free("127.0.0.1", info.port)
+    finally:
+        await srv.stop()

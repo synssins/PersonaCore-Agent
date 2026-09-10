@@ -14,6 +14,7 @@ would notice.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import socket
 import ssl
@@ -215,3 +216,166 @@ def test_the_real_certificates_san_is_checked_against_the_real_bind_host(tmp_pat
         resp = client.post("/network-mcp/settings", data=_form(port))
         assert "127.0.0.1" in ctx.network_mcp.info().certificate_sans
         assert "does not cover" not in resp.text
+
+
+# ---------------------------------------------------------------------------
+# P24 -- the owner's own sequence, against real sockets
+#
+# What he did, in order: the box was ticked; Join refused with "the endpoint is
+# not running"; he switched it off; he switched it back on and was told the
+# port was in use, "which it was not before"; he changed the port and it worked
+# immediately.
+#
+# Every assertion below is on whether the port can actually be bound, never on
+# what the endpoint object reports -- the defect was an object whose state
+# disagreed with reality, so asking it would prove nothing.
+# ---------------------------------------------------------------------------
+
+
+def _port_is_free(host: str, port: int) -> bool:
+    probe = socket.socket()
+    try:
+        probe.bind((host, port))
+    except OSError:
+        return False
+    finally:
+        probe.close()
+    return True
+
+
+def _on_the_agents_loop(client, fn, *args):
+    """Run *fn* on the loop the endpoint is actually serving on.
+
+    ``TestClient.portal`` is only non-None while the client is entered as a
+    context manager, which ``_live_client`` guarantees and this asserts rather
+    than assumes: a portal that had quietly gone away would run the coroutine
+    on some other loop, where the task under test does not exist.
+    """
+    portal = client.portal
+    assert portal is not None, "the test client is not holding a portal"
+    return portal.call(fn, *args)
+
+
+async def _kill_the_serve_task(server) -> None:
+    """End the serve task from outside, the way an unhandled error would.
+
+    A lifespan that fails after startup, an error escaping uvicorn, a
+    cancellation: the endpoint cannot tell them apart and must not need to. All
+    that matters is that the task is over and nothing is serving.
+    """
+    task = server._task
+    task.cancel()
+    with contextlib.suppress(BaseException):
+        await task
+    await asyncio.sleep(0)
+
+
+def test_enable_disable_enable_on_one_port_succeeds(tmp_path):
+    """Steps 3 to 5 with nothing else wrong: the port has to come back."""
+    port = _free_port()
+    with _live_client(tmp_path) as (client, ctx):
+        client.post("/network-mcp/settings", data=_form(port))
+        assert _tls_handshakes("127.0.0.1", port)
+
+        client.post("/network-mcp/settings", data=_form(port, enabled=False))
+        assert _port_is_free("127.0.0.1", port)
+
+        resp = client.post("/network-mcp/settings", data=_form(port))
+
+        assert "could not start" not in resp.text.lower()
+        assert ctx.network_mcp.running is True
+        assert _tls_handshakes("127.0.0.1", port)
+
+
+def test_a_dead_serve_task_does_not_keep_the_port(tmp_path):
+    """Step 2: the box says Enabled, Join says not running, nothing is serving.
+
+    Whatever is true of the configuration, a port this process is holding with
+    nothing behind it is a lie the operator cannot see and cannot clear.
+    """
+    port = _free_port()
+    with _live_client(tmp_path) as (client, ctx):
+        client.post("/network-mcp/settings", data=_form(port))
+        server = ctx.network_mcp
+        assert server.running is True
+
+        _on_the_agents_loop(client, _kill_the_serve_task, server)
+
+        assert server.running is False
+        assert _port_is_free("127.0.0.1", port)
+
+
+def test_the_owners_whole_sequence_on_one_port(tmp_path):
+    """Enabled, serving stops underneath it, off, on again -- on the same port.
+
+    This is the failure as it reached him, and the disable in the middle is the
+    one that changes the bind set, because a ``<select multiple>`` posts in
+    document order rather than the order the addresses were saved in: an
+    ordinary save can therefore count as a rebind, and a rebind while the
+    endpoint is not running is what published a fresh endpoint object over one
+    that was still holding the socket.
+    """
+    port, elsewhere = _free_port(), _free_port()
+    with _live_client(tmp_path) as (client, ctx):
+        client.post("/network-mcp/settings", data=_form(port))
+        server = ctx.network_mcp
+        _on_the_agents_loop(client, _kill_the_serve_task, server)
+        assert server.running is False
+
+        # Switch it off. Whatever else this does, it must not leave a socket
+        # behind that no object in the process can reach any more.
+        client.post("/network-mcp/settings", data=_form(elsewhere, enabled=False))
+        assert _port_is_free("127.0.0.1", port)
+
+        # Switch it back on, on the port he started with.
+        resp = client.post("/network-mcp/settings", data=_form(port))
+
+        assert "already listening on this address" not in resp.text
+        assert "could not start" not in resp.text.lower()
+        assert ctx.network_mcp.running is True
+        assert _tls_handshakes("127.0.0.1", port)
+
+
+def test_switching_off_releases_the_port_even_when_serving_already_stopped(tmp_path):
+    """Step 3 on its own. "Off" means nothing is listening, unconditionally."""
+    port = _free_port()
+    with _live_client(tmp_path) as (client, ctx):
+        client.post("/network-mcp/settings", data=_form(port))
+        _on_the_agents_loop(client, _kill_the_serve_task, ctx.network_mcp)
+
+        client.post("/network-mcp/settings", data=_form(port, enabled=False))
+
+        assert _port_is_free("127.0.0.1", port)
+
+
+def test_replacing_the_live_endpoint_never_strands_its_listening_socket(tmp_path):
+    """The other half of defect A, isolated from the first half.
+
+    ``ctx.network_mcp`` is the only reference this process keeps to an
+    endpoint. Overwrite it while the outgoing object still owns a bound socket
+    and that socket is unreachable forever: no object holds it, nothing will
+    close it, and the port stays taken for the life of the Agent by something
+    that appears in no port listing the operator would think to run.
+
+    Staged without touching the serve task, so this fails for its own reason
+    rather than for the dead-task one: detaching ``_task`` leaves uvicorn
+    serving and the socket bound while ``running`` reports False -- which is
+    exactly the disagreement between an object and reality that the whole
+    defect consists of, and exactly the report the router used to decide
+    whether to bother stopping it.
+    """
+    port, elsewhere = _free_port(), _free_port()
+    with _live_client(tmp_path) as (client, ctx):
+        client.post("/network-mcp/settings", data=_form(port))
+        stranded = ctx.network_mcp
+        assert not _port_is_free("127.0.0.1", port)
+
+        stranded._task = None
+        assert stranded.running is False
+
+        # A disable that also changes the port: `rebind` is true, so the router
+        # publishes a fresh endpoint over the one still holding the socket.
+        client.post("/network-mcp/settings", data=_form(elsewhere, enabled=False))
+
+        assert ctx.network_mcp is not stranded, "the premise -- the object was replaced"
+        assert _port_is_free("127.0.0.1", port)
