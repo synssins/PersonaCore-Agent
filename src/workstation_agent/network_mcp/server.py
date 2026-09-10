@@ -807,7 +807,7 @@ class NetworkMCPServer:
             _ctx: Any, params: types.CallToolRequestParams,
         ) -> types.CallToolResult:
             envelope = await self._invoke(params.name, dict(params.arguments or {}))
-            text = json.dumps(envelope, ensure_ascii=False, default=str)
+            text = _render(params.name, envelope)
             return types.CallToolResult.model_validate({
                 "content": [{"type": "text", "text": self._scrub(text)}],
                 # §5.2: a denied or unconfirmed call is a normal result carrying
@@ -1107,6 +1107,345 @@ async def _guarded_serve(server: Any, sockets: list[socket.socket]) -> None:
 def _fail(code: str, reason: str) -> dict[str, Any]:
     """A §5.2 failure envelope."""
     return {"ok": False, "code": code, "reason": reason}
+
+
+# ---------------------------------------------------------------------------
+# The leading summary (survives the core's truncation)
+# ---------------------------------------------------------------------------
+#
+# The core spills a long tool result to a workspace file and shows the model
+# only the **first `long_item_chars`** characters — default 8,000, owner
+# configurable, and observed as low as 1,000 — plus a line saying where it was
+# saved. The model is not told to open the file, so whatever fell off the front
+# is, for practical purposes, gone.
+#
+# Our results are one text block holding a JSON envelope. `devices_list` costs
+# ~199 characters per enumerated USB device (each row carries a full ISO
+# `present_since` and a `port` path, which §6.1 requires and we therefore keep),
+# so roughly 40 entries clears 8,000 — and a hub plus its populated ports
+# reaches that on an ordinary desk. `shell_run` is unbounded: its payload is
+# whatever the command printed.
+#
+# So each of those two results gets a short `summary` string that answers the
+# question the tool is usually called for, **placed first in the envelope** so
+# it is inside even a 1,000-character window. The payload is untouched: the
+# summary is added, never substituted, and a caller reading the whole block
+# loses nothing. §6.1 settles the contract question — "Unknown extra keys are
+# allowed and ignored" — so no contract change is needed for this.
+#
+# The first-position property is the whole point and it would regress silently
+# the first time somebody reorders a dict, so it is pinned by tests that assert
+# on character offsets in the serialised text, not on key presence.
+
+#: Room the summary is allowed. Small on purpose: the budget it is competing
+#: for is the same 1,000 characters that would otherwise hold real payload.
+MAX_SUMMARY_CHARS: Final = 400
+
+#: Lines of tail output quoted in a `shell_run` summary, and the room each gets.
+_SUMMARY_TAIL_LINES: Final = 3
+_SUMMARY_TAIL_LINE_CHARS: Final = 110
+
+#: Room one device name gets in the summary's "Named:" list.
+_SUMMARY_NAME_CHARS: Final = 40
+
+
+def _clip(text: str, limit: int) -> str:
+    """``text`` shortened to ``limit`` characters, with an elision marker."""
+    text = " ".join(text.split())
+    if len(text) <= limit:
+        return text
+    return text[: max(limit - 1, 0)].rstrip() + "…"
+
+
+def _tail_lines(text: str) -> str:
+    """The **last** few non-blank lines of ``text``, joined onto one line.
+
+    Last rather than first, deliberately. A command's verdict is at the end —
+    the value printed, the summary row, the exception type — while the start is
+    banners, progress and column headings. That holds for a failure too: a
+    PowerShell error record and a Python traceback both put the message last.
+    """
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return ""
+    kept = [_clip(line, _SUMMARY_TAIL_LINE_CHARS) for line in lines[-_SUMMARY_TAIL_LINES:]]
+    return " | ".join(kept)
+
+
+def _count_lines(text: str) -> int:
+    """Lines in ``text``, counting a final unterminated line."""
+    return text.count("\n") + (1 if text and not text.endswith("\n") else 0)
+
+
+#: Windows enumeration labels, not names of things anyone plugged in. A group
+#: whose only names are these is counted, never listed: "USB Input Device" tells
+#: the reader nothing that "1 unnamed" does not.
+_GENERIC_USB_NAMES: Final = (
+    "root hub",
+    "generic usb",
+    "composite device",
+    "usb input device",
+    "hid-compliant",
+    "hid keyboard",
+    "hid mouse",
+    "usb mass storage",
+    "usb attached scsi",
+    "unknown device",
+    "standard usb",
+    "usb device",
+)
+
+
+def _is_hub(name: str) -> bool:
+    """Whether a USB entry is enumeration structure rather than a peripheral.
+
+    Substring, not exact match, because hubs enumerate under many spellings.
+    This does misfile a peripheral whose product name contains "hub" — a
+    USB-C dock sold as a hub — but such a thing generally *is* a hub, so the
+    count it lands in is the honest one.
+    """
+    return "hub" in name.lower()
+
+
+def _is_generic(name: str) -> bool:
+    """Whether ``name`` is a Windows enumeration label rather than a product."""
+    lowered = name.lower()
+    return not lowered or any(marker in lowered for marker in _GENERIC_USB_NAMES)
+
+
+def _group_usb(usb: list[Any]) -> tuple[list[tuple[str, int]], int, int, int]:
+    """Collapse enumeration entries into distinct devices.
+
+    One physical device enumerates three or four times — a webcam shows up
+    under MEDIA, Image, USB and HIDClass; a composite peripheral shows up once
+    per interface — so a summary that reports the entry count reports the
+    enumeration noise, not the answer. On a populated desktop the entry count
+    runs to several dozen while the number of things the owner would name is
+    under ten, and that ratio is the whole reason this function exists.
+
+    **Grouping key: ``vid``/``pid`` when both are present, otherwise the
+    lowercased name.** The vid/pid pair is the strong key — every interface of
+    one composite device carries the same pair, which is exactly the collapse
+    wanted. The name is the weak fallback for entries that have no pair at all
+    (root hubs, mostly).
+
+    **Where this is wrong, and it will be sometimes:** two identical peripherals
+    of the same model — two of the same mouse, two of the same capture card —
+    share a vid/pid and collapse into one entry here. The summary therefore says
+    "distinct devices", not "physical devices", and the payload keeps every row
+    so a reader who needs the true count can still get it. The name fallback is
+    weaker again: two different products that Windows labels identically merge.
+    Neither error can lose data, because nothing is removed from the payload.
+
+    Returns ``(named, unnamed_count, hub_entries, total_entries)`` where
+    ``named`` is ``(display name, entries in that group)`` ordered by how many
+    entries the group spans, then by name.
+    """
+    groups: dict[str, list[str]] = {}
+    hub_entries = 0
+    total = 0
+    for row in usb:
+        if not isinstance(row, dict):
+            continue
+        total += 1
+        name = str(row.get("name") or "")
+        if _is_hub(name):
+            # Hubs are structure. Counting them keeps the arithmetic honest
+            # without spending summary characters on things nobody plugged in.
+            hub_entries += 1
+            continue
+        vid, pid = row.get("vid"), row.get("pid")
+        key = f"{vid}:{pid}" if vid and pid else f"name:{name.lower()}"
+        groups.setdefault(key, []).append(name)
+
+    named: list[tuple[str, int]] = []
+    unnamed = 0
+    for names in groups.values():
+        # The most specific label in the group wins: a webcam that enumerates as
+        # "USB Input Device" three times and under its product name once should
+        # be listed under the product name.
+        specific = [n for n in names if not _is_generic(n)]
+        if specific:
+            named.append((max(specific, key=len), len(names)))
+        else:
+            unnamed += 1
+    named.sort(key=lambda item: (-item[1], item[0]))
+    return named, unnamed, hub_entries, total
+
+
+def _summarise_devices(envelope: dict[str, Any]) -> str:
+    """A short answer to "what is plugged into this machine?".
+
+    Leads with the honest arithmetic — distinct devices, unnamed, hub entries,
+    total entries — and then the recognisable names, which are what the question
+    was actually about. The per-entry rows are untouched in the payload behind
+    it.
+
+    **It does not name the machine**, deliberately. The core routed this call to
+    one workstation and already knows which one answered, so asserting an
+    identity here adds a claim nobody asked for. Worse, the only identity
+    reachable from this module is the OS hostname, which is not necessarily the
+    display name the owner typed at Join — and one machine under two names, in
+    the one field guaranteed to survive truncation, is exactly the defect this
+    project already spent an evening on with ``shell_run`` versus ``shell.run``.
+    If identity in a result is wanted later it should come from the *enrolled*
+    identity, as a deliberate change rather than a byproduct of this field.
+    """
+    usb = envelope.get("usb")
+    adb = envelope.get("adb")
+    com = envelope.get("com")
+    if not isinstance(usb, list) or not isinstance(adb, list) or not isinstance(com, list):
+        return ""
+
+    named, unnamed, hubs, total = _group_usb(usb)
+    head = (
+        f"USB: {total} entries = {len(named)} named devices, "
+        f"{unnamed} unnamed, {hubs} hub entries. ADB {len(adb)}, COM {len(com)}."
+    )
+
+    # The tails are built before the name list so the name list can be given
+    # whatever budget is left rather than crowding them out.
+    tails: list[str] = []
+    ports = [str(row.get("port")) for row in com if isinstance(row, dict) and row.get("port")]
+    if ports:
+        tails.append("COM: " + ", ".join(ports) + ".")
+    phones = [
+        f"{row.get('serial')} ({row.get('state')})"
+        for row in adb
+        if isinstance(row, dict) and row.get("serial")
+    ]
+    if phones:
+        tails.append("ADB: " + ", ".join(phones) + ".")
+    notes = envelope.get("notes")
+    if isinstance(notes, list) and notes:
+        # A degraded answer must look degraded even to a reader who sees only
+        # the summary, or they will report "nothing is plugged in" when the
+        # truth is "the enumerator fell over".
+        tails.append(f"Incomplete: {len(notes)} source(s) could not be enumerated.")
+    tail = " ".join(tails)
+
+    budget = MAX_SUMMARY_CHARS - len(head) - len(tail) - 2
+    listed: list[str] = []
+    for name, _entries in named:
+        candidate = _clip(name, _SUMMARY_NAME_CHARS)
+        # Room for this name plus a worst-case "(+NN more)." after it.
+        spent = len(", ".join([*listed, candidate])) + len(f" (+{len(named)} more).") + 7
+        if spent > budget:
+            break
+        listed.append(candidate)
+
+    parts = [head]
+    if listed:
+        more = len(named) - len(listed)
+        rendered = ", ".join(listed) + (f" (+{more} more)" if more else "")
+        parts.append(f"Named: {rendered}.")
+    if tail:
+        parts.append(tail)
+    return " ".join(parts)
+
+
+def _summarise_shell(envelope: dict[str, Any]) -> str:
+    """One line answering "did the command work, and what did it say?".
+
+    Names no machine, for the reason given in :func:`_summarise_devices`.
+    """
+    if envelope.get("job_id") and envelope.get("state") == "running":
+        # §5.4: outlived its wait. The verdict does not exist yet, so the
+        # summary says how to get it rather than pretending to have it.
+        output = envelope.get("output")
+        output = output if isinstance(output, str) else ""
+        head = (
+            f"Still running as job {envelope.get('job_id')}, "
+            f"{envelope.get('output_bytes', len(output))} bytes so far. "
+            f"Use jobs_wait for the exit code."
+        )
+        tail = _tail_lines(output)
+        return f"{head} Last output: {tail}" if tail else head
+
+    stdout = envelope.get("stdout")
+    stderr = envelope.get("stderr")
+    if not isinstance(stdout, str) or not isinstance(stderr, str):
+        return ""
+
+    code = envelope.get("exit_code")
+    verdict = "succeeded" if code == 0 else "FAILED"
+    head = (
+        f"exit {code} ({verdict}) in {envelope.get('duration_s', '?')}s. "
+        f"stdout {_count_lines(stdout)} lines/{len(stdout)} chars, "
+        f"stderr {_count_lines(stderr)} lines/{len(stderr)} chars."
+    )
+
+    # On a failure the message is in stderr when there is one; on a success the
+    # answer is in stdout. Either way it is the tail that carries it.
+    if code != 0 and stderr.strip():
+        tail, label = _tail_lines(stderr), "Last stderr"
+    elif stdout.strip():
+        tail, label = _tail_lines(stdout), "Last stdout"
+    else:
+        tail, label = _tail_lines(stderr), "Last stderr"
+    return f"{head} {label}: {tail}" if tail else head
+
+
+#: Wire tool name → summariser. Only the two families whose results actually
+#: outgrow the window are listed; every other tool's envelope is unchanged.
+_SUMMARISERS: Final[dict[str, Any]] = {
+    "devices_list": _summarise_devices,
+    "shell_run": _summarise_shell,
+}
+
+
+def _with_summary(name: str, envelope: dict[str, Any]) -> dict[str, Any]:
+    """``envelope`` with a leading ``summary``, when this tool has one.
+
+    **The summary must be first.** ``json.dumps`` preserves insertion order, so
+    building the dict summary-first is what puts it inside the core's window.
+    ``{"summary": …, **envelope}`` also hoists a summary a plugin supplied
+    itself to the front while leaving that plugin's wording alone: on a
+    duplicate key a dict literal keeps the first position and the last value.
+
+    A failure envelope gets none — ``{"ok": false, "code": …, "reason": …}`` is
+    already short and already answers itself. Note that a command that ran and
+    exited non-zero is ``ok: true``; its failure is summarised.
+    """
+    if not envelope.get("ok"):
+        return envelope
+    builder = _SUMMARISERS.get(name)
+    if builder is None:
+        return envelope
+    if "summary" in envelope:
+        return {"summary": envelope["summary"], **envelope}
+    try:
+        summary = builder(envelope)
+    except Exception:
+        # Deliberately broad. A summary is a convenience laid over a result the
+        # caller has already earned; a bug in one must never turn a working tool
+        # call into a failure, so the envelope goes out unsummarised instead.
+        log.exception("network MCP could not summarise a %s result", name)
+        return envelope
+    if not summary:
+        return envelope
+    return {"summary": _clip(summary, MAX_SUMMARY_CHARS), **envelope}
+
+
+def _render(name: str, envelope: dict[str, Any]) -> str:
+    """Serialise a §5.2 envelope into the text block the endpoint sends.
+
+    The one place a result becomes text, so a test that calls this is testing
+    what the core actually receives rather than a reconstruction of it. The
+    summary is applied here and not in each plugin because "the first thing on
+    the wire answers the question" is a property of this endpoint, exactly as
+    the §5.3 cap is. :meth:`NetworkMCPServer._invoke` still returns the bare
+    envelope and the audit row upstream in the gate is untouched.
+
+    The cap is applied to the text that actually leaves. ``_cap`` also runs on
+    the joined blocks inside :func:`_envelope_from_result`, but re-serialising a
+    parsed envelope can grow it — ``json.dumps`` re-inserts the ``, `` and
+    ``: `` separators a compact plugin omitted — and the summary adds to it too.
+    ``_cap`` is idempotent, so anything already inside 60,000 characters comes
+    back byte-identical and no result under the cap changes at all.
+    """
+    envelope = _with_summary(name, envelope)
+    return _cap(json.dumps(envelope, ensure_ascii=False, default=str))
 
 
 _TRAILER = "\n[... {} more characters; use jobs_output to page ...]"

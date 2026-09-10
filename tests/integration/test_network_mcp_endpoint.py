@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import platform
 import socket
 import ssl
 from typing import Any
@@ -201,6 +202,93 @@ async def test_the_real_mcp_client_can_handshake_list_and_call(endpoint, tmp_pat
             }
 
     assert [c[0] for c in host.calls] == ["shell.run", "files.write"]
+
+
+async def test_a_long_result_answers_the_question_in_its_first_1000_characters(tmp_path):
+    """The leading summary, proven over a real socket and the core's own client.
+
+    The core keeps only the first ``long_item_chars`` of a long tool result —
+    default 8,000, owner configurable, and observed as low as 1,000 — and spills
+    the rest to a workspace file the model is never told to open. So this test
+    takes what the real client received, cuts it where the core would cut it,
+    and asks whether the answer is still there.
+
+    The hardware is invented: made-up vendor and product ids, fictional product
+    names, and the enumeration shape that any populated Windows desktop
+    produces — dozens of entries, most of them hubs and generic interfaces, for
+    well under ten things a person would actually name.
+    """
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamable_http_client
+
+    stamp = "2031-04-02T09:15:44.201773+00:00"
+
+    def row(vid, pid, name, cls, port):
+        return {"vid": vid, "pid": pid, "name": name, "class": cls,
+                "port": port, "present_since": stamp}
+
+    rows = [
+        row("05e3", "0608", "Generic USB Hub", "USB", f"Port_#{i:04d}.Hub_#0001")
+        for i in range(18)
+    ]
+    for vid, pid, name in (
+        ("2b1c", "4d01", "Orbital 4K Webcam"),
+        ("3f7a", "1102", "Aurora RGB Controller"),
+        ("4c21", "9001", "Meridian Keyboard"),
+        ("7e30", "2200", "Vantage Audio Interface"),
+    ):
+        rows.append(row(vid, pid, "USB Composite Device", "USB", "Port_#0030.Hub_#0002"))
+        rows.append(row(vid, pid, "USB Input Device", "HIDClass", "Port_#0030.Hub_#0002"))
+        rows.append(row(vid, pid, name, "USB", "Port_#0030.Hub_#0002"))
+
+    class DevicesHost:
+        async def invoke(self, tool_id: str, args: dict) -> Result:  # noqa: ARG002
+            return Result(json.dumps({"ok": True, "usb": rows, "adb": [], "com": []}))
+
+    config = NetworkMcpConfig(enabled=True, bind_host="127.0.0.1", port=0)
+    server = NetworkMCPServer(config, mcp_host=DevicesHost(), state_dir=tmp_path)
+    info = await server.start()
+    try:
+        async with httpx.AsyncClient(
+            verify=_tls_context(tmp_path),
+            headers={"Authorization": f"Bearer {info.token}"},
+        ) as client, streamable_http_client(info.url, http_client=client) as streams:
+            async with ClientSession(streams[0], streams[1]) as session:
+                await session.initialize()
+                result = await session.call_tool("devices_list", {})
+    finally:
+        await server.stop()
+
+    text = _text_of(result)
+    assert len(text) > 5000, "the fixture must overflow the core's window"
+
+    # What the core would actually hand the model.
+    window = text[:1000]
+
+    # Asserted on offsets: the summary opens the block, so it cannot be cut off.
+    assert text.startswith('{"summary": "')
+    assert text.index('"summary"') < text.index('"usb"')
+
+    # And the answer is legible inside that window.
+    assert window.startswith('{"summary": "USB: ')
+    assert "30 entries" in window
+    assert "4 named devices" in window
+    assert "18 hub entries" in window
+
+    # The result claims no machine identity of its own. The core routed this
+    # call and knows which workstation answered; the only name reachable here
+    # is the OS hostname, which need not match the enrolled display name, and
+    # one machine under two names is the defect this project already paid for.
+    assert platform.node() not in text
+    for name in ("Orbital 4K Webcam", "Aurora RGB Controller", "Meridian Keyboard",
+                 "Vantage Audio Interface"):
+        assert name in window
+
+    # The payload is added to, not substituted: every row still arrives whole,
+    # §6.1's `present_since` included.
+    full = json.loads(text)
+    assert len(full["usb"]) == 30
+    assert all(r["present_since"] == stamp for r in full["usb"])
 
 
 async def test_the_served_set_is_exactly_the_list_b5_exports_from(endpoint, tmp_path):
